@@ -1,0 +1,134 @@
+# --- Secrets and key material -----------------------------------------------
+# Never commit any of these.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+*.jks
+*.keystore
+secrets/
+softhsm2/
+hsm-tokens/
+
+# --- Sprint planning and internal docs that aren't checked in ---------------
+*.docx
+*.xlsx
+*.pptx
+
+# --- Python ------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Pyinstaller
+*.manifest
+*.spec
+
+# Test / coverage
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache/
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+htmlcov/
+
+# mypy / ruff / linters
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.ruff_cache/
+.pyre/
+.pytype/
+.pyrightconfig.json
+
+# Environments
+.venv
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+.python-version
+
+# Jupyter
+.ipynb_checkpoints/
+profile_default/
+ipython_config.py
+
+# Translations
+*.mo
+*.pot
+
+# Sphinx
+docs/_build/
+
+# --- Node / Vite (for ui/) --------------------------------------------------
+node_modules/
+.pnp/
+.pnp.js
+.pnp.cjs
+.yarn/cache
+.yarn/install-state.gz
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.npm/
+
+# Vite output
+dist/
+dist-ssr/
+.vite/
+*.local
+
+# --- Editors / IDEs ---------------------------------------------------------
+.idea/
+.vscode/
+!.vscode/settings.json.example
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+
+# --- OS metadata ------------------------------------------------------------
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# --- Local-only ops scratch space -------------------------------------------
+.claude/
+scratch/
+tmp/
+*.log

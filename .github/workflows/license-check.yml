@@ -1,0 +1,59 @@
+name: license-check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  license-header:
+    name: License header on every Python source file
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Verify header on every vargate_telemetry/**/*.py file
+        run: |
+          set -euo pipefail
+
+          HEADER_FILE=".github/LICENSE_HEADER.txt"
+          if [ ! -f "$HEADER_FILE" ]; then
+            echo "::error::License header file not found at $HEADER_FILE" >&2
+            exit 1
+          fi
+
+          # The required header is the full content of LICENSE_HEADER.txt.
+          # Each Python file must begin with these lines (allowing an optional
+          # encoding cookie or shebang on the very first line).
+          mapfile -t HEADER_LINES < "$HEADER_FILE"
+
+          missing=()
+          shopt -s nullglob globstar
+          for f in vargate_telemetry/**/*.py; do
+            # Skip generated migration files? No — we want headers on those too.
+            # Read the first N+2 lines of the file (allow shebang/encoding).
+            first_lines=$(head -n $(( ${#HEADER_LINES[@]} + 2 )) "$f")
+            ok=1
+            for line in "${HEADER_LINES[@]}"; do
+              if ! grep -Fxq -- "$line" <<< "$first_lines"; then
+                ok=0
+                break
+              fi
+            done
+            if [ "$ok" -eq 0 ]; then
+              missing+=("$f")
+            fi
+          done
+
+          if [ "${#missing[@]}" -ne 0 ]; then
+            echo "::error::The following files are missing the license header" \
+                 "(see $HEADER_FILE):"
+            for f in "${missing[@]}"; do
+              echo "  - $f"
+            done
+            exit 1
+          fi
+
+          echo "All Python files under vargate_telemetry/ carry the license header."
