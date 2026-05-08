@@ -1,0 +1,72 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vargate-telemetry"
+version = "0.0.0"
+description = "Read-only AI-usage telemetry, compliance, and analytics platform."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "BSL-1.1" }
+authors = [
+  { name = "Twinlite Services Limited", email = "engineering@vargate.ai" },
+]
+maintainers = [
+  { name = "Twinlite Services Limited", email = "engineering@vargate.ai" },
+]
+keywords = [
+  "ai",
+  "ai-governance",
+  "telemetry",
+  "compliance",
+  "audit",
+  "anthropic",
+]
+classifiers = [
+  "Development Status :: 1 - Planning",
+  "Intended Audience :: Information Technology",
+  "Intended Audience :: System Administrators",
+  "License :: Other/Proprietary License",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Security",
+  "Topic :: System :: Monitoring",
+  "Typing :: Typed",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8,<9",
+  "pytest-cov>=5,<6",
+  "ruff>=0.5,<1",
+  "mypy>=1.10,<2",
+]
+
+[project.urls]
+Homepage = "https://vargate.ai"
+Repository = "https://github.com/zeroco84/vargate-telemetry"
+Issues = "https://github.com/zeroco84/vargate-telemetry/issues"
+"License Text" = "https://github.com/zeroco84/vargate-telemetry/blob/main/LICENSE"
+"Licensing FAQ" = "https://github.com/zeroco84/vargate-telemetry/blob/main/LICENSING-FAQ.md"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["vargate_telemetry*"]
+exclude = ["tests*", "ui*", "docs*", "scripts*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+addopts = "-ra"
