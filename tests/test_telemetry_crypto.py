@@ -58,12 +58,12 @@ def test_dek_wrap_unwrap_roundtrip() -> None:
     dek = generate_dek()
     wrapped = wrap_dek(dek)
 
-    # AES-KEY-WRAP-PAD adds integrity-checked padding; for a 32-byte DEK
-    # the wrapped form is 40 bytes. The exact length matters less than
-    # the invariants: it differs from the DEK in plaintext and is at
-    # least as long.
+    # AES-CBC-PAD: 16-byte IV + 16-byte-aligned ciphertext (PKCS#7 pad).
+    # For a 32-byte DEK the wrapped form is 16 + 48 = 64 bytes. The exact
+    # length matters less than the invariants: it differs from the DEK
+    # in plaintext and is strictly longer than the DEK.
     assert wrapped != dek
-    assert len(wrapped) >= len(dek)
+    assert len(wrapped) > len(dek)
 
     assert unwrap_dek(wrapped) == dek
 
