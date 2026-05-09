@@ -21,12 +21,22 @@ from vargate_telemetry.crypto.hsm import (
     unwrap_dek,
     wrap_dek,
 )
+from vargate_telemetry.crypto.seal import (
+    get_tenant_dek,
+    provision_tenant_dek,
+    seal_secret,
+    unseal_secret,
+)
 
 __all__ = [
     "decrypt_with_dek",
     "encrypt_with_dek",
     "generate_dek",
     "get_or_create_kek",
+    "get_tenant_dek",
+    "provision_tenant_dek",
+    "seal_secret",
+    "unseal_secret",
     "unwrap_dek",
     "wrap_dek",
 ]
