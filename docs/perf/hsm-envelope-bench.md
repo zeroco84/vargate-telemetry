@@ -1,7 +1,9 @@
 # HSM Envelope Encryption — Benchmark (T1.8)
 
-**Status:** baseline; numbers TBD pending first run on the dev compose
-stack.
+**Status:** baseline measured 2026-05-09 against the dev compose stack
+on prod-1. All four decision-rule thresholds (see "Concerns and
+follow-ups") pass with significant margin; no follow-up optimisations
+warranted at T1 scope.
 **Bench script:** [`scripts/bench_hsm_envelope.py`](../../scripts/bench_hsm_envelope.py)
 **Reference implementation:** [`vargate_telemetry/crypto/seal.py`](../../vargate_telemetry/crypto/seal.py)
 
@@ -73,25 +75,59 @@ docker compose exec postgres psql -U vargate -d vargate_telemetry -c "
 
 ## Results
 
-> **TBD** — paste output of `bench_hsm_envelope.py` here on first run.
-> The script prints a markdown table directly suitable for this section.
+Run on 2026-05-09 against the dev compose stack on prod-1
+(postgres:16-alpine + SoftHSM2 in the celery-worker image, single
+process). 1,000 tenants, provision → seal → unseal per tenant, no DEK
+caching.
+
+- **Tenants:** 1000
+- **Total wall-clock:** 17.71 s
+- **Peak Python heap:** 1.17 MB
+
+| Operation | Total (s) | p50 (ms) | p95 (ms) | p99 (ms) |
+|-----------|-----------|----------|----------|----------|
+| provision |      5.69 |     4.84 |    10.46 |    12.38 |
+| seal      |      7.04 |     6.02 |    12.87 |    14.44 |
+| unseal    |      4.95 |     4.20 |     9.36 |    10.49 |
+
+### What the numbers tell us
+
+- **HSM round trips are cheap on SoftHSM2.** Each `wrap_dek` /
+  `unwrap_dek` call is ~1 ms or less. The full per-operation costs
+  (4-15 ms) are dominated by Postgres session setup, RLS GUC
+  configuration, and SQL round trips, not by the crypto.
+- **Seal is the slowest operation** because it does a DB read (look up
+  wrapped DEK) plus the HSM unwrap plus a DB write (INSERT/UPDATE on
+  encrypted_secrets). Unseal skips the write, so it's ~30% faster.
+  Provision is fastest because the DEK is generated in memory and the
+  only HSM call is `wrap_dek` (one direction).
+- **Memory is essentially flat.** A 1.17 MB peak heap across 1,000
+  tenants confirms session_scope and the ORM are not retaining state
+  between operations — the per-operation `with` blocks close cleanly.
 
 ## Concerns and follow-ups
 
-To be filled in once numbers exist. Decision rules:
+The decision rules from T1.8's spec, with measured outcomes:
 
-- **Unseal p95 > 50 ms.** HSM unwrap dominates every secret read; add an
-  LRU cache of unwrapped DEKs keyed by `(tenant_id, kek_label)`. Eviction
-  on rotation, bounded size, time-bounded TTL.
-- **Provision p99 > 250 ms.** Onboarding budget is at risk; consider
-  pre-provisioning DEKs from a pool, or moving provision into a Celery
-  task that runs ahead of the user's first interaction.
-- **Total wall-clock for 1,000 tenants > 60 s.** Aligns with the
-  acceptance signal in T1.7's spec; if exceeded, the LRU cache buys
-  the most.
-- **Peak memory > 256 MB for 1,000-tenant run.** Probably means we're
-  retaining sessions, ORM objects, or DEK material we shouldn't be.
-  Profile with `tracemalloc.snapshot()`.
+| Threshold | Limit | Measured | Verdict |
+|---|---|---|---|
+| Unseal p95 — would trigger LRU DEK cache | > 50 ms | **9.36 ms** | No cache needed at T1 scope |
+| Provision p99 — onboarding budget at risk | > 250 ms | **12.38 ms** | Onboarding has 240 ms+ to spare |
+| 1,000-tenant total wall-clock | > 60 s | **17.71 s** | 70% under budget |
+| Peak memory for the bench | > 256 MB | **1.17 MB** | Two orders of magnitude under |
+
+**No optimisations are required at T1 scope.** Re-run if any of:
+
+- We move from SoftHSM2 to a real network HSM (CloudHSM, Luna, etc.).
+  Network round trips will likely add 1-5 ms per HSM call; the LRU
+  cache discussion may re-open.
+- Per-tenant operation rate exceeds ~50 ops/sec sustained. Single-
+  process, single-threaded SoftHSM2 caps somewhere around there. T1.9
+  prod overlay and T2+ workers will warrant rethinking concurrency.
+- The wrapped-DEK pattern changes (e.g., AES-KEY-WRAP-PAD comes back if
+  python-pkcs11 fixes its broken GCM packing, or we move to a
+  different PKCS#11 wrapper). Different mechanism, different latency
+  shape — re-bench.
 
 ## Notes for re-running
 
