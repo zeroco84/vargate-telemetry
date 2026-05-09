@@ -58,21 +58,48 @@ Three details that look small but matter:
    yields zero rows — the desired fail-closed default. Drop the `true`
    and a missing GUC is a runtime crash.
 
-## The connecting role MUST NOT be a superuser
+## The effective role MUST NOT be a superuser
 
 PostgreSQL superusers BYPASS RLS regardless of ENABLE / FORCE settings.
-The official `postgres` Docker image creates `POSTGRES_USER` as a
-superuser by default — so out of the box, the application role would
-silently sail over every policy.
+The bootstrap user of the cluster (whoever `POSTGRES_USER` resolved to
+when the volume was first initialized) is permanently a superuser — the
+kernel rejects `ALTER USER ... NOSUPERUSER` on the bootstrap role with
 
-Migration `0002_drop_app_superuser` strips `SUPERUSER` from the app role
-so RLS actually applies. Anyone bringing up a fresh Postgres for
-Telemetry should run `alembic upgrade head` before opening the database
-to application traffic.
+```
+permission denied to alter role
+DETAIL:  The bootstrap user must have the SUPERUSER attribute.
+```
 
-If you ever need to add a new role for application traffic, create it
-with `NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE` and grant it only
-the privileges it actually needs.
+— and that's by design: removing the attribute could leave the cluster
+with no superusers at all.
+
+The pattern that works around this:
+
+1. **Leave the bootstrap user as a superuser.** Migrations run under
+   it; DDL is unrestricted; emergencies are still recoverable.
+2. **Create a separate non-superuser role** (`vargate_app`) and grant
+   the bootstrap role membership in it. Migration `0002_create_app_role`
+   does this once.
+3. **Application code issues `SET LOCAL ROLE vargate_app`** at the
+   start of every transaction. `vargate_telemetry.db.session_scope`
+   does this automatically; raw `engine.connect()` callers must do it
+   themselves (the RLS tests demonstrate the pattern).
+
+The result: migrations operate under the bootstrap superuser (so DDL
+is unrestricted), and application traffic operates under
+`vargate_app` (so RLS applies). The mode switch is per-transaction,
+reset on COMMIT/ROLLBACK, and is enforced by `session_scope` on every
+session that backend code opens.
+
+`vargate_app` has `ALL` privileges on every public-schema table and
+sequence, plus an `ALTER DEFAULT PRIVILEGES` clause that auto-grants
+the same on tables and sequences created by the bootstrap role in
+future migrations. So new tables Just Work — no GRANT bookkeeping per
+migration.
+
+If you ever need to add a different non-super role, create it with
+`NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE` and grant it only the
+privileges it actually needs.
 
 ## How the GUC gets set in production code
 

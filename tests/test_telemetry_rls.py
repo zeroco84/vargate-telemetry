@@ -59,10 +59,11 @@ def test_rls_blocks_unset_tenant(clean_canary: None) -> None:
 
     _insert_row("tenant-A", "secret-A")
 
-    # Fresh connection, transaction-local GUC cleared explicitly to be
-    # explicit about the precondition.
+    # Fresh connection. `SET LOCAL ROLE vargate_app` is what session_scope
+    # does in production; we mirror it here so RLS actually applies.
     with engine.connect() as conn:
         with conn.begin():
+            conn.execute(text("SET LOCAL ROLE vargate_app"))
             conn.execute(text("SELECT set_config('app.tenant_id', '', true)"))
             count = conn.execute(text("SELECT count(*) FROM _rls_canary")).scalar()
             assert count == 0
@@ -76,6 +77,7 @@ def test_rls_allows_correct_tenant(clean_canary: None) -> None:
 
     with engine.connect() as conn:
         with conn.begin():
+            conn.execute(text("SET LOCAL ROLE vargate_app"))
             conn.execute(
                 text("SELECT set_config('app.tenant_id', 'tenant-A', true)"),
             )
@@ -97,6 +99,7 @@ def test_rls_blocks_other_tenant(clean_canary: None) -> None:
 
     with engine.connect() as conn:
         with conn.begin():
+            conn.execute(text("SET LOCAL ROLE vargate_app"))
             conn.execute(
                 text("SELECT set_config('app.tenant_id', 'tenant-B', true)"),
             )

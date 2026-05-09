@@ -49,6 +49,13 @@ def session_scope(tenant_id: str) -> Iterator[Session]:
     token = current_tenant.set(tenant_id)
     s = SessionLocal()
     try:
+        # Switch to the non-super app role so RLS actually applies for
+        # the rest of this transaction. The bootstrap role (whatever
+        # POSTGRES_USER points to) is permanently superuser and bypasses
+        # RLS; vargate_app is the non-super role we GRANT'd in 0002.
+        # SET LOCAL ROLE is automatically reset on COMMIT/ROLLBACK.
+        s.execute(text("SET LOCAL ROLE vargate_app"))
+
         # `set_config(name, value, is_local=true)` is the parameter-safe
         # equivalent of `SET LOCAL <name> = <value>` — Postgres does not
         # accept bind parameters in `SET LOCAL`, so we go through the
