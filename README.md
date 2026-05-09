@@ -58,6 +58,36 @@ SoftHSM2 with envelope encryption, FastAPI gateway, React dashboard — with
 a small global control plane for signup routing and billing rollups. No
 content ever crosses regions.
 
+## Running locally
+
+The Telemetry stack is a Docker Compose deployment. Sprint T1 lands
+infrastructure incrementally — Postgres in T1.1, MinIO in T1.2, Celery in
+T1.3 — before the gateway code lands in T1.4+. The list of services in
+`docker-compose.yml` will grow with each sprint.
+
+Prerequisites: Docker Engine ≥ 24 with the Compose v2 plugin.
+
+Bootstrap (Postgres only — current state of the stack):
+
+```bash
+cp .env.example .env
+# edit .env: replace `changeme` with a strong random password
+# (e.g. `openssl rand -hex 32`) in both POSTGRES_PASSWORD and DATABASE_URL.
+
+docker compose up -d postgres
+docker compose ps postgres        # expect (healthy) within ~30s
+docker compose exec postgres psql -U vargate -d vargate_telemetry -c "SELECT 1"
+```
+
+Tear down (keeps the data volume):
+
+```bash
+docker compose down
+```
+
+**Never run `docker compose down -v`** — it deletes the
+`vargate-postgres-data` volume and any HSM keys we add later.
+
 ## Contributing
 
 Contributions are welcome. Substantial code contributions require a
