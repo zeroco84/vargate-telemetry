@@ -4,5 +4,6 @@
 """Declarative models for Telemetry. Every table inherits Base + TenantOwned."""
 
 from vargate_telemetry.models.base import Base, TenantOwned
+from vargate_telemetry.models.secrets import EncryptedSecret, TenantDek
 
-__all__ = ["Base", "TenantOwned"]
+__all__ = ["Base", "EncryptedSecret", "TenantDek", "TenantOwned"]
