@@ -15,7 +15,7 @@ row will fail integrity verification on the next unseal — which is
 correct fail-closed behaviour, not a bug. Re-seal those rows to
 backfill a real tag.
 
-Revision ID: 0004_add_integrity_tag_to_secrets
+Revision ID: 0004_add_integrity_tag
 Revises: 0003_create_encrypted_secrets
 Create Date: 2026-05-09 04:00:00.000000
 
@@ -27,7 +27,7 @@ import sqlalchemy as sa
 from alembic import op
 
 # revision identifiers, used by Alembic.
-revision: str = "0004_add_integrity_tag_to_secrets"
+revision: str = "0004_add_integrity_tag"
 down_revision: Union[str, None] = "0003_create_encrypted_secrets"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
