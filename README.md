@@ -67,38 +67,54 @@ T1.3 — before the gateway code lands in T1.4+. The list of services in
 
 Prerequisites: Docker Engine ≥ 24 with the Compose v2 plugin.
 
-Bootstrap (Postgres only — current state of the stack). The block is
+Bootstrap (Postgres + MinIO — current state of the stack). The block is
 idempotent: re-running won't overwrite an existing `.env` or rotate a
 working password.
 
 ```bash
-# First-time only: create .env and insert a random password into both
-# POSTGRES_PASSWORD and DATABASE_URL. No-op once .env exists.
-[ -f .env ] || { cp .env.example .env && \
-  sed -i "s/changeme/$(openssl rand -hex 32)/g" .env; }
+# First-time only: create .env and insert distinct random passwords for
+# Postgres (POSTGRES_PASSWORD + DATABASE_URL share CHANGEME_PG so they
+# stay in sync) and MinIO (CHANGEME_MINIO). No-op once .env exists.
+[ -f .env ] || { cp .env.example .env \
+  && sed -i "s/CHANGEME_PG/$(openssl rand -hex 32)/g" .env \
+  && sed -i "s/CHANGEME_MINIO/$(openssl rand -hex 32)/g" .env; }
 
-docker compose up -d --wait postgres   # blocks until (healthy)
+docker compose up -d --wait postgres minio   # blocks until both (healthy)
+
+# Postgres round-trip
 docker compose exec postgres psql -U vargate -d vargate_telemetry -c "SELECT 1"
+
+# MinIO smoke test (alias, create bucket, remove bucket)
+docker compose exec minio sh -c '
+  mc alias set local http://localhost:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" \
+  && mc mb local/vargate-test \
+  && mc rb local/vargate-test --force'
 ```
 
-> **If you re-ran the older non-idempotent bootstrap and your `.env`
-> password drifted from what's in the data volume**, realign without
-> destroying the volume:
+> **Postgres password drift recovery.** Postgres bakes the initial password
+> into its data volume on first boot and ignores `.env` changes after that.
+> If your `.env` and the volume disagree, realign without destroying the
+> volume:
 >
 > ```bash
 > PW=$(grep ^POSTGRES_PASSWORD= .env | cut -d= -f2-)
 > docker compose exec -T postgres psql -U vargate -d vargate_telemetry \
 >   -c "ALTER USER vargate PASSWORD '${PW}';"
 > ```
+>
+> MinIO doesn't have this problem — it reads `MINIO_ROOT_PASSWORD` from env
+> on every start, so editing `.env` and running `docker compose up -d
+> --force-recreate minio` is enough.
 
-Tear down (keeps the data volume):
+Tear down (keeps the data volumes):
 
 ```bash
 docker compose down
 ```
 
 **Never run `docker compose down -v`** — it deletes the
-`vargate-postgres-data` volume and any HSM keys we add later.
+`vargate-postgres-data` and `vargate-minio-data` volumes and any HSM keys
+we add later.
 
 ## Contributing
 
