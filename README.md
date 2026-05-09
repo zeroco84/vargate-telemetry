@@ -67,9 +67,9 @@ T1.3 — before the gateway code lands in T1.4+. The list of services in
 
 Prerequisites: Docker Engine ≥ 24 with the Compose v2 plugin.
 
-Bootstrap (Postgres + MinIO — current state of the stack). The block is
-idempotent: re-running won't overwrite an existing `.env` or rotate a
-working password.
+Bootstrap (Postgres + MinIO + Redis + Celery — current state of the
+stack). The block is idempotent: re-running won't overwrite an existing
+`.env` or rotate a working password.
 
 ```bash
 # First-time only: create .env and insert distinct random passwords for
@@ -79,7 +79,10 @@ working password.
   && sed -i "s/CHANGEME_PG/$(openssl rand -hex 32)/g" .env \
   && sed -i "s/CHANGEME_MINIO/$(openssl rand -hex 32)/g" .env; }
 
-docker compose up -d --wait postgres minio   # blocks until both (healthy)
+# `--build` so the celery images rebuild when vargate_telemetry/ changes;
+# `--wait` blocks until every service with a healthcheck is healthy.
+docker compose up -d --build --wait \
+  postgres minio redis celery-worker celery-beat
 
 # Postgres round-trip
 docker compose exec postgres psql -U vargate -d vargate_telemetry -c "SELECT 1"
@@ -89,6 +92,15 @@ docker compose exec minio sh -c '
   mc alias set local http://localhost:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" \
   && mc mb local/vargate-test \
   && mc rb local/vargate-test --force'
+
+# Redis ping
+docker compose exec redis redis-cli ping   # expect: PONG
+
+# Celery worker should log "celery@<host> ready." within a few seconds.
+docker compose logs --tail=30 celery-worker | grep -E "ready\\.|Connected"
+
+# Celery beat should be sending the (currently empty) schedule heartbeat.
+docker compose logs --tail=20 celery-beat | grep -E "Scheduler|beat: Starting"
 ```
 
 > **Postgres password drift recovery.** Postgres bakes the initial password
@@ -113,8 +125,8 @@ docker compose down
 ```
 
 **Never run `docker compose down -v`** — it deletes the
-`vargate-postgres-data` and `vargate-minio-data` volumes and any HSM keys
-we add later.
+`vargate-postgres-data`, `vargate-minio-data`, and `vargate-redis-data`
+volumes and any HSM keys we add later.
 
 ## Contributing
 

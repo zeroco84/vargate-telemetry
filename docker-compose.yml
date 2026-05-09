@@ -50,8 +50,65 @@ services:
       interval: 10s
       retries: 5
 
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    expose:
+      - "6379"
+    volumes:
+      - vargate-redis-data:/data
+    healthcheck:
+      test:
+        - CMD
+        - redis-cli
+        - ping
+      interval: 10s
+      retries: 5
+
+  celery-worker:
+    build: .
+    image: vargate-telemetry:dev
+    restart: unless-stopped
+    command:
+      - celery
+      - -A
+      - vargate_telemetry.celery_app
+      - worker
+      - --loglevel=info
+      - -Q
+      - telemetry,default
+    environment:
+      CELERY_BROKER_URL: ${CELERY_BROKER_URL}
+      CELERY_RESULT_BACKEND: ${CELERY_RESULT_BACKEND}
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+
+  celery-beat:
+    build: .
+    image: vargate-telemetry:dev
+    restart: unless-stopped
+    command:
+      - celery
+      - -A
+      - vargate_telemetry.celery_app
+      - beat
+      - --loglevel=info
+    environment:
+      CELERY_BROKER_URL: ${CELERY_BROKER_URL}
+      CELERY_RESULT_BACKEND: ${CELERY_RESULT_BACKEND}
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+
 volumes:
   vargate-postgres-data:
     name: vargate-postgres-data
   vargate-minio-data:
     name: vargate-minio-data
+  vargate-redis-data:
+    name: vargate-redis-data
