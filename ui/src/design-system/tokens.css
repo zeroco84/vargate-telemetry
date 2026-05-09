@@ -1,0 +1,114 @@
+/* Generated from tokens.json — do not edit by hand. */
+:root {
+  /* color */
+  --color-indigo: #3a3aaf;
+  --color-indigo-2: #2a2a8e;
+  --color-indigo-3: #2d2d8a;
+  --color-indigo-tint: #eeedfb;
+
+  --color-stamp: #c96442;
+  --color-stamp-2: #a04d2f;
+  --color-stamp-3: #7d3a23;
+  --color-stamp-tint: #f7eee8;
+
+  --color-ink: #1f1f1e;
+  --color-ink-2: #57534e;
+  --color-ink-3: #8c8780;
+  --color-ink-4: #b8b3ac;
+
+  --color-paper: #ffffff;
+  --color-paper-2: #faf9f7;
+  --color-paper-3: #f0eee6;
+  --color-paper-4: #e8e5dc;
+
+  --color-line: #ebe8df;
+  --color-line-2: #dad9d4;
+  --color-line-3: #cac7be;
+
+  --color-anomaly: #b03a2e;
+  --color-anomaly-tint: #f6e6e3;
+
+  --color-anchored: #5d6f5a;
+  --color-anchored-tint: #e8ebe4;
+
+  --color-pro: #1f1f1e;
+  --color-pro-tint: #ececea;
+
+  /* type */
+  --font-sans: "Inter Tight", "Helvetica Neue", Helvetica, Arial, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  --fs-xs: 11px;
+  --fs-sm: 12px;
+  --fs-base: 14px;
+  --fs-md: 15px;
+  --fs-lg: 18px;
+  --fs-xl: 22px;
+  --fs-2xl: 28px;
+  --fs-3xl: 36px;
+  --fs-4xl: 48px;
+
+  --fw-regular: 400;
+  --fw-medium: 500;
+  --fw-semibold: 600;
+
+  --ls-tightest: -0.030em;
+  --ls-tighter: -0.020em;
+  --ls-tight: -0.012em;
+  --ls-normal: 0;
+  --ls-wide: 0.04em;
+  --ls-wider: 0.12em;
+  --ls-widest: 0.18em;
+
+  /* space */
+  --sp-0: 0;
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 20px;
+  --sp-6: 24px;
+  --sp-8: 32px;
+  --sp-10: 40px;
+  --sp-12: 48px;
+  --sp-16: 64px;
+  --sp-20: 80px;
+
+  /* radius */
+  --r-sm: 3px;
+  --r: 5px;
+  --r-md: 5px;
+  --r-lg: 8px;
+  --r-full: 9999px;
+
+  /* shadow */
+  --sh-sm: 0 1px 0 0 rgba(31, 31, 30, 0.04);
+  --sh: 0 1px 2px 0 rgba(31, 31, 30, 0.06), 0 0 0 1px rgba(31, 31, 30, 0.04);
+  --sh-md: 0 4px 12px 0 rgba(31, 31, 30, 0.08), 0 0 0 1px rgba(31, 31, 30, 0.04);
+  --sh-lg: 0 12px 32px -4px rgba(31, 31, 30, 0.12), 0 0 0 1px rgba(31, 31, 30, 0.04);
+
+  /* motion */
+  --dur-fast: 120ms;
+  --dur: 180ms;
+  --dur-slow: 280ms;
+  --ease: cubic-bezier(0.2, 0.6, 0.2, 1);
+}
+
+html, body {
+  background: var(--color-paper-2);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  font-size: var(--fs-base);
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Tabular numerics on by default — every audit table needs them. */
+table, .vg-tabular {
+  font-variant-numeric: tabular-nums;
+}
+
+*, *::before, *::after {
+  box-sizing: border-box;
+}
