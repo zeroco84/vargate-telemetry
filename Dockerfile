@@ -15,7 +15,9 @@ COPY requirements.txt ./
 RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir -r requirements.txt
 
+COPY alembic.ini ./
 COPY vargate_telemetry/ ./vargate_telemetry/
+COPY tests/ ./tests/
 
 ENV PYTHONPATH=/app \
     PYTHONUNBUFFERED=1 \

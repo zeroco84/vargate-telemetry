@@ -103,6 +103,36 @@ docker compose logs --tail=30 celery-worker | grep -E "ready\\.|Connected"
 docker compose logs --tail=20 celery-beat | grep -E "Scheduler|beat: Starting"
 ```
 
+### Migrations
+
+Alembic migrations run inside the celery-worker image (it has the same
+dependencies as the would-be gateway). The first run creates the
+`alembic_version` row from the empty initial migration; subsequent
+sprints add real migrations.
+
+```bash
+# Apply all migrations to the dev Postgres
+docker compose run --rm celery-worker alembic upgrade head
+
+# Verify the alembic_version row landed
+docker compose exec postgres psql -U vargate -d vargate_telemetry \
+  -c "SELECT version_num FROM alembic_version;"
+```
+
+### Tests
+
+```bash
+# All tests against the live stack
+docker compose run --rm celery-worker pytest tests/
+
+# Just the T1.4 infra smoke tests
+docker compose run --rm celery-worker pytest tests/test_telemetry_infra.py
+
+# The Celery round-trip test is skipped by default; opt in explicitly:
+docker compose run --rm -e CELERY_TEST_LIVE=1 celery-worker \
+  pytest tests/test_telemetry_infra.py::test_celery_worker_responsive
+```
+
 > **Postgres password drift recovery.** Postgres bakes the initial password
 > into its data volume on first boot and ignores `.env` changes after that.
 > If your `.env` and the volume disagree, realign without destroying the

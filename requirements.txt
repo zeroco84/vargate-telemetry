@@ -1,6 +1,17 @@
-# Runtime dependencies for the Telemetry image. Pinned by minor version so
-# pip resolution stays predictable; reverify on each upgrade.
+# Runtime + test dependencies for the Telemetry image. Pinned by minor
+# version so pip resolution stays predictable; reverify on each upgrade.
 
 # T1.3: Celery on Redis broker
 celery[redis]>=5.3,<6
 flower>=2,<3
+
+# T1.4: Postgres + ORM + migrations
+sqlalchemy>=2.0,<3
+alembic>=1.13,<2
+psycopg[binary]>=3.1,<4
+
+# Test deps. Kept in this single requirements file for now so the image
+# can run pytest without a second install layer; revisit when the prod
+# image is split out (later in the sprint plan).
+pytest>=8,<9
+httpx>=0.27,<1
