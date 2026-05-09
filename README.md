@@ -67,22 +67,28 @@ T1.3 — before the gateway code lands in T1.4+. The list of services in
 
 Prerequisites: Docker Engine ≥ 24 with the Compose v2 plugin.
 
-Bootstrap (Postgres + MinIO + Redis + Celery — current state of the
-stack). The block is idempotent: re-running won't overwrite an existing
-`.env` or rotate a working password.
+Bootstrap (Postgres + MinIO + Redis + Celery + SoftHSM2 — current state
+of the stack). The block is idempotent: re-running won't overwrite an
+existing `.env` or rotate a working password.
 
 ```bash
-# First-time only: create .env and insert distinct random passwords for
-# Postgres (POSTGRES_PASSWORD + DATABASE_URL share CHANGEME_PG so they
-# stay in sync) and MinIO (CHANGEME_MINIO). No-op once .env exists.
+# First-time only: create .env and insert distinct random secrets for
+# each service. POSTGRES_PASSWORD and DATABASE_URL share CHANGEME_PG so
+# they stay in sync; the others get their own. No-op once .env exists.
 [ -f .env ] || { cp .env.example .env \
-  && sed -i "s/CHANGEME_PG/$(openssl rand -hex 32)/g" .env \
-  && sed -i "s/CHANGEME_MINIO/$(openssl rand -hex 32)/g" .env; }
+  && sed -i "s/CHANGEME_PG/$(openssl rand -hex 32)/g"        .env \
+  && sed -i "s/CHANGEME_MINIO/$(openssl rand -hex 32)/g"     .env \
+  && sed -i "s/CHANGEME_HSM_SO/$(openssl rand -hex 32)/g"    .env \
+  && sed -i "s/CHANGEME_HSM_USER/$(openssl rand -hex 32)/g"  .env; }
 
 # `--build` so the celery images rebuild when vargate_telemetry/ changes;
 # `--wait` blocks until every service with a healthcheck is healthy.
 docker compose up -d --build --wait \
   postgres minio redis celery-worker celery-beat
+
+# Apply migrations and initialize the HSM token + KEK. Both are idempotent.
+docker compose run --rm celery-worker alembic upgrade head
+docker compose run --rm celery-worker python scripts/init_telemetry_kek.py
 
 # Postgres round-trip
 docker compose exec postgres psql -U vargate -d vargate_telemetry -c "SELECT 1"
@@ -101,6 +107,10 @@ docker compose logs --tail=30 celery-worker | grep -E "ready\\.|Connected"
 
 # Celery beat should be sending the (currently empty) schedule heartbeat.
 docker compose logs --tail=20 celery-beat | grep -E "Scheduler|beat: Starting"
+
+# HSM should show the Telemetry token + an AES-256 KEK by label.
+docker compose exec celery-worker softhsm2-util --show-slots \
+  | grep -E "Label:|Initialized:"
 ```
 
 ### Migrations
@@ -114,10 +124,24 @@ sprints add real migrations.
 # Apply all migrations to the dev Postgres
 docker compose run --rm celery-worker alembic upgrade head
 
-# Verify the alembic_version row landed
+# Verify the latest version is applied
 docker compose exec postgres psql -U vargate -d vargate_telemetry \
   -c "SELECT version_num FROM alembic_version;"
 ```
+
+### HSM (T1.6)
+
+SoftHSM2 is installed in the Telemetry image; the token directory is
+mounted from the `vargate-hsm-tokens` named volume on celery-worker
+and celery-beat. The Telemetry KEK lives inside that token and is
+generated once via:
+
+```bash
+docker compose run --rm celery-worker python scripts/init_telemetry_kek.py
+```
+
+The init script is idempotent. Re-running prints "Token already
+initialized" and "KEK ready" and exits 0.
 
 ### Tests
 
@@ -155,8 +179,10 @@ docker compose down
 ```
 
 **Never run `docker compose down -v`** — it deletes the
-`vargate-postgres-data`, `vargate-minio-data`, and `vargate-redis-data`
-volumes and any HSM keys we add later.
+`vargate-postgres-data`, `vargate-minio-data`, `vargate-redis-data`,
+and `vargate-hsm-tokens` volumes. The HSM volume holds the KEK that
+wraps every per-tenant DEK; losing it crypto-shreds every encrypted
+blob in the system.
 
 ## Contributing
 
