@@ -110,6 +110,9 @@ dist-ssr/
 .vite/
 *.local
 
+# Storybook build output
+storybook-static/
+
 # --- Editors / IDEs ---------------------------------------------------------
 .idea/
 .vscode/
