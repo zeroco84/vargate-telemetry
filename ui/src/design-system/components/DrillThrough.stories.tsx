@@ -44,7 +44,7 @@ export const RowDetail: S = {
             </div>
             <dl style={{ display: "grid", gridTemplateColumns: "auto 1fr", gap: "10px 24px", margin: 0, fontFamily: "var(--font-mono)", fontSize: "var(--fs-sm)" }}>
               <dt style={{ color: "var(--color-ink-3)" }}>Actor</dt>     <dd style={{ margin: 0 }}>alice@acme.co</dd>
-              <dt style={{ color: "var(--color-ink-3)" }}>Workspace</fb> <dd style={{ margin: 0 }}>acme-prod</dd>
+              <dt style={{ color: "var(--color-ink-3)" }}>Workspace</dt> <dd style={{ margin: 0 }}>acme-prod</dd>
               <dt style={{ color: "var(--color-ink-3)" }}>Source IP</dt> <dd style={{ margin: 0 }}>10.4.22.18</dd>
               <dt style={{ color: "var(--color-ink-3)" }}>Hash</dt>      <dd style={{ margin: 0 }}>9f3a4d12…b21188e1</dd>
               <dt style={{ color: "var(--color-ink-3)" }}>Anchor</dt>    <dd style={{ margin: 0 }}><span className="vg-badge vg-badge--anchored"><span className="vg-badge__dot" />block 19,482,011</span></dd>

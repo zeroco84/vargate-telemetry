@@ -14,4 +14,4 @@ export * from "./components/Sidebar";
 export * from "./components/Topbar";
 export * from "./components/States";
 export * from "./components/icons";
-export { tokens } from "./tokens";
+export { default as tokens, type Tokens } from "./components/tokens";
