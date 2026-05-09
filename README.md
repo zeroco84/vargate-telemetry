@@ -67,17 +67,29 @@ T1.3 — before the gateway code lands in T1.4+. The list of services in
 
 Prerequisites: Docker Engine ≥ 24 with the Compose v2 plugin.
 
-Bootstrap (Postgres only — current state of the stack):
+Bootstrap (Postgres only — current state of the stack). The block is
+idempotent: re-running won't overwrite an existing `.env` or rotate a
+working password.
 
 ```bash
-cp .env.example .env
-# edit .env: replace `changeme` with a strong random password
-# (e.g. `openssl rand -hex 32`) in both POSTGRES_PASSWORD and DATABASE_URL.
+# First-time only: create .env and insert a random password into both
+# POSTGRES_PASSWORD and DATABASE_URL. No-op once .env exists.
+[ -f .env ] || { cp .env.example .env && \
+  sed -i "s/changeme/$(openssl rand -hex 32)/g" .env; }
 
-docker compose up -d postgres
-docker compose ps postgres        # expect (healthy) within ~30s
+docker compose up -d --wait postgres   # blocks until (healthy)
 docker compose exec postgres psql -U vargate -d vargate_telemetry -c "SELECT 1"
 ```
+
+> **If you re-ran the older non-idempotent bootstrap and your `.env`
+> password drifted from what's in the data volume**, realign without
+> destroying the volume:
+>
+> ```bash
+> PW=$(grep ^POSTGRES_PASSWORD= .env | cut -d= -f2-)
+> docker compose exec -T postgres psql -U vargate -d vargate_telemetry \
+>   -c "ALTER USER vargate PASSWORD '${PW}';"
+> ```
 
 Tear down (keeps the data volume):
 
