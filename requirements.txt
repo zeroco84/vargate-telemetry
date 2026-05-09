@@ -1,0 +1,6 @@
+# Runtime dependencies for the Telemetry image. Pinned by minor version so
+# pip resolution stays predictable; reverify on each upgrade.
+
+# T1.3: Celery on Redis broker
+celery[redis]>=5.3,<6
+flower>=2,<3
