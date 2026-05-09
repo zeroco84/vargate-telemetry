@@ -1,0 +1,48 @@
+# Vargate Telemetry — production overlay.
+#
+# Apply alongside the dev compose:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+#
+# What this overlay adds on top of docker-compose.yml:
+#
+#   - Per-service memory limits + reservations. These prevent a single
+#     runaway service (a Celery task allocating unboundedly, a Postgres
+#     query plan exploding, MinIO under load) from starving the host.
+#
+# What this overlay does NOT change:
+#
+#   - Internal-only networking. The dev compose already uses `expose:`
+#     everywhere and never declares `ports:`, so nothing in the stack
+#     binds to the host. The "nginx is the only externally reachable
+#     service" posture from CLAUDE.md is satisfied by virtue of having
+#     no externally reachable service at all in this stack — until T4+
+#     adds the FastAPI gateway and the nginx that fronts it.
+#   - `restart: unless-stopped`. Already on every service in the dev
+#     compose; the dev/prod split here doesn't toggle it.
+#   - Volumes. Inherited from the dev compose's named-volume
+#     declarations; they survive `down` (NOT `down -v`).
+#
+# Resource sizing is conservative for a single-host dev/staging
+# deployment. T4+ will revisit when real workload numbers exist.
+
+services:
+  postgres:
+    mem_limit: 2g
+    mem_reservation: 1g
+
+  minio:
+    mem_limit: 1g
+    mem_reservation: 512m
+
+  redis:
+    mem_limit: 1g
+    mem_reservation: 256m
+
+  celery-worker:
+    mem_limit: 1g
+    mem_reservation: 256m
+
+  celery-beat:
+    mem_limit: 512m
+    mem_reservation: 128m

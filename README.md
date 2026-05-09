@@ -184,6 +184,29 @@ and `vargate-hsm-tokens` volumes. The HSM volume holds the KEK that
 wraps every per-tenant DEK; losing it crypto-shreds every encrypted
 blob in the system.
 
+### Production overlay
+
+`docker-compose.prod.yml` layers per-service memory limits on the
+existing internal-only stack. Apply both files together:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+```
+
+Memory caps: Postgres 2 GB, MinIO 1 GB, Redis 1 GB, Celery worker 1 GB,
+Celery beat 512 MB. Reservations are half of the limit on each service.
+
+Verify nothing is exposed to the host (the only LISTEN sockets should
+be loopback-bound, e.g., dockerd / containerd internals):
+
+```bash
+ss -tlnp 2>/dev/null | grep -vE '(127\.0\.0\.1|\[::1\]|State)'
+# expect: empty output
+```
+
+T4+ adds the FastAPI gateway and an nginx ingress in front of it; until
+then this stack has zero externally-reachable surface.
+
 ## Contributing
 
 Contributions are welcome. Substantial code contributions require a
