@@ -31,6 +31,10 @@ class TenantDek(Base):
     tenant_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     wrapped_dek: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
     kek_label: Mapped[str] = mapped_column(String(128), nullable=False)
+    # HMAC-SHA256 over `tenant_id || ":" || wrapped_dek`. T2.0 verifies
+    # this on every read before unwrapping the DEK; tampering or
+    # cross-tenant swap fails closed with IntegrityError.
+    integrity_tag: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
@@ -51,6 +55,10 @@ class EncryptedSecret(Base, TenantOwned):
     secret_name: Mapped[str] = mapped_column(String(128), nullable=False)
     iv: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
     ciphertext: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    # HMAC-SHA256 over `tenant_id || ":" || ciphertext`. Verified by
+    # unseal_secret before AES-GCM decrypt; failure raises
+    # IntegrityError without touching the AEAD layer.
+    integrity_tag: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,

@@ -41,6 +41,10 @@ from vargate_telemetry.crypto.dek import (
     generate_dek,
 )
 from vargate_telemetry.crypto.hsm import unwrap_dek, wrap_dek
+from vargate_telemetry.crypto.integrity import (
+    compute_integrity_tag,
+    verify_integrity_tag,
+)
 from vargate_telemetry.db import session_scope
 from vargate_telemetry.models.secrets import EncryptedSecret, TenantDek
 
@@ -63,12 +67,14 @@ def provision_tenant_dek(tenant_id: str) -> None:
 
         dek = generate_dek()
         wrapped = wrap_dek(dek)
+        tag = compute_integrity_tag(tenant_id, wrapped)
 
         s.add(
             TenantDek(
                 tenant_id=tenant_id,
                 wrapped_dek=wrapped,
                 kek_label=kek_label,
+                integrity_tag=tag,
             )
         )
 
@@ -82,6 +88,9 @@ def get_tenant_dek(tenant_id: str) -> bytes:
         td = s.get(TenantDek, tenant_id)
         if td is None:
             raise LookupError(f"no DEK provisioned for tenant {tenant_id!r}")
+        verify_integrity_tag(
+            tenant_id, bytes(td.wrapped_dek), bytes(td.integrity_tag)
+        )
         return unwrap_dek(bytes(td.wrapped_dek))
 
 
@@ -101,9 +110,13 @@ def seal_secret(tenant_id: str, name: str, plaintext: bytes) -> None:
                 f"no DEK provisioned for tenant {tenant_id!r}; "
                 "call provision_tenant_dek first"
             )
+        verify_integrity_tag(
+            tenant_id, bytes(td.wrapped_dek), bytes(td.integrity_tag)
+        )
         dek = unwrap_dek(bytes(td.wrapped_dek))
 
         iv, ciphertext = encrypt_with_dek(dek, plaintext, aad=aad)
+        tag = compute_integrity_tag(tenant_id, ciphertext)
 
         existing = s.execute(
             select(EncryptedSecret).where(
@@ -114,6 +127,7 @@ def seal_secret(tenant_id: str, name: str, plaintext: bytes) -> None:
         if existing is not None:
             existing.iv = iv
             existing.ciphertext = ciphertext
+            existing.integrity_tag = tag
             existing.last_rotated_at = func.now()
         else:
             s.add(
@@ -122,6 +136,7 @@ def seal_secret(tenant_id: str, name: str, plaintext: bytes) -> None:
                     secret_name=name,
                     iv=iv,
                     ciphertext=ciphertext,
+                    integrity_tag=tag,
                 )
             )
 
@@ -139,6 +154,9 @@ def unseal_secret(tenant_id: str, name: str) -> bytes:
         td = s.get(TenantDek, tenant_id)
         if td is None:
             raise LookupError(f"no DEK provisioned for tenant {tenant_id!r}")
+        verify_integrity_tag(
+            tenant_id, bytes(td.wrapped_dek), bytes(td.integrity_tag)
+        )
         dek = unwrap_dek(bytes(td.wrapped_dek))
 
         record = s.execute(
@@ -152,6 +170,9 @@ def unseal_secret(tenant_id: str, name: str) -> bytes:
                 f"no secret named {name!r} for tenant {tenant_id!r}"
             )
 
+        verify_integrity_tag(
+            tenant_id, bytes(record.ciphertext), bytes(record.integrity_tag)
+        )
         return decrypt_with_dek(
             dek,
             bytes(record.iv),

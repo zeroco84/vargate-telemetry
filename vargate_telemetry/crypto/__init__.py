@@ -21,6 +21,11 @@ from vargate_telemetry.crypto.hsm import (
     unwrap_dek,
     wrap_dek,
 )
+from vargate_telemetry.crypto.integrity import (
+    IntegrityError,
+    compute_integrity_tag,
+    verify_integrity_tag,
+)
 from vargate_telemetry.crypto.seal import (
     get_tenant_dek,
     provision_tenant_dek,
@@ -29,6 +34,8 @@ from vargate_telemetry.crypto.seal import (
 )
 
 __all__ = [
+    "IntegrityError",
+    "compute_integrity_tag",
     "decrypt_with_dek",
     "encrypt_with_dek",
     "generate_dek",
@@ -38,5 +45,6 @@ __all__ = [
     "seal_secret",
     "unseal_secret",
     "unwrap_dek",
+    "verify_integrity_tag",
     "wrap_dek",
 ]
