@@ -22,6 +22,11 @@ celery_app.conf.update(
     enable_utc=True,
     task_acks_late=True,
     worker_prefetch_multiplier=1,
+    # The worker listens on -Q telemetry,default; route un-specified
+    # tasks to `default` so they actually get picked up. Without this,
+    # `add.delay(...)` lands in the Celery-stock `celery` queue and
+    # nothing consumes it.
+    task_default_queue="default",
 )
 
 # Alias so `celery -A vargate_telemetry.celery_app worker` (which looks up
