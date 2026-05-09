@@ -75,6 +75,8 @@ docker compose exec postgres psql -U vargate -d vargate_telemetry -c "
 
 ## Results
 
+### T1.8 baseline (no integrity tags)
+
 Run on 2026-05-09 against the dev compose stack on prod-1
 (postgres:16-alpine + SoftHSM2 in the celery-worker image, single
 process). 1,000 tenants, provision → seal → unseal per tenant, no DEK
@@ -90,6 +92,28 @@ caching.
 | seal      |      7.04 |     6.02 |    12.87 |    14.44 |
 | unseal    |      4.95 |     4.20 |     9.36 |    10.49 |
 
+### T2.0 re-run (with HMAC integrity tags)
+
+Same conditions, after the T2.0 commit added HMAC-SHA256 compute on
+write and constant-time verify on read for every wrapped DEK and every
+ciphertext. Tolerance per the T2.0 spec was **unseal p95 must not
+increase by more than 2 ms**.
+
+- **Tenants:** 1000
+- **Total wall-clock:** 18.45 s (Δ +0.74 s)
+- **Peak Python heap:** 1.19 MB (Δ +0.02 MB)
+
+| Operation | Total (s) | p50 (ms) | p95 (ms) | p99 (ms) | Δ p95 vs T1.8 |
+|-----------|-----------|----------|----------|----------|---------------|
+| provision |      5.94 |     5.00 |    10.93 |    12.87 |   +0.47 ms    |
+| seal      |      7.28 |     6.24 |    13.17 |    15.40 |   +0.30 ms    |
+| unseal    |      5.21 |     4.36 |     9.85 |    11.91 |   +0.49 ms    |
+
+Unseal p95 regression (+0.49 ms) is well under the 2 ms tolerance.
+The HMAC compute + constant-time verify cost about 250 µs per
+operation amortized — a couple of orders of magnitude under the
+HSM and SQL round-trip costs.
+
 ### What the numbers tell us
 
 - **HSM round trips are cheap on SoftHSM2.** Each `wrap_dek` /
@@ -101,9 +125,13 @@ caching.
   encrypted_secrets). Unseal skips the write, so it's ~30% faster.
   Provision is fastest because the DEK is generated in memory and the
   only HSM call is `wrap_dek` (one direction).
-- **Memory is essentially flat.** A 1.17 MB peak heap across 1,000
+- **Memory is essentially flat.** A 1.19 MB peak heap across 1,000
   tenants confirms session_scope and the ORM are not retaining state
   between operations — the per-operation `with` blocks close cleanly.
+- **HMAC integrity tags are effectively free at this layer.** The
+  KEK-derived HMAC key is module-cached after the first call; per-op
+  cost is just HKDF (cached output) + one SHA-256 compute + one
+  `compare_digest` — all microseconds.
 
 ## Concerns and follow-ups
 
