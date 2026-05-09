@@ -81,6 +81,13 @@ services:
       CELERY_BROKER_URL: ${CELERY_BROKER_URL}
       CELERY_RESULT_BACKEND: ${CELERY_RESULT_BACKEND}
       DATABASE_URL: ${DATABASE_URL}
+      PKCS11_MODULE: ${PKCS11_MODULE}
+      HSM_TOKEN_LABEL: ${HSM_TOKEN_LABEL}
+      HSM_KEK_LABEL: ${HSM_KEK_LABEL}
+      HSM_PIN: ${HSM_PIN}
+      HSM_SO_PIN: ${HSM_SO_PIN}
+    volumes:
+      - vargate-hsm-tokens:/var/lib/softhsm/tokens
     depends_on:
       redis:
         condition: service_healthy
@@ -101,6 +108,13 @@ services:
       CELERY_BROKER_URL: ${CELERY_BROKER_URL}
       CELERY_RESULT_BACKEND: ${CELERY_RESULT_BACKEND}
       DATABASE_URL: ${DATABASE_URL}
+      PKCS11_MODULE: ${PKCS11_MODULE}
+      HSM_TOKEN_LABEL: ${HSM_TOKEN_LABEL}
+      HSM_KEK_LABEL: ${HSM_KEK_LABEL}
+      HSM_PIN: ${HSM_PIN}
+      HSM_SO_PIN: ${HSM_SO_PIN}
+    volumes:
+      - vargate-hsm-tokens:/var/lib/softhsm/tokens
     depends_on:
       redis:
         condition: service_healthy
@@ -114,3 +128,5 @@ volumes:
     name: vargate-minio-data
   vargate-redis-data:
     name: vargate-redis-data
+  vargate-hsm-tokens:
+    name: vargate-hsm-tokens

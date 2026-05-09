@@ -10,6 +10,10 @@ sqlalchemy>=2.0,<3
 alembic>=1.13,<2
 psycopg[binary]>=3.1,<4
 
+# T1.6: PKCS#11 / SoftHSM2 envelope encryption
+python-pkcs11>=0.7,<1
+cryptography>=41,<46
+
 # Test deps. Kept in this single requirements file for now so the image
 # can run pytest without a second install layer; revisit when the prod
 # image is split out (later in the sprint plan).

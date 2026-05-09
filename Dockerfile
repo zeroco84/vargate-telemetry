@@ -5,10 +5,20 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# curl for in-container health probes; ca-certificates for HTTPS calls
-# from inside the workers (Anthropic admin API, etc., from T3.1+).
+# System dependencies:
+#   curl + ca-certificates — in-container health probes and HTTPS to
+#       Anthropic from the workers (T3.1+).
+#   softhsm2 — PKCS#11 software HSM. Provides /usr/lib/softhsm/libsofthsm2.so
+#       and the softhsm2-util token-management CLI used by the T1.6 KEK
+#       init script.
+#   build-essential — fallback for any C-extension wheels that pip can't
+#       resolve as binaries (notably python-pkcs11 on uncommon archs).
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends curl ca-certificates \
+    && apt-get install -y --no-install-recommends \
+         curl \
+         ca-certificates \
+         softhsm2 \
+         build-essential \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt ./
@@ -18,6 +28,7 @@ RUN pip install --no-cache-dir --upgrade pip \
 COPY alembic.ini ./
 COPY vargate_telemetry/ ./vargate_telemetry/
 COPY tests/ ./tests/
+COPY scripts/ ./scripts/
 
 ENV PYTHONPATH=/app \
     PYTHONUNBUFFERED=1 \
