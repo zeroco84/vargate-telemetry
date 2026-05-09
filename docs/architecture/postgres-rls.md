@@ -58,6 +58,22 @@ Three details that look small but matter:
    yields zero rows — the desired fail-closed default. Drop the `true`
    and a missing GUC is a runtime crash.
 
+## The connecting role MUST NOT be a superuser
+
+PostgreSQL superusers BYPASS RLS regardless of ENABLE / FORCE settings.
+The official `postgres` Docker image creates `POSTGRES_USER` as a
+superuser by default — so out of the box, the application role would
+silently sail over every policy.
+
+Migration `0002_drop_app_superuser` strips `SUPERUSER` from the app role
+so RLS actually applies. Anyone bringing up a fresh Postgres for
+Telemetry should run `alembic upgrade head` before opening the database
+to application traffic.
+
+If you ever need to add a new role for application traffic, create it
+with `NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE` and grant it only
+the privileges it actually needs.
+
 ## How the GUC gets set in production code
 
 `vargate_telemetry.db.session_scope(tenant_id)` is the only blessed
