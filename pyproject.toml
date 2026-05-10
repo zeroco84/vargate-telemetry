@@ -75,4 +75,9 @@ select = ["E", "F", "I", "B", "UP"]
 [tool.pytest.ini_options]
 minversion = "8.0"
 testpaths = ["tests"]
+# Add tests/ to sys.path so test modules can import shared helpers like
+# `from fixtures.mock_anthropic_records import ...` without the tests
+# directory needing to be a package (which would conflict with the
+# setuptools `exclude = ["tests*"]` above).
+pythonpath = ["tests"]
 addopts = "-ra"

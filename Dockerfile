@@ -44,6 +44,11 @@ RUN --mount=type=ssh \
     && pip install --no-cache-dir -r requirements.txt
 
 COPY alembic.ini ./
+# pyproject.toml carries the [tool.pytest.ini_options] block (testpaths,
+# pythonpath, etc.). Without it in the image, pytest can't find shared
+# test helpers like tests/fixtures/. Lands after the pip install layer
+# so changes to project metadata don't invalidate the dependency cache.
+COPY pyproject.toml ./
 COPY vargate_telemetry/ ./vargate_telemetry/
 COPY tests/ ./tests/
 COPY scripts/ ./scripts/
