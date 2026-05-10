@@ -86,12 +86,14 @@ services:
     environment:
       CELERY_BROKER_URL: ${CELERY_BROKER_URL}
       CELERY_RESULT_BACKEND: ${CELERY_RESULT_BACKEND}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
       DATABASE_URL: ${DATABASE_URL}
       PKCS11_MODULE: ${PKCS11_MODULE}
       HSM_TOKEN_LABEL: ${HSM_TOKEN_LABEL}
       HSM_KEK_LABEL: ${HSM_KEK_LABEL}
       HSM_PIN: ${HSM_PIN}
       HSM_SO_PIN: ${HSM_SO_PIN}
+      STRIPE_API_KEY_TEST: ${STRIPE_API_KEY_TEST:-}
     volumes:
       - vargate-hsm-tokens:/var/lib/softhsm/tokens
     depends_on:
@@ -117,12 +119,14 @@ services:
     environment:
       CELERY_BROKER_URL: ${CELERY_BROKER_URL}
       CELERY_RESULT_BACKEND: ${CELERY_RESULT_BACKEND}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
       DATABASE_URL: ${DATABASE_URL}
       PKCS11_MODULE: ${PKCS11_MODULE}
       HSM_TOKEN_LABEL: ${HSM_TOKEN_LABEL}
       HSM_KEK_LABEL: ${HSM_KEK_LABEL}
       HSM_PIN: ${HSM_PIN}
       HSM_SO_PIN: ${HSM_SO_PIN}
+      STRIPE_API_KEY_TEST: ${STRIPE_API_KEY_TEST:-}
     volumes:
       - vargate-hsm-tokens:/var/lib/softhsm/tokens
     depends_on:
