@@ -6,4 +6,4 @@
 # Import side-effect: each submodule registers its tasks with celery_app
 # at import time, so the worker only needs to load `vargate_telemetry.tasks`
 # (which it does via celery_app's `include=[...]`) to discover them all.
-from vargate_telemetry.tasks import diagnostics  # noqa: F401
+from vargate_telemetry.tasks import diagnostics, metering  # noqa: F401

@@ -29,6 +29,17 @@ celery_app.conf.update(
     task_default_queue="default",
 )
 
+# Beat schedule. Beat runs scheduled tasks; the worker executes them.
+# T2.3: the metering flush moves Redis counters into Postgres every
+# 60 seconds. T3+ will add more schedules here.
+celery_app.conf.beat_schedule = {
+    "flush-meter-counters": {
+        "task": "vargate_telemetry.tasks.metering.flush_counters",
+        "schedule": 60.0,  # every 60 seconds
+        "options": {"queue": "default"},
+    },
+}
+
 # Alias so `celery -A vargate_telemetry.celery_app worker` (which looks up
 # the default attribute name `app`) resolves the same instance.
 app = celery_app
