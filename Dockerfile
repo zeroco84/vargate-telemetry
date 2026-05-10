@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.4
 # Vargate Telemetry — Python image shared by celery-worker, celery-beat,
 # and (from T1.4) the FastAPI gateway. Single image, per-service commands.
 
@@ -13,16 +14,33 @@ WORKDIR /app
 #       init script.
 #   build-essential — fallback for any C-extension wheels that pip can't
 #       resolve as binaries (notably python-pkcs11 on uncommon archs).
+#   git + openssh-client — required to pip install vargate-audit-chain
+#       from the vargate-proxy repo over Git+SSH (T2.2). Build host must
+#       supply an SSH agent that has read access to the proxy repo:
+#           docker compose build --ssh default celery-worker
+#       (or wherever the agent socket lives).
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
          curl \
          ca-certificates \
          softhsm2 \
          build-essential \
+         git \
+         openssh-client \
     && rm -rf /var/lib/apt/lists/*
 
+# Trust github.com's host key non-interactively so the SSH-mounted pip
+# install below doesn't fail with "Host key verification failed".
+RUN mkdir -p /root/.ssh \
+    && ssh-keyscan github.com >> /root/.ssh/known_hosts
+
 COPY requirements.txt ./
-RUN pip install --no-cache-dir --upgrade pip \
+# BuildKit SSH agent forwarding: --mount=type=ssh exposes the host's
+# SSH agent to this RUN step so pip can clone the private vargate-proxy
+# repo to install vargate-audit-chain. The mount is ephemeral and never
+# baked into image layers.
+RUN --mount=type=ssh \
+    pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir -r requirements.txt
 
 COPY alembic.ini ./

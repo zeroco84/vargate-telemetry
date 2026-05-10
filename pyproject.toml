@@ -37,7 +37,13 @@ classifiers = [
   "Topic :: System :: Monitoring",
   "Typing :: Typed",
 ]
-dependencies = []
+dependencies = [
+  # Shared per-tenant hash-chain + Merkle primitives. Apache 2.0,
+  # consumed from the vargate-proxy repo via Git+SSH. Pinned to a
+  # specific commit so production builds are reproducible; bump the
+  # pinned SHA deliberately when picking up upstream changes.
+  "vargate-audit-chain @ git+ssh://git@github.com/zeroco84/vargate-proxy.git@983a656#subdirectory=packages/audit-chain",
+]
 
 [project.optional-dependencies]
 dev = [
