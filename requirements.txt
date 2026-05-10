@@ -21,7 +21,7 @@ pydantic>=2.5,<3
 # Apache 2.0 package; consumed via Git+SSH pinned to a specific SHA
 # for reproducible builds. Bump the SHA deliberately when picking up
 # upstream changes.
-vargate-audit-chain @ git+ssh://git@github.com/zeroco84/vargate-proxy.git@983a656#subdirectory=packages/audit-chain
+vargate-audit-chain @ git+ssh://git@github.com/zeroco84/vargate.ai.git@712ec02#subdirectory=packages/audit-chain
 
 # Test deps. Kept in this single requirements file for now so the image
 # can run pytest without a second install layer; revisit when the prod
