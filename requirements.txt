@@ -17,6 +17,11 @@ cryptography>=41,<46
 # T2.1: Pydantic schemas for the API surface
 pydantic>=2.5,<3
 
+# T2.4: Stripe usage-metering dispatch (test-mode key only this sprint).
+# Pinned by major version; the SubscriptionItem.create_usage_record API
+# is stable across 8.x, and we'll re-pin when promoting from test to live.
+stripe>=8,<9
+
 # T2.2: Shared chain + Merkle primitives extracted from vargate-proxy.
 # Apache 2.0 package; consumed via Git+SSH pinned to a specific SHA
 # for reproducible builds. Bump the SHA deliberately when picking up

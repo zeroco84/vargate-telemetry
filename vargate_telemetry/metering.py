@@ -165,9 +165,20 @@ def _upsert_usage(
     new increments into any existing row for the same
     (tenant_id, bucket_start, record_type), so repeated flushes that
     span the same minute bucket never double-count.
+
+    After the UPSERT, dispatch Stripe usage events for the same items
+    under the same transaction (T2.4). Dispatch failures land in
+    `billing_retry` instead of raising — Stripe outages must not block
+    metering durability. The idempotency key is derived from
+    (tenant, record_type, bucket_start), so a flush replayed after a
+    worker crash never double-charges.
     """
     if not items:
         return
+
+    # Lazy import to keep `metering` importable in environments that
+    # haven't installed `stripe` yet (e.g. test discovery on a clean box).
+    from vargate_telemetry.billing import report_usage
 
     with session_scope(tenant_id) as s:
         for record_type, bucket_start, count in items:
@@ -187,3 +198,4 @@ def _upsert_usage(
                     "record_count": count,
                 },
             )
+        report_usage(s, tenant_id, items)
