@@ -91,27 +91,10 @@ ipython_config.py
 # Sphinx
 docs/_build/
 
-# --- Node / Vite (for ui/) --------------------------------------------------
-node_modules/
-.pnp/
-.pnp.js
-.pnp.cjs
-.yarn/cache
-.yarn/install-state.gz
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-pnpm-debug.log*
-.npm/
-
-# Vite output
-dist/
-dist-ssr/
-.vite/
-*.local
-
-# Storybook build output
-storybook-static/
+# NOTE: Node / Vite / Storybook patterns intentionally absent —
+# this repo ships backend only. The Ogma dashboard UI lives in the
+# proprietary `vargate-frontend` repo. If a node_modules/ appears
+# here, something has gone wrong; remove it instead of gitignoring it.
 
 # --- Editors / IDEs ---------------------------------------------------------
 .idea/
