@@ -70,6 +70,16 @@ class User(Base):
     last_login_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True)
     )
+    # T4.7: timestamp of the latest successful SSO callback for this
+    # user. Used by the time-to-first-pull histogram (delta from this
+    # moment to the first telemetry_records row for the tenant). Set
+    # on every callback, not just first-ever — re-entering the
+    # onboarding flow after a bounce resets the clock to the most
+    # recent sign-in, which matches the user's lived "started now"
+    # intent.
+    sso_sign_in_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True),
+    )
 
     __table_args__ = (
         UniqueConstraint(

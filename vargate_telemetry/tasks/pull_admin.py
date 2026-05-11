@@ -52,8 +52,9 @@ from vargate_telemetry.anthropic import (
 )
 from vargate_telemetry.celery_app import celery_app
 from vargate_telemetry.chain import append_telemetry_record
-from vargate_telemetry.db import scheduler_session_scope, session_scope
+from vargate_telemetry.db import engine, scheduler_session_scope, session_scope
 from vargate_telemetry.metering import increment
+from vargate_telemetry.metrics import observe_first_pull_if_first
 
 _log = logging.getLogger(__name__)
 
@@ -70,6 +71,40 @@ DEFAULT_BACKFILL_CHUNK_DAYS = 7
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _maybe_observe_first_pull(tenant_id: str, inserted: int) -> None:
+    """T4.7: emit the time-to-first-pull histogram observation if this
+    pull was the first one to land a row for this tenant. Idempotent
+    on a per-tenant basis via Redis SETNX inside
+    `observe_first_pull_if_first`.
+
+    Runs under the bootstrap role (no RLS GUC) because the lookup is
+    on `users` (no RLS) and the per-tenant SELECT is by `tenant_id`.
+    A best-effort signal: any error here is logged and swallowed so a
+    metrics failure can never abort an otherwise-successful pull.
+    """
+    if inserted <= 0:
+        return
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                sql_text(
+                    "SELECT sso_sign_in_at FROM users "
+                    "WHERE tenant_id = :t AND sso_sign_in_at IS NOT NULL "
+                    "ORDER BY sso_sign_in_at ASC LIMIT 1"
+                ),
+                {"t": tenant_id},
+            ).first()
+        if row is None or row.sso_sign_in_at is None:
+            return
+        observe_first_pull_if_first(tenant_id, row.sso_sign_in_at)
+    except Exception:
+        # Never let a metrics-side error abort or fail a successful
+        # pull. Log loudly so we notice in monitoring.
+        _log.exception(
+            "first-pull metric observation failed for %s", tenant_id
+        )
 
 
 def _load_cursor(
@@ -200,6 +235,11 @@ def _pull_admin_for_tenant(
                 pull_started,
                 status="ok",
             )
+
+        # 4. T4.7: emit time-to-first-pull histogram observation
+        # if this pull was the first one to insert a row for the
+        # tenant. Idempotent — only observes once per tenant.
+        _maybe_observe_first_pull(tenant_id, inserted)
     finally:
         if owned_client:
             client.close()
@@ -306,6 +346,12 @@ def _backfill_admin_for_tenant(
 
             chunks_processed += 1
             chunk_start = chunk_end
+
+            # T4.7: emit time-to-first-pull observation as soon as we
+            # know the first chunk landed at least one row. The Redis
+            # SETNX guard makes this safe to call on every chunk —
+            # only the first call per tenant observes.
+            _maybe_observe_first_pull(tenant_id, inserted)
 
             # Emit a PROGRESS tick AFTER the cursor advance, so a
             # status poll that races the chunk boundary sees the

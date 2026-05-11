@@ -37,6 +37,7 @@ from vargate_telemetry.auth.jwt import (
     SESSION_COOKIE_NAME,
     SESSION_TOKEN_TTL_SECONDS,
 )
+from vargate_telemetry.metrics import track_step
 
 
 router = APIRouter()
@@ -130,25 +131,29 @@ def sso_google_callback(
     ogma_oauth_state: Optional[str] = Cookie(default=None),
     ogma_oauth_nonce: Optional[str] = Cookie(default=None),
 ) -> SsoCallbackResponse:
-    try:
-        result = handle_sso_callback(
-            "google",
-            code=body.code,
-            body_state=body.state,
-            state_cookie=ogma_oauth_state,
-            nonce_cookie=ogma_oauth_nonce,
-            redirect_uri=_redirect_uri("google"),
-        )
-    except SsoCallbackError as exc:
-        raise _to_http_error(exc) from exc
+    # T4.7: track_step observes on success only — a SsoCallbackError
+    # path raises through the context manager and bypasses the
+    # histogram observation.
+    with track_step("sso"):
+        try:
+            result = handle_sso_callback(
+                "google",
+                code=body.code,
+                body_state=body.state,
+                state_cookie=ogma_oauth_state,
+                nonce_cookie=ogma_oauth_nonce,
+                redirect_uri=_redirect_uri("google"),
+            )
+        except SsoCallbackError as exc:
+            raise _to_http_error(exc) from exc
 
-    _set_session_cookie(response, result.session_jwt)
-    _clear_oauth_cookies(response)
-    return SsoCallbackResponse(
-        user_id=result.user_id,
-        email=result.email,
-        name=result.name,
-    )
+        _set_session_cookie(response, result.session_jwt)
+        _clear_oauth_cookies(response)
+        return SsoCallbackResponse(
+            user_id=result.user_id,
+            email=result.email,
+            name=result.name,
+        )
 
 
 @router.post(
@@ -164,25 +169,26 @@ def sso_microsoft_callback(
     ogma_oauth_state: Optional[str] = Cookie(default=None),
     ogma_oauth_nonce: Optional[str] = Cookie(default=None),
 ) -> SsoCallbackResponse:
-    try:
-        result = handle_sso_callback(
-            "microsoft",
-            code=body.code,
-            body_state=body.state,
-            state_cookie=ogma_oauth_state,
-            nonce_cookie=ogma_oauth_nonce,
-            redirect_uri=_redirect_uri("microsoft"),
-        )
-    except SsoCallbackError as exc:
-        raise _to_http_error(exc) from exc
+    with track_step("sso"):  # T4.7
+        try:
+            result = handle_sso_callback(
+                "microsoft",
+                code=body.code,
+                body_state=body.state,
+                state_cookie=ogma_oauth_state,
+                nonce_cookie=ogma_oauth_nonce,
+                redirect_uri=_redirect_uri("microsoft"),
+            )
+        except SsoCallbackError as exc:
+            raise _to_http_error(exc) from exc
 
-    _set_session_cookie(response, result.session_jwt)
-    _clear_oauth_cookies(response)
-    return SsoCallbackResponse(
-        user_id=result.user_id,
-        email=result.email,
-        name=result.name,
-    )
+        _set_session_cookie(response, result.session_jwt)
+        _clear_oauth_cookies(response)
+        return SsoCallbackResponse(
+            user_id=result.user_id,
+            email=result.email,
+            name=result.name,
+        )
 
 
 @router.get(
