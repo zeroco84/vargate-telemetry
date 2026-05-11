@@ -22,6 +22,11 @@ pydantic>=2.5,<3
 # is stable across 8.x, and we'll re-pin when promoting from test to live.
 stripe>=8,<9
 
+# T3.1: Anthropic Admin API client — retry + backoff on 429.
+# tenacity provides the Retrying primitive used inside the client so
+# tests can inject a zero-wait policy without monkey-patching.
+tenacity>=8,<10
+
 # T2.2: Shared chain + Merkle primitives extracted from vargate-proxy.
 # Apache 2.0 package; consumed via Git+SSH pinned to a specific SHA
 # for reproducible builds. Bump the SHA deliberately when picking up
@@ -33,3 +38,9 @@ vargate-audit-chain @ git+ssh://git@github.com/zeroco84/vargate.ai.git@712ec02#s
 # image is split out (later in the sprint plan).
 pytest>=8,<9
 httpx>=0.27,<1
+
+# T3.1: VCR cassette replay for the Anthropic Admin API client.
+# Tests rely on httpx.MockTransport for retry/pagination scenarios;
+# vcrpy is here for the redaction-config test now and for T3.2's
+# real cassette recordings (filter_headers redacts the x-api-key).
+vcrpy>=6,<7
