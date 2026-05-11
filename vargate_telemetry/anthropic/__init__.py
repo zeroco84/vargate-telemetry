@@ -8,9 +8,19 @@ from vargate_telemetry.anthropic.exceptions import (
     AnthropicAPIError,
     RateLimited,
 )
+from vargate_telemetry.anthropic.types import (
+    Member,
+    UsageBreakdown,
+    UsageBucket,
+    Workspace,
+)
 
 __all__ = [
     "AnthropicAPIError",
     "AnthropicAdminClient",
+    "Member",
     "RateLimited",
+    "UsageBreakdown",
+    "UsageBucket",
+    "Workspace",
 ]

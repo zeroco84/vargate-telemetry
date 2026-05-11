@@ -25,6 +25,7 @@ T3.2 — this sprint is just the transport layer.
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, Iterator, Optional
 
 import httpx
@@ -39,6 +40,11 @@ from tenacity import (
 from vargate_telemetry.anthropic.exceptions import (
     AnthropicAPIError,
     RateLimited,
+)
+from vargate_telemetry.anthropic.types import (
+    Member,
+    UsageBucket,
+    Workspace,
 )
 
 
@@ -144,11 +150,11 @@ class AnthropicAdminClient:
     def paginate(
         self, path: str, params: Optional[dict] = None
     ) -> Iterator[dict]:
-        """Yield rows from `data` across all cursor pages.
+        """Yield rows from `data` across pages — `next_page` cursor variant.
 
-        Anthropic's Admin endpoints page via a `next_page` cursor token
-        on the response envelope. The generator stops when `next_page`
-        is absent or empty.
+        Kept from T3.1 for any endpoint that uses a `next_page` cursor
+        on the envelope. The Anthropic Admin API uses a different
+        pattern (see `_paginate_admin`); use that for admin endpoints.
         """
         p = dict(params or {})
         while True:
@@ -158,3 +164,63 @@ class AnthropicAdminClient:
             if not cursor:
                 return
             p["page"] = cursor
+
+    def _paginate_admin(
+        self, path: str, params: Optional[dict] = None
+    ) -> Iterator[dict]:
+        """Yield rows from `data` across pages — Anthropic Admin variant.
+
+        Pagination contract: each response envelope carries `data`,
+        `has_more`, `first_id`, and `last_id`. When `has_more` is true,
+        the next request adds `after_id=<last_id>` to advance. Stops
+        when `has_more` is false or `last_id` is missing.
+
+        T3.2: shape is best-guess scaffolding. T3.x's first real
+        cassette recording will confirm; mismatches show up here as
+        either an early `return` (we stop before all pages) or an
+        infinite loop (we fail to advance). Test
+        `test_paginate_admin_advances_after_id` pins the contract.
+        """
+        p = dict(params or {})
+        while True:
+            envelope = self._get(path, p)
+            yield from envelope.get("data", [])
+            if not envelope.get("has_more"):
+                return
+            last_id = envelope.get("last_id")
+            if last_id is None:
+                return
+            p["after_id"] = last_id
+
+    def list_workspaces(self) -> Iterator[Workspace]:
+        """Yield every workspace in the organization."""
+        for raw in self._paginate_admin("/v1/organizations/workspaces"):
+            yield Workspace.model_validate(raw)
+
+    def list_members(self) -> Iterator[Member]:
+        """Yield every member user in the organization."""
+        for raw in self._paginate_admin("/v1/organizations/users"):
+            yield Member.model_validate(raw)
+
+    def list_usage(
+        self,
+        *,
+        starting_at: datetime,
+        ending_at: datetime,
+        bucket_width: str = "1d",
+    ) -> Iterator[UsageBucket]:
+        """Yield time-bucketed usage rows for `[starting_at, ending_at)`.
+
+        `bucket_width` is the per-bucket granularity. Common values:
+        `1d` (daily, the default) and `1h` (hourly). T3.5's scheduled
+        pull task fans these out per tenant into `telemetry_records`.
+        """
+        params = {
+            "starting_at": starting_at.isoformat(),
+            "ending_at": ending_at.isoformat(),
+            "bucket_width": bucket_width,
+        }
+        for raw in self._paginate_admin(
+            "/v1/organizations/usage_report/messages", params
+        ):
+            yield UsageBucket.model_validate(raw)
