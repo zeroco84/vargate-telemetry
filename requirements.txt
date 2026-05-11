@@ -14,8 +14,10 @@ psycopg[binary]>=3.1,<4
 python-pkcs11>=0.7,<1
 cryptography>=41,<46
 
-# T2.1: Pydantic schemas for the API surface
-pydantic>=2.5,<3
+# T2.1: Pydantic schemas for the API surface.
+# T4.2: `[email]` extra installs email-validator so `EmailStr` resolves
+# at FastAPI app construction (used by SsoCallbackResponse / MeResponse).
+pydantic[email]>=2.5,<3
 
 # T2.4: Stripe usage-metering dispatch (test-mode key only this sprint).
 # Pinned by major version; the SubscriptionItem.create_usage_record API
@@ -33,6 +35,17 @@ tenacity>=8,<10
 # `tests/test_openapi_spec.py` parse test. PyYAML comes in transitively
 # via alembic, so no explicit pin needed here.
 openapi-spec-validator>=0.7,<1
+
+# T4.2: FastAPI gateway + SSO. The gateway serves the contract from
+# T4.0; SSO callbacks issue JWT session cookies. uvicorn is the ASGI
+# server in the new `gateway` compose service. python-multipart is
+# FastAPI's optional dep for parsing form-encoded bodies (not strictly
+# needed by the SSO callbacks today, but standard hygiene).
+fastapi>=0.115,<1
+uvicorn[standard]>=0.32,<1
+python-multipart>=0.0.12,<1
+authlib>=1.3,<2
+pyjwt[crypto]>=2.9,<3
 
 # T2.2: Shared chain + Merkle primitives extracted from vargate-proxy.
 # Apache 2.0 package; consumed via Git+SSH pinned to a specific SHA

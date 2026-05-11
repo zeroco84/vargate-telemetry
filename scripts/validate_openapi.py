@@ -93,34 +93,114 @@ def _validate_yaml_against_openapi_31() -> int:
 def _diff_runtime_against_yaml() -> int:
     """Step 2: runtime FastAPI app.openapi() drift check (gated).
 
-    Disabled by default until the onboarding routes land in T4.2+.
-    Enable per-environment with `OGMA_OPENAPI_DIFF_ROUTES=1`. The
-    real implementation will:
+    With T4.2 the gateway exists, so we can actually compare. Enabled
+    per-environment with `OGMA_OPENAPI_DIFF_ROUTES=1`. T4.2's
+    contract surface is the three SSO/me operations; later sprints
+    flesh out the rest. The diff:
 
-      - Import `vargate_telemetry.api` (or whatever the FastAPI
-        app module ends up named) and call `app.openapi()`.
-      - Compare path set, method set per path, and operationId set
-        against the committed YAML.
-      - Exit 2 on any difference, with a one-line summary of the
-        drift category (path-missing / method-missing / etc.).
-
-    Today, returning 0 means "nothing to check yet."
+      - Compares the path set in the YAML to the path set in
+        `app.openapi()["paths"]`. Paths declared in YAML but not
+        implemented are NOT yet a failure (T4 ships incrementally;
+        the onboarding endpoints come online sprint-by-sprint).
+        Paths IMPLEMENTED but not in YAML ARE a failure — that's
+        drift.
+      - For every operation present in BOTH, checks that the
+        operationId matches. Misalignment here breaks the
+        frontend's generated types.
     """
     if os.environ.get("OGMA_OPENAPI_DIFF_ROUTES") != "1":
         print(
             "SKIP: runtime/spec diff disabled "
-            "(set OGMA_OPENAPI_DIFF_ROUTES=1 to enable once routes exist)."
+            "(set OGMA_OPENAPI_DIFF_ROUTES=1 to enable per env)."
         )
         return 0
 
-    # Placeholder for T4.2+ — fail loud rather than silently passing,
-    # so a CI job that opts in but is misconfigured doesn't fake-pass.
-    print(
-        "FAIL: OGMA_OPENAPI_DIFF_ROUTES=1 was set but no FastAPI app is "
-        "wired into this script yet (T4.2 hand-off).",
-        file=sys.stderr,
+    try:
+        import yaml
+    except ImportError:
+        print("FAIL: PyYAML not importable", file=sys.stderr)
+        return 1
+
+    try:
+        from vargate_telemetry.api.app import app
+    except Exception as exc:
+        print(
+            f"FAIL: could not import the FastAPI app — {exc}",
+            file=sys.stderr,
+        )
+        return 2
+
+    runtime = app.openapi()
+    runtime_paths: dict = runtime.get("paths") or {}
+
+    with SPEC_PATH.open() as fh:
+        committed = yaml.safe_load(fh)
+    committed_paths: dict = committed.get("paths") or {}
+
+    # Paths implemented but missing from the YAML — drift we must
+    # never tolerate. The contract is the source of truth.
+    undeclared: list[str] = []
+    for path, methods in runtime_paths.items():
+        if path not in committed_paths:
+            method_list = ", ".join(
+                m.upper()
+                for m in methods
+                if m in ("get", "post", "put", "patch", "delete")
+            )
+            undeclared.append(f"{method_list} {path}")
+            continue
+
+    if undeclared:
+        print(
+            "FAIL: routes implemented but absent from the YAML contract:",
+            file=sys.stderr,
+        )
+        for u in undeclared:
+            print(f"  - {u}", file=sys.stderr)
+        return 2
+
+    # operationId drift on operations present in both.
+    op_drift: list[str] = []
+    for path, methods in runtime_paths.items():
+        for method, op in methods.items():
+            if method not in ("get", "post", "put", "patch", "delete"):
+                continue
+            committed_op = (committed_paths[path] or {}).get(method)
+            if committed_op is None:
+                op_drift.append(
+                    f"{method.upper()} {path}: method implemented but not in YAML"
+                )
+                continue
+            runtime_id = op.get("operationId")
+            yaml_id = committed_op.get("operationId")
+            if runtime_id and yaml_id and runtime_id != yaml_id:
+                op_drift.append(
+                    f"{method.upper()} {path}: operationId "
+                    f"{runtime_id!r} (runtime) vs {yaml_id!r} (YAML)"
+                )
+
+    if op_drift:
+        print("FAIL: operationId drift:", file=sys.stderr)
+        for d in op_drift:
+            print(f"  - {d}", file=sys.stderr)
+        return 2
+
+    # Count how many YAML-declared paths are NOT yet implemented.
+    # This is information, not failure — sprints fill these in over
+    # time. Helps planning to see the gap.
+    not_yet_implemented = sorted(
+        path for path in committed_paths if path not in runtime_paths
     )
-    return 2
+    print(
+        f"OK: runtime has {len(runtime_paths)} paths, YAML has "
+        f"{len(committed_paths)} paths "
+        f"({len(not_yet_implemented)} contract paths not yet implemented)."
+    )
+    if not_yet_implemented:
+        print("  Not yet implemented (informational):")
+        for path in not_yet_implemented:
+            print(f"    - {path}")
+    return 0
 
 
 def main() -> int:

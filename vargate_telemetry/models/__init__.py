@@ -10,16 +10,19 @@ from vargate_telemetry.models.records import TelemetryRecord
 from vargate_telemetry.models.secrets import EncryptedSecret, TenantDek
 from vargate_telemetry.models.tenants import Tenant
 from vargate_telemetry.models.usage import UsageRecord
+from vargate_telemetry.models.users import Session, User
 
 __all__ = [
     "Base",
     "BillingRetry",
     "EncryptedSecret",
     "PullState",
+    "Session",
     "TelemetryRecord",
     "Tenant",
     "TenantBilling",
     "TenantDek",
     "TenantOwned",
     "UsageRecord",
+    "User",
 ]
