@@ -42,7 +42,7 @@ dependencies = [
   # consumed from the vargate-proxy repo via Git+SSH. Pinned to a
   # specific commit so production builds are reproducible; bump the
   # pinned SHA deliberately when picking up upstream changes.
-  "vargate-audit-chain @ git+ssh://git@github.com/zeroco84/vargate.ai.git@712ec02#subdirectory=packages/audit-chain",
+  "vargate-audit-chain @ git+ssh://git@github.com/zeroco84/vargate.ai.git@2ef8ada#subdirectory=packages/audit-chain",
 ]
 
 [project.optional-dependencies]
