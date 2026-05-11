@@ -4,8 +4,8 @@
 """Onboarding routes — key validation, region select, backfill kick-off.
 
 T4.4 ships `POST /onboarding/validate-key`. T4.5 adds
-`POST /onboarding/select-region`. T4.6 will add `start-backfill` +
-`backfill-status`.
+`POST /onboarding/select-region`. T4.6 adds `start-backfill` +
+`backfill-status` — the last leg of the onboarding flow.
 
 `validate-key` is the live probe the UI uses to gate the "Continue"
 button on the paste-key screen. It builds an EPHEMERAL
@@ -46,10 +46,11 @@ from __future__ import annotations
 import os
 import uuid
 from datetime import datetime, timezone
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Response, status
+from celery.result import AsyncResult
+from fastapi import APIRouter, Depends, HTTPException, Path, Response, status
 from pydantic import BaseModel, Field
 from sqlalchemy import text as sql_text
 
@@ -64,10 +65,12 @@ from vargate_telemetry.auth.jwt import (
     issue_session_jwt,
 )
 from vargate_telemetry.auth.middleware import AuthenticatedUser, current_user
+from vargate_telemetry.celery_app import celery_app
 from vargate_telemetry.crypto.dek import encrypt_with_dek, generate_dek
 from vargate_telemetry.crypto.hsm import wrap_dek
 from vargate_telemetry.crypto.integrity import compute_integrity_tag
 from vargate_telemetry.db import SessionLocal
+from vargate_telemetry.tasks.pull_admin import backfill_admin_for_tenant
 
 
 router = APIRouter()
@@ -598,3 +601,345 @@ def _reissue_and_set_cookie(
         tenant_id=tenant_id,
     )
     _set_session_cookie(response, new_jwt)
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# /onboarding/start-backfill  + /onboarding/backfill-status/{task_id}
+#
+# T4.6's loading-screen pair. The frontend POSTs `start-backfill`
+# once on mount, then polls `backfill-status` every ~2s until the
+# task hits SUCCESS or FAILURE.
+#
+# Both endpoints are tenant-scoped: the user can only schedule a
+# backfill for THEIR OWN tenant, and they can only poll a task id
+# that was recorded against their own tenant's `tenants` row. The
+# task id is stored on the tenant row at enqueue time precisely so
+# the poll endpoint has something to gate against — Celery's own
+# AsyncResult can't tell us "this task id belongs to user X."
+# ───────────────────────────────────────────────────────────────────────────
+
+
+class StartBackfillRequest(BaseModel):
+    tenant_id: str = Field(..., description="The tenant to backfill.")
+    days: int = Field(
+        90,
+        ge=1,
+        le=365,
+        description=(
+            "How many days of history to pull. Defaults to 90 (the "
+            "T3.6 backfill default). Bounded to avoid runaway pulls."
+        ),
+    )
+
+
+class StartBackfillResponse(BaseModel):
+    task_id: str
+
+
+class BackfillStatusResponse(BaseModel):
+    state: str  # PENDING | STARTED | PROGRESS | SUCCESS | FAILURE
+    chunks_processed: Optional[int] = None
+    inserted: Optional[int] = None
+    deduped: Optional[int] = None
+    error: Optional[str] = None
+
+
+# ── Injection seams ────────────────────────────────────────────────────────
+#
+# Production wires the live Celery task + the real AsyncResult. Tests
+# substitute lightweight stubs so we can assert on dispatch args and
+# control the polled state without standing up a worker.
+
+TaskDispatcher = Callable[[str, int], Any]
+"""(tenant_id, days) -> an object exposing `.id` (Celery's
+`AsyncResult` does; the test stub mimics)."""
+
+
+AsyncResultFactory = Callable[[str], Any]
+"""(task_id) -> an object exposing `.state` and `.info` like
+`celery.result.AsyncResult`."""
+
+
+def _default_task_dispatcher(tenant_id: str, days: int) -> Any:
+    return backfill_admin_for_tenant.delay(tenant_id, days=days)
+
+
+def _default_async_result_factory(task_id: str) -> AsyncResult:
+    return AsyncResult(task_id, app=celery_app)
+
+
+_task_dispatcher: TaskDispatcher = _default_task_dispatcher
+_async_result_factory: AsyncResultFactory = _default_async_result_factory
+
+
+def set_task_dispatcher_for_test(
+    dispatcher: Optional[TaskDispatcher],
+) -> None:
+    """Substitute the Celery `.delay` dispatcher for tests. Pass `None` to reset."""
+    global _task_dispatcher
+    _task_dispatcher = (
+        dispatcher if dispatcher is not None else _default_task_dispatcher
+    )
+
+
+def set_async_result_factory_for_test(
+    factory: Optional[AsyncResultFactory],
+) -> None:
+    """Substitute the AsyncResult factory for tests. Pass `None` to reset."""
+    global _async_result_factory
+    _async_result_factory = (
+        factory if factory is not None else _default_async_result_factory
+    )
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────
+
+
+def _fetch_user_tenant(user: AuthenticatedUser) -> Optional[tuple[str, bool]]:
+    """Return `(tenant_id, active)` for the authenticated user's tenant,
+    or `None` if the user has no tenant binding yet.
+
+    Reads `users.tenant_id` (no RLS — `users` is global) then joins
+    `tenants` (bootstrap-only access; we run as the bootstrap role
+    inside this short-lived session). Two round-trips would also work
+    but a single CTE / SELECT keeps the latency bounded.
+    """
+    user_uuid = _user_uuid_or_400(user.user_id)
+    s = SessionLocal()
+    try:
+        row = s.execute(
+            sql_text(
+                """
+                SELECT t.tenant_id, t.active
+                FROM users u
+                LEFT JOIN tenants t ON t.tenant_id = u.tenant_id
+                WHERE u.id = :uid
+                """
+            ),
+            {"uid": str(user_uuid)},
+        ).first()
+    finally:
+        s.close()
+    if row is None or row.tenant_id is None:
+        return None
+    return (row.tenant_id, bool(row.active))
+
+
+def _format_failure(info: Any) -> str:
+    """Render a FAILURE task's info as a short, leak-safe string.
+
+    Celery exposes the raised exception as `.info` (and `.result`). We
+    don't want stack traces in the response — the frontend renders this
+    inline. Format: `<ExceptionClass>: <message>`, truncated to 1000
+    chars per the YAML contract.
+    """
+    if info is None:
+        return "unknown_error: task failed without a reportable cause"
+    if isinstance(info, BaseException):
+        msg = f"{type(info).__name__}: {info}"
+    else:
+        msg = f"{type(info).__name__}: {info!s}"
+    return msg[:1000]
+
+
+# ── POST /onboarding/start-backfill ────────────────────────────────────────
+
+
+@router.post(
+    "/onboarding/start-backfill",
+    response_model=StartBackfillResponse,
+    operation_id="startBackfill",
+    tags=["onboarding"],
+    summary="Enqueue the historical backfill for the user's tenant",
+)
+def start_backfill(
+    body: StartBackfillRequest,
+    user: AuthenticatedUser = Depends(current_user),
+) -> StartBackfillResponse:
+    """Dispatch `backfill_admin_for_tenant` (T3.6) and record the task
+    id on the tenant row so the matching status endpoint can scope
+    polling.
+
+    Idempotency: if the tenant already has `initial_backfill_task_id`
+    set, the existing id is returned unchanged. This is what the
+    frontend's "refresh the page mid-backfill" path relies on — the
+    second page load re-POSTs and gets the same task to poll.
+    """
+    # 1. Cross-tenant guard. We compare the body's tenant_id against
+    # the SSO identity's bound tenant; mismatch is a 403 (the user
+    # cannot kick off provisioning against someone else's tenant).
+    if user.tenant_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "no_tenant_bound",
+                "message": (
+                    "Your session is not bound to a tenant yet. "
+                    "Complete `/onboarding/select-region` first."
+                ),
+            },
+        )
+    if body.tenant_id != user.tenant_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "code": "tenant_mismatch",
+                "message": (
+                    "You cannot start a backfill for a tenant you do "
+                    "not belong to."
+                ),
+            },
+        )
+
+    # 2. Tenant must exist and be active.
+    binding = _fetch_user_tenant(user)
+    if binding is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "code": "tenant_not_found",
+                "message": (
+                    "No matching tenant row. Your session may be "
+                    "stale — sign in again."
+                ),
+            },
+        )
+    tenant_id, active = binding
+    if not active:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "tenant_inactive",
+                "message": (
+                    "Tenant is inactive; reactivate before scheduling "
+                    "a backfill."
+                ),
+            },
+        )
+
+    # 3. Idempotency: if a backfill has already been enqueued, return
+    # the same id. The frontend's "refresh mid-poll" path needs this.
+    with SessionLocal() as s:
+        existing_id = s.execute(
+            sql_text(
+                "SELECT initial_backfill_task_id FROM tenants "
+                "WHERE tenant_id = :t"
+            ),
+            {"t": tenant_id},
+        ).scalar()
+    if existing_id:
+        return StartBackfillResponse(task_id=existing_id)
+
+    # 4. Dispatch via the injectable seam. The default returns the
+    # live Celery AsyncResult; tests substitute a stub.
+    async_result = _task_dispatcher(tenant_id, body.days)
+    task_id = getattr(async_result, "id", None)
+    if not task_id:
+        # Defensive: a dispatcher that returns something without `.id`
+        # is a configuration bug — surface it instead of returning a
+        # response the frontend can't poll.
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={
+                "code": "internal_error",
+                "message": (
+                    "Backfill task dispatcher returned no task id. "
+                    "Contact support."
+                ),
+            },
+        )
+
+    # 5. Record the task id on the tenant row. Bootstrap role: tenants
+    # is REVOKE'd from vargate_app per T3.4.
+    with SessionLocal() as s:
+        s.execute(
+            sql_text(
+                "UPDATE tenants SET initial_backfill_task_id = :tid, "
+                "                    updated_at = NOW() "
+                "WHERE tenant_id = :t"
+            ),
+            {"tid": task_id, "t": tenant_id},
+        )
+        s.commit()
+
+    return StartBackfillResponse(task_id=task_id)
+
+
+# ── GET /onboarding/backfill-status/{task_id} ──────────────────────────────
+
+
+@router.get(
+    "/onboarding/backfill-status/{task_id}",
+    response_model=BackfillStatusResponse,
+    operation_id="getBackfillStatus",
+    tags=["onboarding"],
+    summary="Poll the backfill task's progress",
+)
+def get_backfill_status(
+    task_id: str = Path(..., description="Task id from start-backfill."),
+    user: AuthenticatedUser = Depends(current_user),
+) -> BackfillStatusResponse:
+    """Reads Celery state for `task_id`, scoped to the user's tenant.
+
+    A task id that isn't recorded against the user's tenant returns
+    404 — this prevents (a) probing for foreign tenants' task ids
+    and (b) Celery's PENDING-vs-unknown ambiguity (Celery treats
+    "task id never existed" the same as "queued but not picked up").
+    """
+    if user.tenant_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "no_tenant_bound",
+                "message": (
+                    "Your session is not bound to a tenant yet. "
+                    "Complete `/onboarding/select-region` first."
+                ),
+            },
+        )
+
+    # 1. Tenant-scope the task id. SELECT initial_backfill_task_id
+    # WHERE tenant_id = user's tenant; only match-on-equal is OK.
+    with SessionLocal() as s:
+        recorded_id = s.execute(
+            sql_text(
+                "SELECT initial_backfill_task_id FROM tenants "
+                "WHERE tenant_id = :t"
+            ),
+            {"t": user.tenant_id},
+        ).scalar()
+    if not recorded_id or recorded_id != task_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "code": "task_not_found",
+                "message": (
+                    "No backfill task with that id is recorded against "
+                    "your tenant."
+                ),
+            },
+        )
+
+    # 2. Read Celery state.
+    result = _async_result_factory(task_id)
+    state = result.state or "PENDING"
+    info = result.info  # alias for `.result`
+
+    # 3. Translate to the contract. PROGRESS carries the meta dict
+    # the task emitted; SUCCESS carries the task's return value
+    # (which also has chunks_processed / inserted / deduped); FAILURE
+    # carries the exception; PENDING / STARTED have no detail to add.
+    payload: dict[str, Any] = {"state": state}
+
+    if state == "PROGRESS" and isinstance(info, dict):
+        payload["chunks_processed"] = int(info.get("chunks_processed", 0))
+        payload["inserted"] = int(info.get("inserted", 0))
+        payload["deduped"] = int(info.get("deduped", 0))
+    elif state == "SUCCESS" and isinstance(info, dict):
+        payload["chunks_processed"] = int(info.get("chunks_processed", 0))
+        payload["inserted"] = int(info.get("inserted", 0))
+        payload["deduped"] = int(info.get("deduped", 0))
+    elif state == "FAILURE":
+        payload["error"] = _format_failure(info)
+
+    return BackfillStatusResponse(**payload)

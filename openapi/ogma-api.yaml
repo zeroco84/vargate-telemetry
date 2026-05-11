@@ -243,10 +243,21 @@ components:
 
     BackfillState:
       type: string
-      enum: [PENDING, STARTED, SUCCESS, FAILURE]
+      enum: [PENDING, STARTED, PROGRESS, SUCCESS, FAILURE]
       description: |
-        Celery task state. PENDING = queued, STARTED = running,
-        SUCCESS = done, FAILURE = exhausted retries.
+        Celery task state.
+
+          - PENDING  — queued, worker has not picked it up yet.
+          - STARTED  — worker accepted the task but has not yet
+            crossed the first chunk boundary.
+          - PROGRESS — at least one 7-day chunk has completed; the
+            `meta` carries chunks_processed / inserted / deduped.
+            The frontend polls and re-renders the progress bar on
+            every PROGRESS tick.
+          - SUCCESS  — done. The task return value carries the final
+            totals; the response surfaces them via the same fields.
+          - FAILURE  — exhausted retries. `error` carries a short
+            human-readable summary (class name + message).
 
     BackfillStatus:
       type: object
@@ -258,8 +269,8 @@ components:
           type: integer
           minimum: 0
           description: |
-            Number of 7-day chunks the backfill has completed. Present
-            in STARTED / SUCCESS states; absent or 0 in PENDING.
+            Number of 7-day chunks the backfill has completed. Set
+            on PROGRESS / SUCCESS; absent or 0 in PENDING / STARTED.
         inserted:
           type: integer
           minimum: 0
@@ -275,7 +286,7 @@ components:
           type: string
           description: |
             Present only on FAILURE. Truncated to 1000 chars for
-            display safety.
+            display safety. Format: `<ExceptionClass>: <message>`.
 
     Me:
       type: object

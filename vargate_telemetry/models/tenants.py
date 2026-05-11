@@ -25,6 +25,7 @@ fuller convention.
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Optional
 
 from sqlalchemy import Boolean, DateTime, String, func, text
 from sqlalchemy.orm import Mapped, mapped_column
@@ -48,6 +49,14 @@ class Tenant(Base):
         String(16),
         nullable=False,
         server_default="trial",
+    )
+    # Set by T4.6's POST /onboarding/start-backfill. The id is also
+    # the gate the matching status endpoint uses to scope polling
+    # to the user's own tenant (only `task_id == this column` is
+    # acceptable). NULL until the first backfill is queued; never
+    # cleared (re-running a backfill manually overwrites in place).
+    initial_backfill_task_id: Mapped[Optional[str]] = mapped_column(
+        String(64),
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

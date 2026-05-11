@@ -151,6 +151,13 @@ services:
       HSM_KEK_LABEL: ${HSM_KEK_LABEL}
       HSM_PIN: ${HSM_PIN}
       HSM_SO_PIN: ${HSM_SO_PIN}
+      # T4.6: `/onboarding/start-backfill` enqueues a Celery task and
+      # `/onboarding/backfill-status` reads task state from the result
+      # backend. The gateway therefore imports `celery_app`, which
+      # reads these at module import time — they must be set even
+      # though the gateway never runs a worker itself.
+      CELERY_BROKER_URL: ${CELERY_BROKER_URL}
+      CELERY_RESULT_BACKEND: ${CELERY_RESULT_BACKEND}
     volumes:
       - vargate-hsm-tokens:/var/lib/softhsm/tokens
     expose:

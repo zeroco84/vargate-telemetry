@@ -40,7 +40,7 @@ import json
 import logging
 import os
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Callable, Optional
 
 from sqlalchemy import text as sql_text
 from sqlalchemy.exc import IntegrityError
@@ -227,6 +227,7 @@ def _backfill_admin_for_tenant(
     *,
     chunk_days: int = DEFAULT_BACKFILL_CHUNK_DAYS,
     client: Optional[AnthropicAdminClient] = None,
+    progress_callback: Optional[Callable[[dict], None]] = None,
 ) -> dict[str, int]:
     """Walk `days` of history in `chunk_days` slices, resumable on crash.
 
@@ -242,6 +243,14 @@ def _backfill_admin_for_tenant(
     matters when (a) the steady-state pull task has already run and
     advanced the cursor past the requested backfill start, and (b)
     when an earlier backfill crashed mid-run.
+
+    `progress_callback` is invoked at each chunk boundary with the
+    cumulative `{chunks_processed, inserted, deduped}` dict. The
+    Celery wrapper feeds this to `self.update_state(state='PROGRESS',
+    meta=...)` so `/onboarding/backfill-status` can surface live
+    counters to the frontend. Pure callers (the existing T3.6
+    tests, the recovery path) pass None and the function stays
+    side-effect-free with respect to Celery.
 
     Returns aggregated counts: inserted, deduped, chunks_processed.
     """
@@ -297,6 +306,28 @@ def _backfill_admin_for_tenant(
 
             chunks_processed += 1
             chunk_start = chunk_end
+
+            # Emit a PROGRESS tick AFTER the cursor advance, so a
+            # status poll that races the chunk boundary sees the
+            # already-committed state (not an in-flight chunk count
+            # that a subsequent failure would unwind).
+            if progress_callback is not None:
+                try:
+                    progress_callback(
+                        {
+                            "chunks_processed": chunks_processed,
+                            "inserted": inserted,
+                            "deduped": deduped,
+                        }
+                    )
+                except Exception:  # pragma: no cover — never let the
+                    # progress channel block the ingest path. A broken
+                    # update_state shouldn't abort the backfill that's
+                    # otherwise succeeding.
+                    _log.exception(
+                        "progress_callback raised for %s; ignoring",
+                        tenant_id,
+                    )
     finally:
         if owned_client:
             client.close()
@@ -318,9 +349,19 @@ def backfill_admin_for_tenant(
     tenant_id: str,
     days: int = DEFAULT_BACKFILL_DAYS,
 ) -> dict:
-    """One-shot Celery task: pull `days` of history for `tenant_id`."""
+    """One-shot Celery task: pull `days` of history for `tenant_id`.
+
+    Threads `self.update_state(state='PROGRESS', meta=...)` into the
+    pure helper so the T4.6 status endpoint can render live counters.
+    """
+
+    def _progress(meta: dict) -> None:
+        self.update_state(state="PROGRESS", meta=meta)
+
     try:
-        return _backfill_admin_for_tenant(tenant_id, days=days)
+        return _backfill_admin_for_tenant(
+            tenant_id, days=days, progress_callback=_progress
+        )
     except Exception as exc:
         _log.exception("backfill_admin failed for %s", tenant_id)
         raise self.retry(exc=exc, countdown=120)
