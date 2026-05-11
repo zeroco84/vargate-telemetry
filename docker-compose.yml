@@ -8,6 +8,27 @@
 #   - T1.2 adds MinIO
 #   - T1.3 adds celery-worker + celery-beat
 #   - T1.4+ adds the Telemetry FastAPI gateway
+#   - T4.7.1 bridges the gateway to Tyr's network so Tyr's Prometheus
+#     can scrape Ogma's /metrics endpoint without exposing the rest
+#     of the Telemetry stack (Postgres, Redis, MinIO, Celery workers).
+#
+# Networks (T4.7.1):
+#   - `telemetry_internal` — bridge, used by every Telemetry service for
+#     in-stack DNS (postgres/redis/minio/etc). Replaces the previous
+#     implicit `vargate-telemetry_default` network so the explicit
+#     model below works.
+#   - `tyr_observability` — external; the gateway joins this so Tyr's
+#     Prometheus (running in a different compose project) can resolve
+#     `vargate-telemetry-gateway-1` over Docker DNS.
+#
+# Pick the right `tyr_observability` name for the environment:
+#   - dev (this box, plain `docker compose up`): `vargate_default` (the
+#     auto-created network from the Tyr project running plain
+#     docker-compose.yml). This is the default.
+#   - prod (Tyr running with docker-compose.prod.yml overlay):
+#     `vargate_vargate-internal` (the project-prefixed name of the
+#     explicit `vargate-internal` bridge in the prod overlay). Set
+#     `TYR_OBSERVABILITY_NETWORK=vargate_vargate-internal` in the .env.
 
 services:
   postgres:
@@ -21,6 +42,8 @@ services:
       POSTGRES_DB: ${POSTGRES_DB}
     volumes:
       - vargate-postgres-data:/var/lib/postgresql/data
+    networks:
+      - telemetry_internal
     healthcheck:
       test:
         - CMD-SHELL
@@ -41,6 +64,8 @@ services:
       MINIO_BROWSER_REDIRECT_URL: ${MINIO_BROWSER_REDIRECT_URL}
     volumes:
       - vargate-minio-data:/data
+    networks:
+      - telemetry_internal
     healthcheck:
       test:
         - CMD
@@ -57,6 +82,8 @@ services:
       - "6379"
     volumes:
       - vargate-redis-data:/data
+    networks:
+      - telemetry_internal
     healthcheck:
       test:
         - CMD
@@ -105,6 +132,8 @@ services:
       OGMA_CORS_ORIGINS: ${OGMA_CORS_ORIGINS:-http://localhost:5173}
     volumes:
       - vargate-hsm-tokens:/var/lib/softhsm/tokens
+    networks:
+      - telemetry_internal
     depends_on:
       redis:
         condition: service_healthy
@@ -160,6 +189,21 @@ services:
       CELERY_RESULT_BACKEND: ${CELERY_RESULT_BACKEND}
     volumes:
       - vargate-hsm-tokens:/var/lib/softhsm/tokens
+    # T4.7.1: gateway sits on BOTH networks. `telemetry_internal` for
+    # in-stack DNS to postgres/redis/etc; `tyr_observability` so Tyr's
+    # Prometheus can scrape `/metrics` from across the project boundary.
+    #
+    # Custom alias `ogma-gateway` on the shared network avoids a DNS
+    # collision: the Tyr stack also registers `gateway` as an alias for
+    # its own proxy container on `vargate_default`, and Docker's
+    # embedded DNS refuses to disambiguate duplicate aliases (returns
+    # NXDOMAIN instead of picking one). Prometheus scrapes
+    # `ogma-gateway:8000` to address Ogma unambiguously.
+    networks:
+      telemetry_internal: {}
+      tyr_observability:
+        aliases:
+          - ogma-gateway
     expose:
       - "8000"
     depends_on:
@@ -213,11 +257,22 @@ services:
       OGMA_CORS_ORIGINS: ${OGMA_CORS_ORIGINS:-http://localhost:5173}
     volumes:
       - vargate-hsm-tokens:/var/lib/softhsm/tokens
+    networks:
+      - telemetry_internal
     depends_on:
       redis:
         condition: service_healthy
       postgres:
         condition: service_healthy
+
+# T4.7.1: explicit network model. See header comment for the
+# `tyr_observability` env-var override (dev defaults to vargate_default).
+networks:
+  telemetry_internal:
+    driver: bridge
+  tyr_observability:
+    external: true
+    name: ${TYR_OBSERVABILITY_NETWORK:-vargate_default}
 
 volumes:
   vargate-postgres-data:
