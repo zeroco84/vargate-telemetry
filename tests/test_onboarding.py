@@ -29,7 +29,8 @@ os.environ["JWT_SIGNING_KEY"] = (
 @pytest.fixture
 def clean_onboarding_state() -> None:
     """Clear users + sessions (the only auth-side state) before/after,
-    and reset the client-factory injection. Tests own provisioning.
+    and reset every injectable seam in the onboarding module. Tests
+    own provisioning.
 
     `select-region` writes to additional tables (tenants, tenant_deks,
     encrypted_secrets) — those are also truncated so each test starts
@@ -37,7 +38,9 @@ def clean_onboarding_state() -> None:
     tests is meaningful.
     """
     from vargate_telemetry.api.onboarding import (
+        set_async_result_factory_for_test,
         set_client_factory_for_test,
+        set_task_dispatcher_for_test,
         set_tenant_id_generator_for_test,
     )
     from vargate_telemetry.db import engine
@@ -51,6 +54,8 @@ def clean_onboarding_state() -> None:
         conn.execute(truncate_sql)
     set_client_factory_for_test(None)
     set_tenant_id_generator_for_test(None)
+    set_task_dispatcher_for_test(None)
+    set_async_result_factory_for_test(None)
 
     yield
 
@@ -58,6 +63,8 @@ def clean_onboarding_state() -> None:
         conn.execute(truncate_sql)
     set_client_factory_for_test(None)
     set_tenant_id_generator_for_test(None)
+    set_task_dispatcher_for_test(None)
+    set_async_result_factory_for_test(None)
 
 
 @pytest.fixture
@@ -81,12 +88,23 @@ def _bearer_token() -> str:
     )
 
 
-def _bearer_token_for(user_id: uuid.UUID, email: str = "tester@example.com") -> str:
+def _bearer_token_for(
+    user_id: uuid.UUID,
+    email: str = "tester@example.com",
+    tenant_id: str | None = None,
+) -> str:
     """Issue a JWT keyed to a real user UUID — needed for endpoints
-    that load + update the matching `users` row (`select-region`).
+    that load + update the matching `users` row (`select-region`,
+    `start-backfill`, `backfill-status`).
+
     `email` defaults to a constant so most tests can ignore it; pass
     an explicit value when the test asserts on the reissued JWT
     claims to keep DB row + JWT in sync.
+
+    `tenant_id` is non-null for tests that exercise endpoints which
+    require the user to already be bound (T4.6's backfill pair). The
+    select-region tests should pass None so the endpoint's "user is
+    fresh from SSO" branch is hit.
     """
     from vargate_telemetry.auth.jwt import issue_session_jwt
 
@@ -94,6 +112,7 @@ def _bearer_token_for(user_id: uuid.UUID, email: str = "tester@example.com") -> 
         user_id=str(user_id),
         email=email,
         sso_provider="google",
+        tenant_id=tenant_id,
     )
 
 
@@ -618,3 +637,383 @@ def test_select_region_reissues_jwt_with_tenant_id_claim(
     assert payload.sub == str(user_uuid)
     assert payload.email == "jwt@example.com"
     assert payload.sso == "google"
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# start-backfill / backfill-status — T4.6
+# ───────────────────────────────────────────────────────────────────────────
+
+
+class _StubAsyncResult:
+    """Mimics `celery.result.AsyncResult` shape we use in onboarding.py:
+    `.state` and `.info`. Production reads only those two attributes."""
+
+    def __init__(self, state: str, info: object = None) -> None:
+        self.state = state
+        self.info = info
+
+
+class _StubDispatch:
+    """Mimics what `task.delay(...)` returns — an object with `.id`.
+    The test asserts on `recorded_calls` to check that the dispatcher
+    was invoked with the right (tenant_id, days)."""
+
+    def __init__(self, task_id: str) -> None:
+        self.id = task_id
+        self.recorded_calls: list[tuple[str, int]] = []
+
+    def __call__(self, tenant_id: str, days: int) -> "_StubDispatch":
+        self.recorded_calls.append((tenant_id, days))
+        return self
+
+
+def _provision_test_tenant(
+    tenant_id: str,
+    region: str = "us",
+    initial_backfill_task_id: str | None = None,
+    active: bool = True,
+) -> None:
+    """INSERT a tenants row directly (bypass select-region). Used by
+    the T4.6 tests because they don't care about the provisioning
+    transaction — only the read-side."""
+    from vargate_telemetry.db import engine
+
+    with engine.begin() as conn:
+        conn.execute(
+            sql_text(
+                """
+                INSERT INTO tenants
+                    (tenant_id, region, active, billing_status,
+                     initial_backfill_task_id)
+                VALUES
+                    (:t, :r, :active, 'trial', :tid)
+                """
+            ),
+            {
+                "t": tenant_id,
+                "r": region,
+                "active": active,
+                "tid": initial_backfill_task_id,
+            },
+        )
+
+
+def _bearer_for_tenant(user_uuid: uuid.UUID, tenant_id: str) -> str:
+    """Issue a session JWT for a user already bound to `tenant_id`."""
+    return _bearer_token_for(user_uuid, tenant_id=tenant_id)
+
+
+def test_start_backfill_enqueues_celery_task(
+    clean_onboarding_state: None,
+    client: TestClient,
+) -> None:
+    """The endpoint calls the dispatcher with (tenant_id, days) and
+    records the returned task id on `tenants.initial_backfill_task_id`."""
+    from vargate_telemetry.api.onboarding import (
+        set_task_dispatcher_for_test,
+    )
+
+    tenant_id = "tnt_us_backfill_enqueue"
+    _provision_test_tenant(tenant_id)
+    user_uuid = _create_test_user(
+        email="enqueue@example.com", tenant_id=tenant_id
+    )
+
+    dispatcher = _StubDispatch(task_id="celery-task-enqueue-001")
+    set_task_dispatcher_for_test(dispatcher)
+
+    response = client.post(
+        "/onboarding/start-backfill",
+        json={"tenant_id": tenant_id, "days": 90},
+        headers={
+            "Authorization": (
+                f"Bearer {_bearer_for_tenant(user_uuid, tenant_id)}"
+            ),
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"task_id": "celery-task-enqueue-001"}
+
+    # Dispatcher invoked exactly once with the right args.
+    assert dispatcher.recorded_calls == [(tenant_id, 90)]
+
+    # Task id persisted on the tenant row so the matching status
+    # endpoint can scope polling to this tenant.
+    from vargate_telemetry.db import engine
+
+    with engine.connect() as conn:
+        recorded = conn.execute(
+            sql_text(
+                "SELECT initial_backfill_task_id FROM tenants "
+                "WHERE tenant_id = :t"
+            ),
+            {"t": tenant_id},
+        ).scalar()
+    assert recorded == "celery-task-enqueue-001"
+
+
+def test_start_backfill_is_idempotent_when_task_id_already_recorded(
+    clean_onboarding_state: None,
+    client: TestClient,
+) -> None:
+    """A second call returns the existing task id — no new dispatch."""
+    from vargate_telemetry.api.onboarding import (
+        set_task_dispatcher_for_test,
+    )
+
+    tenant_id = "tnt_us_idem_enqueue"
+    existing_task = "celery-task-already-running"
+    _provision_test_tenant(
+        tenant_id, initial_backfill_task_id=existing_task
+    )
+    user_uuid = _create_test_user(
+        email="idem-enqueue@example.com", tenant_id=tenant_id
+    )
+
+    # If the dispatcher fires we'll know — count its calls.
+    dispatcher = _StubDispatch(task_id="should-not-be-used")
+    set_task_dispatcher_for_test(dispatcher)
+
+    response = client.post(
+        "/onboarding/start-backfill",
+        json={"tenant_id": tenant_id, "days": 90},
+        headers={
+            "Authorization": (
+                f"Bearer {_bearer_for_tenant(user_uuid, tenant_id)}"
+            ),
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"task_id": existing_task}
+    assert dispatcher.recorded_calls == [], (
+        "idempotent path should not re-dispatch the task"
+    )
+
+
+def test_start_backfill_rejects_cross_tenant_request(
+    clean_onboarding_state: None,
+    client: TestClient,
+) -> None:
+    """User bound to tenant X cannot kick off a backfill for tenant Y."""
+    from vargate_telemetry.api.onboarding import (
+        set_task_dispatcher_for_test,
+    )
+
+    my_tenant = "tnt_us_caller"
+    other_tenant = "tnt_us_victim"
+    _provision_test_tenant(my_tenant)
+    _provision_test_tenant(other_tenant)
+    user_uuid = _create_test_user(
+        email="cross@example.com", tenant_id=my_tenant
+    )
+
+    # Dispatcher must NOT be invoked — gate fires before it.
+    dispatcher = _StubDispatch(task_id="should-not-be-used")
+    set_task_dispatcher_for_test(dispatcher)
+
+    response = client.post(
+        "/onboarding/start-backfill",
+        json={"tenant_id": other_tenant, "days": 90},
+        headers={
+            "Authorization": (
+                f"Bearer {_bearer_for_tenant(user_uuid, my_tenant)}"
+            ),
+        },
+    )
+
+    assert response.status_code == 403, response.text
+    detail = response.json()["detail"]
+    assert detail["code"] == "tenant_mismatch"
+    assert dispatcher.recorded_calls == []
+
+    # And the foreign tenant row is untouched — no task id leaked.
+    from vargate_telemetry.db import engine
+
+    with engine.connect() as conn:
+        recorded = conn.execute(
+            sql_text(
+                "SELECT initial_backfill_task_id FROM tenants "
+                "WHERE tenant_id = :t"
+            ),
+            {"t": other_tenant},
+        ).scalar()
+    assert recorded is None
+
+
+def test_backfill_status_returns_progress_during_run(
+    clean_onboarding_state: None,
+    client: TestClient,
+) -> None:
+    """A PROGRESS-state task surfaces chunks_processed / inserted /
+    deduped from the meta dict."""
+    from vargate_telemetry.api.onboarding import (
+        set_async_result_factory_for_test,
+    )
+
+    tenant_id = "tnt_us_status_progress"
+    task_id = "celery-task-progress-001"
+    _provision_test_tenant(
+        tenant_id, initial_backfill_task_id=task_id
+    )
+    user_uuid = _create_test_user(
+        email="progress@example.com", tenant_id=tenant_id
+    )
+
+    set_async_result_factory_for_test(
+        lambda tid: _StubAsyncResult(
+            state="PROGRESS",
+            info={"chunks_processed": 4, "inserted": 87, "deduped": 2},
+        )
+    )
+
+    response = client.get(
+        f"/onboarding/backfill-status/{task_id}",
+        headers={
+            "Authorization": (
+                f"Bearer {_bearer_for_tenant(user_uuid, tenant_id)}"
+            ),
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "state": "PROGRESS",
+        "chunks_processed": 4,
+        "inserted": 87,
+        "deduped": 2,
+        "error": None,
+    }
+
+
+def test_backfill_status_returns_success_with_final_counts(
+    clean_onboarding_state: None,
+    client: TestClient,
+) -> None:
+    """A SUCCESS-state task surfaces the task's return-dict counts."""
+    from vargate_telemetry.api.onboarding import (
+        set_async_result_factory_for_test,
+    )
+
+    tenant_id = "tnt_us_status_success"
+    task_id = "celery-task-success-001"
+    _provision_test_tenant(
+        tenant_id, initial_backfill_task_id=task_id
+    )
+    user_uuid = _create_test_user(
+        email="success@example.com", tenant_id=tenant_id
+    )
+
+    set_async_result_factory_for_test(
+        lambda tid: _StubAsyncResult(
+            state="SUCCESS",
+            info={
+                "chunks_processed": 13,
+                "inserted": 612,
+                "deduped": 8,
+            },
+        )
+    )
+
+    response = client.get(
+        f"/onboarding/backfill-status/{task_id}",
+        headers={
+            "Authorization": (
+                f"Bearer {_bearer_for_tenant(user_uuid, tenant_id)}"
+            ),
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["state"] == "SUCCESS"
+    assert body["chunks_processed"] == 13
+    assert body["inserted"] == 612
+    assert body["deduped"] == 8
+    assert body["error"] is None
+
+
+def test_backfill_status_returns_failure_with_exception_summary(
+    clean_onboarding_state: None,
+    client: TestClient,
+) -> None:
+    """A FAILURE-state task surfaces `<class>: <message>` (no traceback)."""
+    from vargate_telemetry.api.onboarding import (
+        set_async_result_factory_for_test,
+    )
+
+    tenant_id = "tnt_us_status_failure"
+    task_id = "celery-task-failure-001"
+    _provision_test_tenant(
+        tenant_id, initial_backfill_task_id=task_id
+    )
+    user_uuid = _create_test_user(
+        email="failure@example.com", tenant_id=tenant_id
+    )
+
+    set_async_result_factory_for_test(
+        lambda tid: _StubAsyncResult(
+            state="FAILURE",
+            info=httpx.ConnectError("anthropic unreachable"),
+        )
+    )
+
+    response = client.get(
+        f"/onboarding/backfill-status/{task_id}",
+        headers={
+            "Authorization": (
+                f"Bearer {_bearer_for_tenant(user_uuid, tenant_id)}"
+            ),
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["state"] == "FAILURE"
+    # Format: "<ExceptionClass>: <message>" — no traceback leak.
+    assert body["error"] == "ConnectError: anthropic unreachable"
+    # Counter fields stay None (no progress info during a failure).
+    assert body["chunks_processed"] is None
+
+
+def test_backfill_status_for_unknown_task_id_returns_404(
+    clean_onboarding_state: None,
+    client: TestClient,
+) -> None:
+    """Polling a task id NOT recorded against the user's tenant
+    returns 404 — prevents probing for other tenants' task ids AND
+    avoids Celery's PENDING-vs-unknown ambiguity."""
+    from vargate_telemetry.api.onboarding import (
+        set_async_result_factory_for_test,
+    )
+
+    tenant_id = "tnt_us_status_404"
+    real_task = "celery-task-real-001"
+    _provision_test_tenant(
+        tenant_id, initial_backfill_task_id=real_task
+    )
+    user_uuid = _create_test_user(
+        email="not-found@example.com", tenant_id=tenant_id
+    )
+
+    # Factory must NOT be called — the gate fires first.
+    call_log: list[str] = []
+    set_async_result_factory_for_test(
+        lambda tid: call_log.append(tid) or _StubAsyncResult("PENDING")
+    )
+
+    response = client.get(
+        "/onboarding/backfill-status/celery-task-unknown-XXX",
+        headers={
+            "Authorization": (
+                f"Bearer {_bearer_for_tenant(user_uuid, tenant_id)}"
+            ),
+        },
+    )
+
+    assert response.status_code == 404, response.text
+    assert response.json()["detail"]["code"] == "task_not_found"
+    assert call_log == [], (
+        "AsyncResult should not be consulted for unrecognized task ids"
+    )
