@@ -38,6 +38,15 @@ celery_app.conf.beat_schedule = {
         "schedule": 60.0,  # every 60 seconds
         "options": {"queue": "default"},
     },
+    # T3.5: every 15 minutes, fan out one pull task per active tenant
+    # in the current region. The dispatcher uses the read-only
+    # `vargate_scheduler` role to enumerate `tenants`; per-tenant
+    # tasks run under `vargate_app` with RLS enforced per session.
+    "dispatch-admin-pulls": {
+        "task": "vargate_telemetry.tasks.pull_admin.dispatch_admin_pulls",
+        "schedule": 900.0,  # every 15 minutes
+        "options": {"queue": "default"},
+    },
 }
 
 # Alias so `celery -A vargate_telemetry.celery_app worker` (which looks up
