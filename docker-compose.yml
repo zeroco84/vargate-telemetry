@@ -95,6 +95,7 @@ services:
       HSM_SO_PIN: ${HSM_SO_PIN}
       STRIPE_API_KEY_TEST: ${STRIPE_API_KEY_TEST:-}
       VARGATE_REGION: ${VARGATE_REGION:-us}
+      ANTHROPIC_ADMIN_KEY_TEST: ${ANTHROPIC_ADMIN_KEY_TEST:-}
     volumes:
       - vargate-hsm-tokens:/var/lib/softhsm/tokens
     depends_on:
@@ -129,6 +130,7 @@ services:
       HSM_SO_PIN: ${HSM_SO_PIN}
       STRIPE_API_KEY_TEST: ${STRIPE_API_KEY_TEST:-}
       VARGATE_REGION: ${VARGATE_REGION:-us}
+      ANTHROPIC_ADMIN_KEY_TEST: ${ANTHROPIC_ADMIN_KEY_TEST:-}
     volumes:
       - vargate-hsm-tokens:/var/lib/softhsm/tokens
     depends_on:
