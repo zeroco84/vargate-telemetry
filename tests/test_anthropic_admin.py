@@ -195,6 +195,61 @@ def test_list_usage_parses_nested_results() -> None:
     assert opus.service_tier == "priority"
 
 
+def test_list_usage_accepts_null_model_in_breakdown() -> None:
+    """Anthropic returns `model: null` on aggregate / non-model-tagged rows.
+
+    Regression for T3.2's best-guess `model: str` (required) → the
+    T3.7 real-data smoke surfaced `ValidationError: results.0.model
+    Input should be a valid string [type=string_type, input_value=None]`
+    against the live API on 2026-05-11. The fix loosens the type to
+    `Optional[str] = None`; this test pins that shape so a future
+    "tighten the model field" refactor doesn't silently re-regress.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    {
+                        "starting_at": "2026-05-01T00:00:00Z",
+                        "ending_at": "2026-05-02T00:00:00Z",
+                        "results": [
+                            {
+                                # Aggregate / non-model-tagged row: `model: None`.
+                                "model": None,
+                                "uncached_input_tokens": 0,
+                                "output_tokens": 0,
+                            },
+                            {
+                                # Normal row alongside the aggregate.
+                                "model": "claude-sonnet-4-6",
+                                "uncached_input_tokens": 100,
+                                "output_tokens": 50,
+                            },
+                        ],
+                    },
+                ],
+                "has_more": False,
+            },
+        )
+
+    with _zero_wait_client(handler) as client:
+        buckets = list(
+            client.list_usage(
+                starting_at=datetime(2026, 5, 1, tzinfo=timezone.utc),
+                ending_at=datetime(2026, 5, 2, tzinfo=timezone.utc),
+            )
+        )
+
+    assert len(buckets) == 1
+    assert len(buckets[0].results) == 2
+    # The aggregate row parses with model=None.
+    assert buckets[0].results[0].model is None
+    # The normal row remains a string.
+    assert buckets[0].results[1].model == "claude-sonnet-4-6"
+
+
 def test_paginate_admin_advances_after_id() -> None:
     """has_more + last_id drives the next request's after_id parameter."""
     pages = [
