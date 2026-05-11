@@ -1,0 +1,249 @@
+# Copyright (C) Twinlite Services Limited
+# Licensed under the Business Source License 1.1
+# See LICENSE for the full license text and the Change Date.
+"""Anthropic Admin API scheduled pull task (T3.5).
+
+Two Celery tasks compose the steady-state pull pipeline:
+
+  - `dispatch_admin_pulls` — beat-scheduled every 15 minutes. Opens a
+    `scheduler_session_scope` (read-only, no `app.tenant_id` bound),
+    enumerates active tenants in the current region, and fans out one
+    `pull_admin_for_tenant.delay(tenant_id)` per row.
+  - `pull_admin_for_tenant` — per-tenant. Loads the (tenant, "admin")
+    cursor from `pull_state`, calls `admin_client_for_tenant` to get
+    a client wired with the tenant's sealed admin key, iterates
+    `client.list_usage(...)`, normalizes each `UsageBucket` to a
+    telemetry_records row, and advances the cursor on success.
+
+The actual work lives in `_pull_admin_for_tenant`, a pure-Python
+function that accepts an optional `client` kwarg. Tests inject a
+`MockTransport`-backed client; production calls the public Celery
+wrapper which builds the client from sealed credentials.
+
+Dedup: telemetry_records carries `UNIQUE (tenant_id, source_api,
+external_id)`. A re-pull that hits an already-ingested bucket raises
+`IntegrityError` from `append_telemetry_record`; we catch it and
+count the dedup, leaving the existing chain row untouched. The
+metering `increment` is gated by successful insert, so the count
+matches the number of NEW records — not the number of iterations.
+
+Cursor semantics: the cursor is the upper bound of what's been
+successfully pulled. On first run (no cursor row), we default to a
+1-day lookback to bootstrap the steady state. T3.6's backfill task
+is the explicit "pull 90 days" entry point.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import os
+from datetime import datetime, timedelta, timezone
+from typing import Optional
+
+from sqlalchemy import text as sql_text
+from sqlalchemy.exc import IntegrityError
+
+from vargate_telemetry.anthropic import (
+    AnthropicAdminClient,
+    UsageBucket,
+    admin_client_for_tenant,
+)
+from vargate_telemetry.celery_app import celery_app
+from vargate_telemetry.chain import append_telemetry_record
+from vargate_telemetry.db import scheduler_session_scope, session_scope
+from vargate_telemetry.metering import increment
+
+_log = logging.getLogger(__name__)
+
+# Source-API name used in pull_state + telemetry_records for this stream.
+SOURCE_API_ADMIN = "admin"
+
+# How far back to look on first run when no cursor exists.
+DEFAULT_INITIAL_LOOKBACK_DAYS = 1
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _load_cursor(
+    session, tenant_id: str, source_api: str
+) -> Optional[datetime]:
+    row = session.execute(
+        sql_text(
+            "SELECT cursor FROM pull_state "
+            "WHERE tenant_id = :t AND source_api = :s"
+        ),
+        {"t": tenant_id, "s": source_api},
+    ).first()
+    if row is None or row.cursor is None:
+        return None
+    return datetime.fromisoformat(row.cursor)
+
+
+def _save_cursor(
+    session,
+    tenant_id: str,
+    source_api: str,
+    cursor: datetime,
+    status: str = "ok",
+    error: Optional[str] = None,
+) -> None:
+    session.execute(
+        sql_text(
+            "INSERT INTO pull_state "
+            "(tenant_id, source_api, cursor, last_pulled_at, "
+            "last_status, last_error) "
+            "VALUES (:t, :s, :c, :now, :status, :err) "
+            "ON CONFLICT (tenant_id, source_api) "
+            "DO UPDATE SET "
+            "  cursor = EXCLUDED.cursor, "
+            "  last_pulled_at = EXCLUDED.last_pulled_at, "
+            "  last_status = EXCLUDED.last_status, "
+            "  last_error = EXCLUDED.last_error"
+        ),
+        {
+            "t": tenant_id,
+            "s": source_api,
+            "c": cursor.isoformat(),
+            "now": _now(),
+            "status": status,
+            "err": error,
+        },
+    )
+
+
+def _normalize_usage(bucket: UsageBucket) -> dict:
+    """Turn one UsageBucket into telemetry_records insert kwargs.
+
+    `external_id` is keyed off the bucket window so a re-pull of an
+    already-ingested window dedups on insert via the UNIQUE constraint.
+    `content_hash` is a SHA-256 over the canonical JSON of the whole
+    bucket, so a refresh that changes nested `results` content surfaces
+    as a hash mismatch even though the external_id matches.
+    """
+    bucket_dict = bucket.model_dump(mode="json")
+    canonical = json.dumps(
+        bucket_dict, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return {
+        "record_type": "usage",
+        "source_api": SOURCE_API_ADMIN,
+        "external_id": (
+            f"usage:{bucket.starting_at.isoformat()}:"
+            f"{bucket.ending_at.isoformat()}"
+        ),
+        "occurred_at": bucket.starting_at,
+        "content_hash": hashlib.sha256(canonical).digest(),
+        "record_metadata": bucket_dict,
+    }
+
+
+def _pull_admin_for_tenant(
+    tenant_id: str,
+    *,
+    client: Optional[AnthropicAdminClient] = None,
+) -> dict[str, int]:
+    """Pure-Python pull implementation. Returns {'inserted': N, 'deduped': M}."""
+    if not tenant_id:
+        raise ValueError("tenant_id required")
+
+    # 1. Load cursor (own transaction, so the subsequent network call
+    # doesn't hold the DB connection during HTTP I/O).
+    with session_scope(tenant_id) as s:
+        cursor = _load_cursor(s, tenant_id, SOURCE_API_ADMIN)
+
+    pull_started = _now()
+    starting_at = cursor or (
+        pull_started - timedelta(days=DEFAULT_INITIAL_LOOKBACK_DAYS)
+    )
+
+    # 2. Build the Anthropic client unless one was injected.
+    owned_client = client is None
+    if owned_client:
+        client = admin_client_for_tenant(tenant_id)
+
+    inserted = 0
+    deduped = 0
+    try:
+        for bucket in client.list_usage(
+            starting_at=starting_at,
+            ending_at=pull_started,
+        ):
+            fields = _normalize_usage(bucket)
+            try:
+                append_telemetry_record(tenant_id, **fields)
+                increment(tenant_id, "usage")
+                inserted += 1
+            except IntegrityError:
+                # Dedup hit on (tenant, source_api, external_id) UNIQUE.
+                # Expected for re-pulls of an already-ingested window.
+                deduped += 1
+                _log.info(
+                    "pull_admin: dedup hit for %s/%s",
+                    tenant_id,
+                    fields["external_id"],
+                )
+
+        # 3. Advance the cursor on success.
+        with session_scope(tenant_id) as s:
+            _save_cursor(
+                s,
+                tenant_id,
+                SOURCE_API_ADMIN,
+                pull_started,
+                status="ok",
+            )
+    finally:
+        if owned_client:
+            client.close()
+
+    return {"inserted": inserted, "deduped": deduped}
+
+
+@celery_app.task(
+    bind=True,
+    max_retries=3,
+    name="vargate_telemetry.tasks.pull_admin.pull_admin_for_tenant",
+)
+def pull_admin_for_tenant(self, tenant_id: str) -> dict:
+    """Beat-dispatched per-tenant pull. Retries on any exception."""
+    try:
+        return _pull_admin_for_tenant(tenant_id)
+    except Exception as exc:
+        _log.exception("pull_admin failed for %s", tenant_id)
+        raise self.retry(exc=exc, countdown=60)
+
+
+@celery_app.task(
+    name="vargate_telemetry.tasks.pull_admin.dispatch_admin_pulls",
+)
+def dispatch_admin_pulls(region: Optional[str] = None) -> int:
+    """Beat fan-out. Enumerates active tenants and queues a pull per tenant.
+
+    Runs under `scheduler_session_scope` so the cross-tenant SELECT on
+    `tenants` is permitted (the role's GRANT posture is the gate, not
+    RLS). Returns the count of dispatched tasks.
+    """
+    target_region = region or os.environ.get("VARGATE_REGION", "us")
+
+    with scheduler_session_scope() as s:
+        rows = s.execute(
+            sql_text(
+                "SELECT tenant_id FROM tenants "
+                "WHERE active = true AND region = :r"
+            ),
+            {"r": target_region},
+        ).all()
+
+    for row in rows:
+        pull_admin_for_tenant.delay(row.tenant_id)
+
+    _log.info(
+        "dispatch_admin_pulls: queued %d tenants in region %s",
+        len(rows),
+        target_region,
+    )
+    return len(rows)
