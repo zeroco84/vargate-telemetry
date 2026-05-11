@@ -63,6 +63,10 @@ SOURCE_API_ADMIN = "admin"
 # How far back to look on first run when no cursor exists.
 DEFAULT_INITIAL_LOOKBACK_DAYS = 1
 
+# Backfill defaults — T3.6 walks 90 days in 1-week chunks.
+DEFAULT_BACKFILL_DAYS = 90
+DEFAULT_BACKFILL_CHUNK_DAYS = 7
+
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
@@ -215,6 +219,111 @@ def pull_admin_for_tenant(self, tenant_id: str) -> dict:
     except Exception as exc:
         _log.exception("pull_admin failed for %s", tenant_id)
         raise self.retry(exc=exc, countdown=60)
+
+
+def _backfill_admin_for_tenant(
+    tenant_id: str,
+    days: int = DEFAULT_BACKFILL_DAYS,
+    *,
+    chunk_days: int = DEFAULT_BACKFILL_CHUNK_DAYS,
+    client: Optional[AnthropicAdminClient] = None,
+) -> dict[str, int]:
+    """Walk `days` of history in `chunk_days` slices, resumable on crash.
+
+    Each chunk is one `client.list_usage(starting_at, ending_at)` call
+    plus a `_save_cursor` after the chunk completes. A mid-backfill
+    exception leaves the cursor pointing at the last successful chunk
+    boundary, so the next invocation picks up from there — re-running
+    `_backfill_admin_for_tenant` is the recovery path, no separate
+    "resume" mode needed.
+
+    If an existing cursor is later than `now - days`, the backfill
+    starts from the cursor (resume) instead of `now - days`. This
+    matters when (a) the steady-state pull task has already run and
+    advanced the cursor past the requested backfill start, and (b)
+    when an earlier backfill crashed mid-run.
+
+    Returns aggregated counts: inserted, deduped, chunks_processed.
+    """
+    if not tenant_id:
+        raise ValueError("tenant_id required")
+    if days <= 0:
+        raise ValueError("days must be positive")
+    if chunk_days <= 0:
+        raise ValueError("chunk_days must be positive")
+
+    with session_scope(tenant_id) as s:
+        cursor = _load_cursor(s, tenant_id, SOURCE_API_ADMIN)
+
+    now = _now()
+    backfill_start = now - timedelta(days=days)
+    start = max(cursor, backfill_start) if cursor else backfill_start
+
+    owned_client = client is None
+    if owned_client:
+        client = admin_client_for_tenant(tenant_id)
+
+    inserted = 0
+    deduped = 0
+    chunks_processed = 0
+
+    try:
+        chunk_start = start
+        while chunk_start < now:
+            chunk_end = min(chunk_start + timedelta(days=chunk_days), now)
+
+            for bucket in client.list_usage(
+                starting_at=chunk_start,
+                ending_at=chunk_end,
+            ):
+                fields = _normalize_usage(bucket)
+                try:
+                    append_telemetry_record(tenant_id, **fields)
+                    increment(tenant_id, "usage")
+                    inserted += 1
+                except IntegrityError:
+                    deduped += 1
+
+            # Cursor advances chunk-by-chunk so a later crash resumes
+            # cleanly from this point.
+            with session_scope(tenant_id) as s:
+                _save_cursor(
+                    s,
+                    tenant_id,
+                    SOURCE_API_ADMIN,
+                    chunk_end,
+                    status="ok",
+                )
+
+            chunks_processed += 1
+            chunk_start = chunk_end
+    finally:
+        if owned_client:
+            client.close()
+
+    return {
+        "inserted": inserted,
+        "deduped": deduped,
+        "chunks_processed": chunks_processed,
+    }
+
+
+@celery_app.task(
+    bind=True,
+    max_retries=3,
+    name="vargate_telemetry.tasks.pull_admin.backfill_admin_for_tenant",
+)
+def backfill_admin_for_tenant(
+    self,
+    tenant_id: str,
+    days: int = DEFAULT_BACKFILL_DAYS,
+) -> dict:
+    """One-shot Celery task: pull `days` of history for `tenant_id`."""
+    try:
+        return _backfill_admin_for_tenant(tenant_id, days=days)
+    except Exception as exc:
+        _log.exception("backfill_admin failed for %s", tenant_id)
+        raise self.retry(exc=exc, countdown=120)
 
 
 @celery_app.task(
