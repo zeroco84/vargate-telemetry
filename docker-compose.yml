@@ -141,6 +141,18 @@ services:
       MICROSOFT_OAUTH_CLIENT_SECRET: ${MICROSOFT_OAUTH_CLIENT_SECRET:-}
       OGMA_OAUTH_REDIRECT_BASE: ${OGMA_OAUTH_REDIRECT_BASE:-https://vargate.ai}
       OGMA_CORS_ORIGINS: ${OGMA_CORS_ORIGINS:-http://localhost:5173}
+      # T4.5: `/onboarding/select-region` provisions a per-tenant DEK
+      # (generate → wrap-at-HSM → store) in the same transaction it
+      # INSERTs `tenants`. The gateway therefore needs the HSM
+      # credentials and the SoftHSM2 token volume just like the
+      # celery workers that seal/unseal during ingest.
+      PKCS11_MODULE: ${PKCS11_MODULE}
+      HSM_TOKEN_LABEL: ${HSM_TOKEN_LABEL}
+      HSM_KEK_LABEL: ${HSM_KEK_LABEL}
+      HSM_PIN: ${HSM_PIN}
+      HSM_SO_PIN: ${HSM_SO_PIN}
+    volumes:
+      - vargate-hsm-tokens:/var/lib/softhsm/tokens
     expose:
       - "8000"
     depends_on:
