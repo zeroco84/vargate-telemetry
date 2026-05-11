@@ -8,6 +8,10 @@ from vargate_telemetry.anthropic.exceptions import (
     AnthropicAPIError,
     RateLimited,
 )
+from vargate_telemetry.anthropic.factory import (
+    ANTHROPIC_ADMIN_KEY_SECRET,
+    admin_client_for_tenant,
+)
 from vargate_telemetry.anthropic.types import (
     Member,
     UsageBreakdown,
@@ -16,6 +20,7 @@ from vargate_telemetry.anthropic.types import (
 )
 
 __all__ = [
+    "ANTHROPIC_ADMIN_KEY_SECRET",
     "AnthropicAPIError",
     "AnthropicAdminClient",
     "Member",
@@ -23,4 +28,5 @@ __all__ = [
     "UsageBreakdown",
     "UsageBucket",
     "Workspace",
+    "admin_client_for_tenant",
 ]
