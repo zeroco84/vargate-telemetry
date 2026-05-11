@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import os
+import uuid
 from datetime import datetime, timezone
 from typing import Iterator
 
@@ -29,23 +30,34 @@ os.environ["JWT_SIGNING_KEY"] = (
 def clean_onboarding_state() -> None:
     """Clear users + sessions (the only auth-side state) before/after,
     and reset the client-factory injection. Tests own provisioning.
+
+    `select-region` writes to additional tables (tenants, tenant_deks,
+    encrypted_secrets) — those are also truncated so each test starts
+    from a clean slate and the no-persist assertion in validate-key
+    tests is meaningful.
     """
-    from vargate_telemetry.api.onboarding import set_client_factory_for_test
+    from vargate_telemetry.api.onboarding import (
+        set_client_factory_for_test,
+        set_tenant_id_generator_for_test,
+    )
     from vargate_telemetry.db import engine
 
+    truncate_sql = sql_text(
+        "TRUNCATE TABLE encrypted_secrets, tenant_deks, sessions, "
+        "users, tenants RESTART IDENTITY CASCADE"
+    )
+
     with engine.begin() as conn:
-        conn.execute(
-            sql_text("TRUNCATE TABLE sessions, users RESTART IDENTITY CASCADE")
-        )
+        conn.execute(truncate_sql)
     set_client_factory_for_test(None)
+    set_tenant_id_generator_for_test(None)
 
     yield
 
     with engine.begin() as conn:
-        conn.execute(
-            sql_text("TRUNCATE TABLE sessions, users RESTART IDENTITY CASCADE")
-        )
+        conn.execute(truncate_sql)
     set_client_factory_for_test(None)
+    set_tenant_id_generator_for_test(None)
 
 
 @pytest.fixture
@@ -69,6 +81,22 @@ def _bearer_token() -> str:
     )
 
 
+def _bearer_token_for(user_id: uuid.UUID, email: str = "tester@example.com") -> str:
+    """Issue a JWT keyed to a real user UUID — needed for endpoints
+    that load + update the matching `users` row (`select-region`).
+    `email` defaults to a constant so most tests can ignore it; pass
+    an explicit value when the test asserts on the reissued JWT
+    claims to keep DB row + JWT in sync.
+    """
+    from vargate_telemetry.auth.jwt import issue_session_jwt
+
+    return issue_session_jwt(
+        user_id=str(user_id),
+        email=email,
+        sso_provider="google",
+    )
+
+
 def _post_validate(
     client: TestClient, admin_key: str
 ) -> httpx.Response:
@@ -76,6 +104,56 @@ def _post_validate(
         "/onboarding/validate-key",
         json={"admin_key": admin_key},
         headers={"Authorization": f"Bearer {_bearer_token()}"},
+    )
+
+
+def _create_test_user(
+    email: str = "tester@example.com",
+    tenant_id: str | None = None,
+) -> uuid.UUID:
+    """INSERT a real `users` row and return its UUID. The select-region
+    endpoint loads + updates this row, so the JWT needs to point at a
+    real DB identity (unlike validate-key, which only needs a valid
+    signature).
+    """
+    from vargate_telemetry.db import engine
+
+    user_uuid = uuid.uuid4()
+    with engine.begin() as conn:
+        conn.execute(
+            sql_text(
+                """
+                INSERT INTO users
+                    (id, email, sso_provider, sso_subject_id, name,
+                     tenant_id)
+                VALUES
+                    (:id, :email, 'google', :sub, 'Tester', :tenant_id)
+                """
+            ),
+            {
+                "id": str(user_uuid),
+                "email": email,
+                "sub": f"google-sub-{user_uuid.hex[:8]}",
+                "tenant_id": tenant_id,
+            },
+        )
+    return user_uuid
+
+
+def _post_select_region(
+    client: TestClient,
+    user_uuid: uuid.UUID,
+    *,
+    region: str,
+    admin_key: str = "sk-ant-admin01-test-key-for-onboarding-XXXXXX",
+    email: str = "tester@example.com",
+) -> httpx.Response:
+    return client.post(
+        "/onboarding/select-region",
+        json={"region": region, "admin_key": admin_key},
+        headers={
+            "Authorization": f"Bearer {_bearer_token_for(user_uuid, email)}",
+        },
     )
 
 
@@ -304,3 +382,239 @@ def test_validate_key_does_not_persist_anything(
     assert diff == {}, (
         f"validate-key wrote to tables it shouldn't have: {diff}"
     )
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# select-region — T4.5
+# ───────────────────────────────────────────────────────────────────────────
+
+
+def _count(table: str, **where: object) -> int:
+    """Count rows in `table` matching `where=value`. Returns 0 when
+    no rows match."""
+    from vargate_telemetry.db import engine
+
+    if not where:
+        sql = f"SELECT COUNT(*) FROM {table}"
+        params: dict = {}
+    else:
+        clause = " AND ".join(f"{col} = :{col}" for col in where)
+        sql = f"SELECT COUNT(*) FROM {table} WHERE {clause}"
+        params = dict(where)
+    with engine.connect() as conn:
+        return conn.execute(sql_text(sql), params).scalar() or 0
+
+
+def test_select_region_creates_tenant_and_seals_key(
+    clean_onboarding_state: None,
+    client: TestClient,
+) -> None:
+    """Happy path: a brand-new user picks `us`, the endpoint creates
+    the tenant row, binds it to the user, and seals the admin key
+    under the freshly provisioned DEK.
+    """
+    from vargate_telemetry.api.onboarding import (
+        set_tenant_id_generator_for_test,
+    )
+    from vargate_telemetry.crypto.seal import unseal_secret
+
+    fixed_id = "tnt_us_happy_path_0001"
+    set_tenant_id_generator_for_test(lambda _r: fixed_id)
+    user_uuid = _create_test_user(email="happy@example.com")
+
+    admin_key = "sk-ant-admin01-the-real-key-XXXXXXXXXXXXXXXX"
+    response = _post_select_region(
+        client, user_uuid, region="us", admin_key=admin_key,
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body == {"tenant_id": fixed_id, "region": "us"}
+
+    # DB invariants — all four writes landed.
+    assert _count("tenants", tenant_id=fixed_id) == 1
+    assert _count("tenant_deks", tenant_id=fixed_id) == 1
+    assert _count(
+        "encrypted_secrets",
+        tenant_id=fixed_id,
+        secret_name="anthropic_admin_key",
+    ) == 1
+    assert _count("users", id=str(user_uuid), tenant_id=fixed_id) == 1
+
+    # And the sealed admin key round-trips: unseal returns the
+    # original plaintext, proving DEK + AAD wiring is correct.
+    plaintext = unseal_secret(fixed_id, "anthropic_admin_key")
+    assert plaintext == admin_key.encode("utf-8")
+
+
+def test_select_region_is_idempotent_on_retry(
+    clean_onboarding_state: None,
+    client: TestClient,
+) -> None:
+    """Replaying the call (same user, same region) returns 200 with
+    the existing tenant — no new rows, no provisioning churn.
+    """
+    from vargate_telemetry.api.onboarding import (
+        set_tenant_id_generator_for_test,
+    )
+
+    fixed_id = "tnt_us_idempotent_0002"
+    set_tenant_id_generator_for_test(lambda _r: fixed_id)
+    user_uuid = _create_test_user(email="idem@example.com")
+
+    # First call provisions.
+    first = _post_select_region(client, user_uuid, region="us")
+    assert first.status_code == 200, first.text
+    assert first.json()["tenant_id"] == fixed_id
+
+    # Snapshot row counts before the replay.
+    before_tenants = _count("tenants")
+    before_deks = _count("tenant_deks")
+    before_secrets = _count("encrypted_secrets")
+
+    # Flip the generator to a different value so we can detect a
+    # "should not have re-generated" mistake — the endpoint must
+    # short-circuit on the idempotency check before consulting it.
+    set_tenant_id_generator_for_test(lambda _r: "tnt_us_should_never_be_used")
+
+    # Second call returns the same tenant. No new rows.
+    second = _post_select_region(client, user_uuid, region="us")
+    assert second.status_code == 200, second.text
+    assert second.json() == {"tenant_id": fixed_id, "region": "us"}
+
+    assert _count("tenants") == before_tenants
+    assert _count("tenant_deks") == before_deks
+    assert _count("encrypted_secrets") == before_secrets
+
+
+def test_select_region_rolls_back_on_failure(
+    clean_onboarding_state: None,
+    client: TestClient,
+) -> None:
+    """If the tenants INSERT fails (PK conflict), the whole
+    transaction rolls back — no orphan `tenant_deks` row, no
+    orphan `encrypted_secrets` row, and `users.tenant_id` stays
+    NULL.
+    """
+    from vargate_telemetry.api.onboarding import (
+        set_tenant_id_generator_for_test,
+    )
+    from vargate_telemetry.db import engine
+
+    collision_id = "tnt_us_collision_0003"
+
+    # Pre-insert a tenant row with the id the generator will return.
+    # The select-region INSERT will hit a PK conflict.
+    with engine.begin() as conn:
+        conn.execute(
+            sql_text(
+                """
+                INSERT INTO tenants (tenant_id, region, active,
+                                     billing_status)
+                VALUES (:t, 'us', TRUE, 'trial')
+                """
+            ),
+            {"t": collision_id},
+        )
+
+    set_tenant_id_generator_for_test(lambda _r: collision_id)
+    user_uuid = _create_test_user(email="rollback@example.com")
+
+    response = _post_select_region(client, user_uuid, region="us")
+
+    # The endpoint surfaces the integrity error as a 500 (default
+    # FastAPI mapping for unhandled exceptions). The exact status
+    # is less important than the DB invariants below.
+    assert response.status_code >= 500
+
+    # No leakage: the pre-existing tenant row is still the only one
+    # for that id; no DEK row, no secret row, user.tenant_id is NULL.
+    assert _count("tenants", tenant_id=collision_id) == 1
+    assert _count("tenant_deks", tenant_id=collision_id) == 0
+    assert _count(
+        "encrypted_secrets", tenant_id=collision_id
+    ) == 0
+
+    with engine.connect() as conn:
+        users_tenant = conn.execute(
+            sql_text("SELECT tenant_id FROM users WHERE id = :uid"),
+            {"uid": str(user_uuid)},
+        ).scalar()
+    assert users_tenant is None, (
+        f"users.tenant_id should have been rolled back, got {users_tenant!r}"
+    )
+
+
+def test_select_region_rejects_invalid_region_string(
+    clean_onboarding_state: None,
+    client: TestClient,
+) -> None:
+    """A region outside `[us, eu]` is rejected with 422 and no DB
+    writes."""
+    user_uuid = _create_test_user(email="badregion@example.com")
+
+    before_tenants = _count("tenants")
+    before_users_bound = _count(
+        "users", id=str(user_uuid)
+    )  # the row itself stays
+
+    response = _post_select_region(client, user_uuid, region="apac")
+    assert response.status_code == 422, response.text
+
+    body = response.json()
+    detail = body["detail"]
+    # Pydantic returns a list of validation issues OR our explicit
+    # `{"code": ..., "message": ...}` shape from the endpoint's
+    # normalized_region() guard, depending on which validator fires
+    # first. Accept both — what matters is that the request was
+    # rejected.
+    assert detail is not None
+
+    # No tenant rows created, user binding unchanged.
+    assert _count("tenants") == before_tenants
+    assert _count("users", id=str(user_uuid)) == before_users_bound
+    with __import__("vargate_telemetry.db", fromlist=["engine"]).engine.connect() as conn:
+        assert conn.execute(
+            sql_text("SELECT tenant_id FROM users WHERE id = :uid"),
+            {"uid": str(user_uuid)},
+        ).scalar() is None
+
+
+def test_select_region_reissues_jwt_with_tenant_id_claim(
+    clean_onboarding_state: None,
+    client: TestClient,
+) -> None:
+    """The endpoint sets a fresh `ogma_session` cookie carrying the
+    new tenant_id claim — so the very next request the browser makes
+    is already tenant-bound.
+    """
+    from vargate_telemetry.api.onboarding import (
+        set_tenant_id_generator_for_test,
+    )
+    from vargate_telemetry.auth.jwt import (
+        SESSION_COOKIE_NAME,
+        decode_session_jwt,
+    )
+
+    fixed_id = "tnt_eu_jwt_claim_0004"
+    set_tenant_id_generator_for_test(lambda _r: fixed_id)
+    user_email = "jwt@example.com"
+    user_uuid = _create_test_user(email=user_email)
+
+    response = _post_select_region(
+        client, user_uuid, region="eu", email=user_email
+    )
+    assert response.status_code == 200, response.text
+
+    # The cookie is set on the response. `TestClient` makes the raw
+    # cookie value available via `response.cookies[<name>]`.
+    cookie_value = response.cookies.get(SESSION_COOKIE_NAME)
+    assert cookie_value, (
+        "select-region did not set the ogma_session cookie"
+    )
+
+    payload = decode_session_jwt(cookie_value)
+    assert payload.tenant_id == fixed_id
+    assert payload.sub == str(user_uuid)
+    assert payload.email == "jwt@example.com"
+    assert payload.sso == "google"

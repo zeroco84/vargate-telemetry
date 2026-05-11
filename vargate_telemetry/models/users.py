@@ -54,6 +54,14 @@ class User(Base):
     sso_provider: Mapped[str] = mapped_column(String(32), nullable=False)
     sso_subject_id: Mapped[str] = mapped_column(String(255), nullable=False)
     name: Mapped[Optional[str]] = mapped_column(String(255))
+    # tenant_id is NULL during the onboarding window between SSO sign-in
+    # and `POST /onboarding/select-region`. After region select it is
+    # set to the freshly provisioned tenant and the session JWT is
+    # reissued carrying the same value. No FK to `tenants` because
+    # the role split (T3.4) revokes vargate_app's reads on that table;
+    # invariant maintained at the application layer instead. See
+    # migration 0011_add_tenant_id_to_users.py.
+    tenant_id: Mapped[Optional[str]] = mapped_column(String(64), index=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,

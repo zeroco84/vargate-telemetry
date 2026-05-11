@@ -190,10 +190,19 @@ components:
 
     SelectRegionRequest:
       type: object
-      required: [region]
+      required: [region, admin_key]
       properties:
         region:
           $ref: '#/components/schemas/Region'
+        admin_key:
+          type: string
+          description: |
+            The Anthropic admin key, previously validated by
+            `/onboarding/validate-key`. Sealed into
+            `encrypted_secrets` inside the same transaction that
+            creates the tenant row, so a mid-flow failure never
+            leaves a sealed key without a tenant or vice versa.
+          minLength: 30
 
     Tenant:
       type: object
