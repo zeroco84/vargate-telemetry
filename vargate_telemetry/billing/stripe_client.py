@@ -91,20 +91,26 @@ class StripeDispatcher:
 _dispatcher: Optional[UsageDispatcher] = None
 
 
-def _get_dispatcher() -> UsageDispatcher:
+def _get_dispatcher() -> Optional[UsageDispatcher]:
     """Return the cached dispatcher, creating a StripeDispatcher on
-    first use. Test-mode key only — production wiring lands in a later
-    sprint.
+    first use, or None if no dispatch is configured.
+
+    `None` is a first-class outcome — callers MUST treat it as
+    "skip Stripe for this batch" rather than letting an exception
+    propagate. The flush path runs inside a transaction that's
+    committing usage_records; raising here would roll those back,
+    losing the durable metering count for a transient config issue.
+    See `report_usage` for the caller-side handling.
     """
     global _dispatcher
-    if _dispatcher is None:
-        api_key = os.environ.get("STRIPE_API_KEY_TEST")
-        if not api_key:
-            raise RuntimeError(
-                "STRIPE_API_KEY_TEST is not set; "
-                "call set_dispatcher_for_test() or configure the env"
-            )
-        _dispatcher = StripeDispatcher(api_key=api_key)
+    if _dispatcher is not None:
+        return _dispatcher
+
+    api_key = os.environ.get("STRIPE_API_KEY_TEST")
+    if not api_key:
+        return None
+
+    _dispatcher = StripeDispatcher(api_key=api_key)
     return _dispatcher
 
 
@@ -151,6 +157,20 @@ def report_usage(
 
     subscription_item_id = row.subscription_item_id
     dispatcher = _get_dispatcher()
+    if dispatcher is None:
+        # No dispatcher configured (STRIPE_API_KEY_TEST unset, no test
+        # stub installed). Same disposition as "no tenant_billing row":
+        # log + early return so the caller's usage_records UPSERT
+        # commits. Letting `_get_dispatcher` raise here would cascade
+        # into a transaction rollback and lose the metering count to
+        # a config issue, which is exactly the failure mode we don't
+        # want.
+        _log.info(
+            "billing: no dispatcher configured (STRIPE_API_KEY_TEST "
+            "unset and no test stub) — skipping Stripe dispatch for %s",
+            tenant_id,
+        )
+        return
 
     for record_type, bucket_start, quantity in items_list:
         try:

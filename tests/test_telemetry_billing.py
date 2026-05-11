@@ -190,3 +190,63 @@ def test_no_billing_row_skips_dispatch(clean_billing_state: None) -> None:
 
     # Flush commits the usage_records row but never touches Stripe.
     assert flush() == 1
+
+
+def test_no_dispatcher_configured_does_not_rollback_usage(
+    clean_billing_state: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """STRIPE_API_KEY_TEST unset + provisioned tenant_billing → usage_records still commits.
+
+    Regression test for the T2.4 bug that surfaced during T3.7+
+    verification: when celery-beat fired `flush_counters` in the
+    worker process during the 1000-record integration test loop,
+    the worker's `_get_dispatcher` raised RuntimeError because the
+    Docker compose default for STRIPE_API_KEY_TEST is the empty
+    string. That exception escaped report_usage, propagated through
+    _upsert_usage's session_scope, and rolled back the
+    usage_records UPSERT — silently dropping a chunk of the
+    metering counts to a config issue. Metering durability is
+    non-negotiable; "no Stripe key" must degrade to "skip dispatch",
+    not to "lose the count".
+    """
+    from vargate_telemetry.billing import set_dispatcher_for_test
+    from vargate_telemetry.db import session_scope
+    from vargate_telemetry.metering import flush, increment
+
+    tenant = "test-billing-no-dispatcher"
+    _provision_billing(tenant, "si_test_ND")
+
+    # No test stub installed, and no STRIPE_API_KEY_TEST in the env.
+    set_dispatcher_for_test(None)
+    monkeypatch.delenv("STRIPE_API_KEY_TEST", raising=False)
+
+    for _ in range(13):
+        increment(tenant, "usage")
+
+    # The flush must commit usage_records even though no dispatcher
+    # is available. No raise, no rollback.
+    assert flush() == 1
+
+    with session_scope(tenant) as s:
+        usage_row = s.execute(
+            sql_text(
+                "SELECT record_count FROM usage_records "
+                "WHERE tenant_id = :t"
+            ),
+            {"t": tenant},
+        ).first()
+        retry_count = s.execute(
+            sql_text(
+                "SELECT COUNT(*) FROM billing_retry "
+                "WHERE tenant_id = :t"
+            ),
+            {"t": tenant},
+        ).scalar()
+
+    assert usage_row is not None
+    assert usage_row.record_count == 13
+    # "No dispatcher configured" doesn't write to billing_retry —
+    # that queue is for transient per-item dispatch failures, not
+    # for config-level "Stripe isn't wired at all" states.
+    assert retry_count == 0
