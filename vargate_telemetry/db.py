@@ -72,3 +72,29 @@ def session_scope(tenant_id: str) -> Iterator[Session]:
     finally:
         s.close()
         current_tenant.reset(token)
+
+
+@contextmanager
+def scheduler_session_scope() -> Iterator[Session]:
+    """Open a session under the read-only `vargate_scheduler` role (T3.4).
+
+    The scheduler enumerates active tenants from the `tenants` index
+    (no RLS, but the role only has SELECT on that single table) and
+    dispatches per-tenant Celery work. It never touches RLS-protected
+    tables; per-tenant execution uses `session_scope(tenant_id)`
+    after dispatch.
+
+    This deliberately does NOT bind `app.tenant_id` — the scheduler is
+    the one place we want a cross-tenant view, and the role's GRANT
+    posture is what makes that safe.
+    """
+    s = SessionLocal()
+    try:
+        s.execute(text("SET LOCAL ROLE vargate_scheduler"))
+        yield s
+        s.commit()
+    except Exception:
+        s.rollback()
+        raise
+    finally:
+        s.close()
