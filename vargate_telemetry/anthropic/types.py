@@ -81,7 +81,11 @@ class UsageBreakdown(BaseModel):
 
     model_config = ConfigDict(extra="allow", protected_namespaces=())
 
-    model: str
+    # T3.7 smoke against the real Anthropic API revealed `model` is
+    # `None` for some breakdown rows (likely aggregate / non-model-tagged
+    # entries). Allowing None here matches the wire reality; consumers
+    # of UsageBreakdown that need a string fall back to a sentinel.
+    model: Optional[str] = None
     workspace_id: Optional[str] = None
     api_key_id: Optional[str] = None
     service_tier: Optional[str] = None
