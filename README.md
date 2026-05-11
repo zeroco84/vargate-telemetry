@@ -40,7 +40,6 @@ If your situation falls in a grey area, write to legal@vargate.ai.
 | Path                       | What it is                                     |
 | -------------------------- | ---------------------------------------------- |
 | `vargate_telemetry/`       | Python package — gateway, ingest, analyzers    |
-| `ui/`                      | React + Vite dashboard                         |
 | `docs/adr/`                | Architecture decision records                  |
 | `docs/architecture/`       | Architecture documents and diagrams            |
 | `docs/legal/`              | Trademark and IP-assignment tracking           |
@@ -49,14 +48,22 @@ If your situation falls in a grey area, write to legal@vargate.ai.
 | `tests/`                   | Pytest suite                                   |
 | `scripts/`                 | One-shot maintenance and benchmark scripts     |
 
+This repository ships **backend only**. The Ogma dashboard UI lives
+in the proprietary `vargate-frontend` repo at
+`apps/ogma-dashboard/`, separate from this BSL-licensed source. See
+the working-memory rule `ui_lives_in_vargate_frontend.md` for the
+reasoning.
+
 ## Architecture
 
 The system architecture is documented in
 [ADR-001](docs/adr/ADR-001-telemetry-architecture.md). The short version:
 Telemetry runs as a per-region cell — Postgres, MinIO, Celery on Redis,
-SoftHSM2 with envelope encryption, FastAPI gateway, React dashboard — with
-a small global control plane for signup routing and billing rollups. No
-content ever crosses regions.
+SoftHSM2 with envelope encryption, FastAPI gateway — with a small global
+control plane for signup routing and billing rollups. No content ever
+crosses regions. The dashboard UI is a separate React app in
+`vargate-frontend/apps/ogma-dashboard/` that consumes the gateway over
+HTTP.
 
 ## Running locally
 

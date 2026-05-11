@@ -240,9 +240,11 @@ backend is the engine T4 wraps:
 | First insights loading | `enqueue_admin_backfill` (T3.6 stub) → `backfill_admin_for_tenant` (T3.6) |
 | Tenant is now visible to the dispatcher | `dispatch_admin_pulls` already runs every 900s (T3.5) |
 
-T4 is **mostly wiring**, not designing — the design work is already
-done in T1.0.5 (the `ui/src/pages/onboarding/` five-screen flow),
-and T3 supplies the every backend primitive each screen needs.
+T4 is **mostly wiring**, not designing — the design work was done
+in T1.0.5; the onboarding screen now lives in the proprietary
+`vargate-frontend` repo at
+`apps/ogma-dashboard/src/pages/onboarding/` (migrated in Sprint
+T3.7+), and T3 supplies the backend primitive each screen needs.
 
 Run conditions for a clean T3 baseline:
 
