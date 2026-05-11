@@ -453,18 +453,17 @@ paths:
               schema:
                 $ref: '#/components/schemas/ValidateKeyResponse'
         '400':
-          $ref: '#/components/responses/BadRequest'
-        '401':
-          $ref: '#/components/responses/Unauthenticated'
-        '422':
           description: |
-            Anthropic rejected the key (`code: invalid_admin_key`).
-            Distinct from 400 so the UI can show "this key doesn't
-            work" vs. "your request body is malformed."
+            Either the request body failed validation (FastAPI's
+            standard shape, `code: validation_error`) OR Anthropic
+            rejected the supplied key (`code: invalid_admin_key`).
+            The UI branches on `code`, not status.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
         '500':
           $ref: '#/components/responses/InternalError'
 
