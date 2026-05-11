@@ -47,6 +47,14 @@ python-multipart>=0.0.12,<1
 authlib>=1.3,<2
 pyjwt[crypto]>=2.9,<3
 
+# T4.7: Prometheus instrumentation surface. The gateway exposes
+# /metrics on port 8000 for the Prom scraper; the onboarding routes
+# observe step durations + completion outcomes, and the pull/backfill
+# task observes time-to-first-pull. Single small dependency; the
+# default `REGISTRY` is process-global which is fine for the gateway's
+# single-worker startup.
+prometheus-client>=0.20,<1
+
 # T2.2: Shared chain + Merkle primitives extracted from vargate-proxy.
 # Apache 2.0 package; consumed via Git+SSH pinned to a specific SHA
 # for reproducible builds. Bump the SHA deliberately when picking up

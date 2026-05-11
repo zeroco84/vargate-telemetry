@@ -316,12 +316,21 @@ def _upsert_user(
             sso_subject_id=sso_subject_id,
             name=name,
             last_login_at=now,
+            # T4.7: time-to-first-pull histogram observes
+            # `now() - sso_sign_in_at` when the first telemetry row
+            # lands. Setting this here means the metric reflects the
+            # most-recent sign-in's wall-clock — a user who bounces
+            # halfway through onboarding and re-enters gets a fresh
+            # clock for the second attempt, which matches their lived
+            # "started now" intent.
+            sso_sign_in_at=now,
         )
         session.add(user)
         session.flush()
         return user
 
     existing.last_login_at = now
+    existing.sso_sign_in_at = now  # T4.7 — see above.
     # Refresh email + name in case the provider's profile changed.
     if email and email != existing.email:
         existing.email = email

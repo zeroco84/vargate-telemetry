@@ -70,6 +70,7 @@ from vargate_telemetry.crypto.dek import encrypt_with_dek, generate_dek
 from vargate_telemetry.crypto.hsm import wrap_dek
 from vargate_telemetry.crypto.integrity import compute_integrity_tag
 from vargate_telemetry.db import SessionLocal
+from vargate_telemetry.metrics import record_completion, track_step
 from vargate_telemetry.tasks.pull_admin import backfill_admin_for_tenant
 
 
@@ -246,68 +247,71 @@ def validate_key(
     confirmed both the org and the region, which is the right
     boundary for crypto material.
     """
-    client = _client_factory(body.admin_key)
+    # T4.7: observe step duration on success only. An exception path
+    # (invalid key 400, rate limit 503, etc.) skips the observation.
+    with track_step("validate-key"):
+        client = _client_factory(body.admin_key)
 
-    # 1. Admin API + org-name probe. If this fails with 401/403 the
-    # key is unusable; surface the canonical `invalid_admin_key`
-    # error so the UI can render the "this key doesn't work" state.
-    org_name: Optional[str] = None
-    try:
-        first_workspace = next(iter(client.list_workspaces()), None)
-        admin_api_ok = True
-        if first_workspace is not None:
-            org_name = first_workspace.name
-    except RateLimited as exc:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail={
-                "code": "anthropic_rate_limited",
-                "message": (
-                    f"Anthropic rate-limited the probe; retry in "
-                    f"{exc.retry_after}s."
-                ),
-            },
-        ) from exc
-    except Exception as exc:
-        if _is_auth_failure(exc):
+        # 1. Admin API + org-name probe. If this fails with 401/403 the
+        # key is unusable; surface the canonical `invalid_admin_key`
+        # error so the UI can render the "this key doesn't work" state.
+        org_name: Optional[str] = None
+        try:
+            first_workspace = next(iter(client.list_workspaces()), None)
+            admin_api_ok = True
+            if first_workspace is not None:
+                org_name = first_workspace.name
+        except RateLimited as exc:
             raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail={
-                    "code": "invalid_admin_key",
-                    "message": _INVALID_KEY_MESSAGE,
+                    "code": "anthropic_rate_limited",
+                    "message": (
+                        f"Anthropic rate-limited the probe; retry in "
+                        f"{exc.retry_after}s."
+                    ),
                 },
             ) from exc
-        raise
+        except Exception as exc:
+            if _is_auth_failure(exc):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail={
+                        "code": "invalid_admin_key",
+                        "message": _INVALID_KEY_MESSAGE,
+                    },
+                ) from exc
+            raise
 
-    # 2. Members probe — used here as a loose proxy for Compliance
-    # API capability until T5 lands the real Compliance probe. If
-    # the admin probe worked but this one doesn't, the user's key
-    # has Admin scope but not the broader Compliance scope.
-    try:
-        next(iter(client.list_members()), None)
-        compliance_api_ok = True
-    except Exception as exc:
-        if _is_auth_failure(exc):
-            compliance_api_ok = False
-        else:
-            # A 5xx from Anthropic is not the user's fault — but it
-            # also doesn't tell us much about scope. Default to
-            # `False` here so the UI doesn't claim Compliance is
-            # available when we couldn't confirm.
-            compliance_api_ok = False
+        # 2. Members probe — used here as a loose proxy for Compliance
+        # API capability until T5 lands the real Compliance probe. If
+        # the admin probe worked but this one doesn't, the user's key
+        # has Admin scope but not the broader Compliance scope.
+        try:
+            next(iter(client.list_members()), None)
+            compliance_api_ok = True
+        except Exception as exc:
+            if _is_auth_failure(exc):
+                compliance_api_ok = False
+            else:
+                # A 5xx from Anthropic is not the user's fault — but it
+                # also doesn't tell us much about scope. Default to
+                # `False` here so the UI doesn't claim Compliance is
+                # available when we couldn't confirm.
+                compliance_api_ok = False
 
-    # 3. Code Analytics: real probe lands in T5; for T4.4 default to
-    # `False` so the UI can render the "missing capability" row.
-    code_analytics_ok = False
+        # 3. Code Analytics: real probe lands in T5; for T4.4 default to
+        # `False` so the UI can render the "missing capability" row.
+        code_analytics_ok = False
 
-    return ValidateKeyResponse(
-        org_name=org_name or "Your Anthropic Organization",
-        capabilities=KeyCapabilities(
-            admin_api=admin_api_ok,
-            compliance_api=compliance_api_ok,
-            code_analytics=code_analytics_ok,
-        ),
-    )
+        return ValidateKeyResponse(
+            org_name=org_name or "Your Anthropic Organization",
+            capabilities=KeyCapabilities(
+                admin_api=admin_api_ok,
+                compliance_api=compliance_api_ok,
+                code_analytics=code_analytics_ok,
+            ),
+        )
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -390,6 +394,19 @@ def select_region(
           • region matches → 200 with the existing tenant row.
           • region differs → 409 `region_already_set`.
     """
+    # T4.7: observe step duration on success only. The context manager
+    # delegates to the underlying impl so the original 200-line body
+    # doesn't need re-indenting; an HTTPException raised inside skips
+    # the observation by design.
+    with track_step("select-region"):
+        return _select_region_impl(body, response, user)
+
+
+def _select_region_impl(
+    body: SelectRegionRequest,
+    response: Response,
+    user: AuthenticatedUser,
+) -> TenantResponse:
     try:
         region = body.normalized_region()
     except ValueError as exc:
@@ -765,6 +782,20 @@ def start_backfill(
     frontend's "refresh the page mid-backfill" path relies on — the
     second page load re-POSTs and gets the same task to poll.
     """
+    # T4.7: start-backfill is the last server-side gate of onboarding,
+    # so we observe both the step duration AND the `completed` outcome
+    # counter on success. The wrapping context manager guarantees the
+    # error paths (403, 404, 400, 500) bypass observation by design.
+    with track_step("start-backfill"):
+        result = _start_backfill_impl(body, user)
+        record_completion("completed")
+        return result
+
+
+def _start_backfill_impl(
+    body: StartBackfillRequest,
+    user: AuthenticatedUser,
+) -> StartBackfillResponse:
     # 1. Cross-tenant guard. We compare the body's tenant_id against
     # the SSO identity's bound tenant; mismatch is a 403 (the user
     # cannot kick off provisioning against someone else's tenant).

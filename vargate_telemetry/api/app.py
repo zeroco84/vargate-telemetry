@@ -21,11 +21,17 @@ from __future__ import annotations
 
 import os
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Response
 from fastapi.middleware.cors import CORSMiddleware
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 from vargate_telemetry.api import auth as auth_routes
 from vargate_telemetry.api import onboarding as onboarding_routes
+
+# Side-effect import: registers the T4.7 onboarding instruments against
+# the default Prometheus registry at module-load time, so `/metrics`
+# returns them on the very first scrape (no warm-up traffic needed).
+import vargate_telemetry.metrics  # noqa: F401
 
 
 def _build_app() -> FastAPI:
@@ -69,6 +75,21 @@ def _build_app() -> FastAPI:
     def _health() -> dict:
         """Liveness probe — not part of the public contract."""
         return {"status": "ok"}
+
+    @app.get("/metrics", include_in_schema=False)
+    def _metrics() -> Response:
+        """Prometheus scrape endpoint (T4.7).
+
+        Returns the full default-registry exposition. Kept off the
+        OpenAPI surface (not part of the customer-facing contract) and
+        intentionally unauthenticated — ops scrape this from inside
+        the network. If we ever expose this publicly, gate at nginx
+        via IP allowlist or a header check.
+        """
+        return Response(
+            content=generate_latest(),
+            media_type=CONTENT_TYPE_LATEST,
+        )
 
     return app
 
