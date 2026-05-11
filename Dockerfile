@@ -52,6 +52,10 @@ COPY pyproject.toml ./
 COPY vargate_telemetry/ ./vargate_telemetry/
 COPY tests/ ./tests/
 COPY scripts/ ./scripts/
+# openapi/ogma-api.yaml is the contract source of truth (T4.0).
+# Validated by scripts/validate_openapi.py and tests/test_openapi_spec.py;
+# both expect the file at /app/openapi/ inside the running container.
+COPY openapi/ ./openapi/
 
 ENV PYTHONPATH=/app \
     PYTHONUNBUFFERED=1 \
