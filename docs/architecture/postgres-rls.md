@@ -140,6 +140,59 @@ If you find yourself reaching for "this table has tenant_id but RLS
 should be off because…", stop. The answer is almost always wrong. Open
 an ADR before creating an exception.
 
+## Cross-tenant enumeration — the second-role pattern
+
+Sometimes infrastructure code *must* see every tenant at once. The
+canonical case is the Celery beat scheduler: it iterates a small
+`tenants` index to dispatch per-tenant pull tasks every 15 minutes.
+RLS by definition blocks that query — `current_setting('app.tenant_id', true)`
+matches one tenant, never N.
+
+The answer is **not** "disable RLS for this table and trust the
+callers." It's a second non-super role with surgical GRANTs:
+
+1. The cross-tenant table omits RLS entirely (e.g. `tenants`).
+2. A new role — `vargate_scheduler` is the canonical one, added in
+   migration `0009_create_tenants_index` — is created `NOLOGIN
+   NOSUPERUSER NOINHERIT NOCREATEDB NOCREATEROLE`.
+3. The role gets `USAGE` on the schema and `SELECT` on this single
+   table only. No DML, no GRANT on any other table.
+4. The migration explicitly `REVOKE`s the table from `vargate_app` so
+   the `ALTER DEFAULT PRIVILEGES` clause in `0002_create_app_role`
+   doesn't silently auto-include it.
+5. A dedicated session helper (`scheduler_session_scope()` in
+   `vargate_telemetry.db`) issues `SET LOCAL ROLE vargate_scheduler`
+   and does NOT bind `app.tenant_id`.
+
+After this, the cross-tenant query works exactly where it should
+(inside `scheduler_session_scope`) and fails everywhere else. If a
+new code path ever tries to read `tenants` under `vargate_app`,
+Postgres raises `permission denied` — caught by
+`test_tenants_index_invisible_to_app_role` in CI.
+
+When you reach for this pattern, ask:
+
+- **Is the table genuinely cross-tenant?** If it's just billing rollups
+  scoped to one tenant at a time, RLS still applies; pick a different
+  shape.
+- **Does the role need WRITE access?** If yes, think hard — a writable
+  cross-tenant table is a juicy footgun. The current `vargate_scheduler`
+  is read-only by design.
+- **Will the test suite catch a regression that grants `vargate_app`
+  access?** The `_invisible_to_app_role` test is the contract; copy
+  the pattern when you add the next cross-tenant table.
+
+Future candidates that fit this pattern naturally:
+
+- Fleet-wide health metrics (one row per tenant, "is this tenant's
+  pull current?").
+- Billing roll-ups (one row per (tenant, month), summing usage).
+- Operational alerts triggered by oncall (cross-tenant by definition).
+
+Each gets its own non-super role if the access pattern differs from
+`vargate_scheduler`'s (e.g., a future `vargate_oncall` with SELECT on
+multiple operational tables).
+
 ## Testing the pattern on a new table
 
 The three properties checked by `tests/test_telemetry_rls.py` against
