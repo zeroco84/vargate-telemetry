@@ -27,6 +27,13 @@ stripe>=8,<9
 # tests can inject a zero-wait policy without monkey-patching.
 tenacity>=8,<10
 
+# T4.0: OpenAPI 3.1 contract validation. `openapi/ogma-api.yaml` is
+# the contract source of truth; this validator is used by the
+# `scripts/validate_openapi.py` CI check and by the
+# `tests/test_openapi_spec.py` parse test. PyYAML comes in transitively
+# via alembic, so no explicit pin needed here.
+openapi-spec-validator>=0.7,<1
+
 # T2.2: Shared chain + Merkle primitives extracted from vargate-proxy.
 # Apache 2.0 package; consumed via Git+SSH pinned to a specific SHA
 # for reproducible builds. Bump the SHA deliberately when picking up

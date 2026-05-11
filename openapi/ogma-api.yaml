@@ -1,0 +1,604 @@
+openapi: 3.1.0
+
+info:
+  title: Vargate Ogma API
+  version: "0.1.0"
+  description: |
+    Public HTTP contract for Ogma (the Vargate Telemetry product).
+
+    This file is the contract source of truth — the backend implements
+    against it, the frontend generates TypeScript types from it. See
+    `openapi/README.md` for the contract-first change order.
+
+    The shape covers the T4 onboarding flow:
+      1. SSO sign-in (Google / Microsoft callback)
+      2. Validate the supplied Anthropic admin key
+      3. Pick a region
+      4. Start the 90-day backfill
+      5. Poll backfill status until done
+
+    Plus `/me` for "who am I currently signed in as."
+
+    Subsequent sprints (T5+) extend this file additively — adding new
+    paths, new schemas, new tags. Breaking changes (renames, removed
+    fields) require a major version bump and a deprecation window.
+  contact:
+    name: Vargate engineering
+    email: engineering@vargate.ai
+  license:
+    name: Business Source License 1.1
+    url: https://github.com/zeroco84/vargate-telemetry/blob/main/LICENSE
+
+servers:
+  - url: /api
+    description: Same-origin (nginx routes /api/ to the FastAPI gateway).
+
+tags:
+  - name: auth
+    description: SSO sign-in flows.
+  - name: onboarding
+    description: First-run flow that gets a paying customer to "data flowing" in <60 s.
+  - name: me
+    description: The authenticated caller's identity.
+
+# ───────────────────────────────────────────────────────────────────────────
+# Security schemes
+# ───────────────────────────────────────────────────────────────────────────
+
+components:
+  securitySchemes:
+    cookieAuth:
+      type: apiKey
+      in: cookie
+      name: ogma_session
+      description: |
+        HttpOnly Secure cookie set by `/api/auth/sso/*/callback` on
+        successful sign-in. Carries the short-lived JWT. Default
+        auth scheme for browser callers.
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        `Authorization: Bearer <JWT>`. Programmatic callers (CI
+        scripts, integration tests) that can't use cookies. The JWT
+        format is identical to the cookie payload.
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Reusable schemas
+  # ─────────────────────────────────────────────────────────────────────────
+
+  schemas:
+    ErrorResponse:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          description: Stable machine-readable code (snake_case). Clients branch on this, not on `message`.
+          examples: ["validation_error", "invalid_admin_key", "tenant_not_found", "unauthenticated"]
+        message:
+          type: string
+          description: Human-readable, English. Display verbatim or use for diagnostics.
+          examples: ["Anthropic rejected the supplied admin key as invalid."]
+        details:
+          type: array
+          description: Per-field validation breakdown when applicable. Empty / omitted for non-validation errors.
+          items:
+            type: object
+            required: [field, issue]
+            properties:
+              field:
+                type: string
+                examples: ["admin_key"]
+              issue:
+                type: string
+                examples: ["must start with 'sk-ant-admin01-'"]
+      examples:
+        - code: validation_error
+          message: One or more fields failed validation.
+          details:
+            - field: admin_key
+              issue: "must start with 'sk-ant-admin01-'"
+
+    SsoCallbackRequest:
+      type: object
+      required: [code, state]
+      description: OAuth 2.0 authorization-code callback parameters.
+      properties:
+        code:
+          type: string
+          description: The authorization code issued by the provider.
+        state:
+          type: string
+          description: |
+            The CSRF token the frontend set before redirecting to the provider.
+            Backend verifies it matches the value stored in the short-lived
+            state cookie.
+
+    SsoCallbackResponse:
+      type: object
+      required: [user_id, email]
+      description: |
+        Returned alongside the `Set-Cookie: ogma_session=...` response
+        header. The session cookie is the durable artifact; this body
+        is for clients that want to render "signed in as ..." without
+        a follow-up `/me` round-trip.
+      properties:
+        user_id:
+          type: string
+          description: Stable internal id, NOT the SSO provider's `sub`.
+          examples: ["usr_01HXYZ..."]
+        email:
+          type: string
+          format: email
+          examples: ["alice@example.com"]
+        name:
+          type: string
+          description: Provider-supplied display name. May be absent.
+
+    ValidateKeyRequest:
+      type: object
+      required: [admin_key]
+      properties:
+        admin_key:
+          type: string
+          description: Anthropic admin API key (begins `sk-ant-admin01-`).
+          minLength: 30
+          examples: ["sk-ant-admin01-abc123..."]
+
+    KeyCapabilities:
+      type: object
+      required: [admin_api, compliance_api, code_analytics]
+      description: |
+        Which Anthropic Admin sub-APIs the supplied key has access to.
+        Determined by probing each endpoint with a read-only request.
+        Used by the UI to render a "what we'll be able to show you"
+        capability matrix.
+      properties:
+        admin_api:
+          type: boolean
+          description: Can call `/v1/organizations/usage_report/messages`.
+        compliance_api:
+          type: boolean
+          description: Can pull prompt/response content (T5 dependency).
+        code_analytics:
+          type: boolean
+          description: Has Code Analytics access (T5 dependency).
+
+    ValidateKeyResponse:
+      type: object
+      required: [org_name, capabilities]
+      properties:
+        org_name:
+          type: string
+          description: |
+            The Anthropic org name the key belongs to, as returned by
+            `list_workspaces()`. Displayed in the UI so the user can
+            confirm they pasted the right key.
+          examples: ["Acme Corp"]
+        capabilities:
+          $ref: '#/components/schemas/KeyCapabilities'
+
+    Region:
+      type: string
+      enum: [us, eu]
+      description: |
+        Data-residency region. Once set on a tenant it MUST NOT change —
+        the first anchor is region-bound. Future regions (apac, etc.)
+        will be added here.
+
+    SelectRegionRequest:
+      type: object
+      required: [region]
+      properties:
+        region:
+          $ref: '#/components/schemas/Region'
+
+    Tenant:
+      type: object
+      required: [tenant_id, region]
+      properties:
+        tenant_id:
+          type: string
+          description: Stable per-tenant identifier (matches `tenants.tenant_id`).
+          examples: ["tnt_01HXYZ..."]
+        region:
+          $ref: '#/components/schemas/Region'
+
+    StartBackfillRequest:
+      type: object
+      required: [tenant_id]
+      properties:
+        tenant_id:
+          type: string
+        days:
+          type: integer
+          description: |
+            How many days of history to pull. Defaults to 90 (the
+            T3.6 backfill default). Bounded to avoid runaway pulls.
+          minimum: 1
+          maximum: 365
+          default: 90
+
+    StartBackfillResponse:
+      type: object
+      required: [task_id]
+      properties:
+        task_id:
+          type: string
+          description: |
+            Celery task id. Pass to `GET /onboarding/backfill-status/{task_id}`
+            to poll progress.
+          examples: ["6f8b9c..."]
+
+    BackfillState:
+      type: string
+      enum: [PENDING, STARTED, SUCCESS, FAILURE]
+      description: |
+        Celery task state. PENDING = queued, STARTED = running,
+        SUCCESS = done, FAILURE = exhausted retries.
+
+    BackfillStatus:
+      type: object
+      required: [state]
+      properties:
+        state:
+          $ref: '#/components/schemas/BackfillState'
+        chunks_processed:
+          type: integer
+          minimum: 0
+          description: |
+            Number of 7-day chunks the backfill has completed. Present
+            in STARTED / SUCCESS states; absent or 0 in PENDING.
+        inserted:
+          type: integer
+          minimum: 0
+          description: Total telemetry_records rows inserted so far.
+        deduped:
+          type: integer
+          minimum: 0
+          description: |
+            Buckets that hit the (tenant_id, source_api, external_id)
+            UNIQUE constraint — expected when the backfill resumes
+            after a partial run.
+        error:
+          type: string
+          description: |
+            Present only on FAILURE. Truncated to 1000 chars for
+            display safety.
+
+    Me:
+      type: object
+      required: [user_id, email, tenants]
+      properties:
+        user_id:
+          type: string
+        email:
+          type: string
+          format: email
+        name:
+          type: string
+        sso_provider:
+          type: string
+          enum: [google, microsoft]
+        tenants:
+          type: array
+          description: |
+            All tenants this user has access to. Empty array means the
+            user is signed in but hasn't completed onboarding yet
+            (between SSO callback and `/onboarding/select-region`).
+          items:
+            $ref: '#/components/schemas/Tenant'
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Reusable response bodies — every 4xx / 5xx is an ErrorResponse.
+  # ─────────────────────────────────────────────────────────────────────────
+
+  responses:
+    BadRequest:
+      description: Validation failure or malformed input.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    Unauthenticated:
+      description: Missing or invalid session.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    Forbidden:
+      description: Authenticated but lacks permission for this tenant or resource.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    NotFound:
+      description: The named resource does not exist.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    InternalError:
+      description: Unhandled server error. Body is safe-to-display; details land in server logs.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+
+# ───────────────────────────────────────────────────────────────────────────
+# Default security: every endpoint requires either the cookie or a Bearer
+# token. Endpoints that don't (the SSO callbacks) override with `security: []`.
+# ───────────────────────────────────────────────────────────────────────────
+
+security:
+  - cookieAuth: []
+  - bearerAuth: []
+
+# ───────────────────────────────────────────────────────────────────────────
+# Paths
+# ───────────────────────────────────────────────────────────────────────────
+
+paths:
+
+  /auth/sso/google/callback:
+    post:
+      tags: [auth]
+      summary: Google OAuth 2.0 callback
+      description: |
+        Handles the redirect back from Google after the user
+        authenticates. Verifies `state` against the cookie set
+        before redirect, exchanges `code` for an ID token, upserts
+        the user row, and issues the session cookie.
+      security: []
+      operationId: ssoGoogleCallback
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SsoCallbackRequest'
+      responses:
+        '200':
+          description: Sign-in successful. Body carries user identity; cookie carries the session.
+          headers:
+            Set-Cookie:
+              description: '`ogma_session=<JWT>; HttpOnly; Secure; SameSite=Lax`'
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SsoCallbackResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          description: |
+            State token mismatch (likely CSRF attempt) or the `code`
+            was rejected by Google. Returns an ErrorResponse with
+            `code: invalid_state` or `code: oauth_exchange_failed`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /auth/sso/microsoft/callback:
+    post:
+      tags: [auth]
+      summary: Microsoft OAuth 2.0 callback
+      description: |
+        Microsoft Entra (formerly Azure AD) callback. Same flow as
+        Google's callback; separate path because the provider's
+        token-exchange endpoint and ID-token claim shape differ.
+      security: []
+      operationId: ssoMicrosoftCallback
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SsoCallbackRequest'
+      responses:
+        '200':
+          description: Sign-in successful.
+          headers:
+            Set-Cookie:
+              description: '`ogma_session=<JWT>; HttpOnly; Secure; SameSite=Lax`'
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SsoCallbackResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          description: State mismatch or `code` rejected by Microsoft.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /onboarding/validate-key:
+    post:
+      tags: [onboarding]
+      summary: Validate an Anthropic admin API key
+      description: |
+        Confirms the supplied key works against Anthropic's Admin API
+        by calling `list_workspaces()` (one read-only request — does
+        not consume credit). Returns the org name (so the user can
+        eyeball that it's the right org) plus a capability matrix
+        the UI uses to render the "what we can show you" panel.
+
+        Does NOT seal the key into `encrypted_secrets` yet — that
+        happens after region selection so the seal is bound to a
+        tenant. Validate-then-bind-then-seal is the sequence.
+      operationId: validateAdminKey
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ValidateKeyRequest'
+      responses:
+        '200':
+          description: Key is valid; returns capabilities + org name.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ValidateKeyResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '422':
+          description: |
+            Anthropic rejected the key (`code: invalid_admin_key`).
+            Distinct from 400 so the UI can show "this key doesn't
+            work" vs. "your request body is malformed."
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /onboarding/select-region:
+    post:
+      tags: [onboarding]
+      summary: Pick a data-residency region and provision the tenant
+      description: |
+        Creates the tenant row, provisions the per-tenant DEK (T1.7),
+        seals the admin key (previously validated by `validate-key`)
+        into `encrypted_secrets`. Once this call returns, the tenant
+        is visible to the scheduler in `tenants` and pulls will start
+        on the next 15-minute beat fire.
+
+        Region MUST NOT change after this call — every record will be
+        anchored to the chosen region's chain.
+      operationId: selectRegion
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SelectRegionRequest'
+      responses:
+        '200':
+          description: Tenant created; the JWT will pick up the new tenant_id on next refresh.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Tenant'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '409':
+          description: |
+            `code: region_already_set` — this user already provisioned
+            a tenant. Region is immutable; further `select-region`
+            calls for the same user return 409.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /onboarding/start-backfill:
+    post:
+      tags: [onboarding]
+      summary: Enqueue the 90-day historical backfill
+      description: |
+        Dispatches the T3.6 `backfill_admin_for_tenant` Celery task
+        and returns the task id. The frontend polls
+        `/onboarding/backfill-status/{task_id}` until the state
+        reaches SUCCESS or FAILURE.
+
+        Idempotent on `tenant_id`: enqueuing a second backfill for the
+        same tenant while one is in flight returns the existing task
+        id rather than queuing a duplicate.
+      operationId: startBackfill
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StartBackfillRequest'
+      responses:
+        '200':
+          description: Task queued (or already in flight); poll for progress.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StartBackfillResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          description: '`tenant_id` does not belong to the authenticated user.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /onboarding/backfill-status/{task_id}:
+    get:
+      tags: [onboarding]
+      summary: Poll the backfill task's progress
+      description: |
+        Reads Celery task state. Safe to call on a 1–2 s polling
+        interval — the underlying state lookup is one Redis read.
+      operationId: getBackfillStatus
+      parameters:
+        - name: task_id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: The task id returned by `/onboarding/start-backfill`.
+      responses:
+        '200':
+          description: Current task state.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BackfillStatus'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /me:
+    get:
+      tags: [me]
+      summary: Return the signed-in user's profile + tenant binding
+      description: |
+        The frontend uses this on every route entry to confirm the
+        session is still valid and to pick up tenant changes (e.g.,
+        after `select-region` updates the JWT's `tenant_id` claim).
+      operationId: getMe
+      responses:
+        '200':
+          description: User profile + accessible tenants.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Me'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '500':
+          $ref: '#/components/responses/InternalError'
