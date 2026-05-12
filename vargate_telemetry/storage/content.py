@@ -208,13 +208,28 @@ def _aad_for_content(tenant_id: str, content_ref: str) -> bytes:
 _IV_LEN = 12  # AES-GCM 96-bit IV per NIST SP 800-38D
 
 
-def store_content(tenant_id: str, plaintext: bytes) -> tuple[str, bytes]:
+def store_content(
+    tenant_id: str, plaintext: bytes
+) -> tuple[str, bytes, int]:
     """Encrypt ``plaintext`` under the tenant DEK and write to MinIO.
 
-    Returns ``(content_ref, content_hash)`` for the caller to persist
-    in ``telemetry_records.content_ref`` / ``.content_hash``.
-    ``content_hash`` is SHA-256 of the *plaintext* (see module
-    docstring on why this is load-bearing for DEK rotation).
+    Returns ``(content_ref, content_hash, content_size_bytes)`` for
+    the caller to persist in ``telemetry_records.content_ref`` /
+    ``.content_hash`` / ``.content_size_bytes``.
+
+      - ``content_ref`` — the per-tenant MinIO key
+        (``YYYY/MM/DD/{uuid}.enc``).
+      - ``content_hash`` — SHA-256 of the *plaintext* (see module
+        docstring on why this is load-bearing for DEK rotation).
+      - ``content_size_bytes`` — the uncompressed plaintext size.
+        Used by the dashboard for "this record holds X KB of
+        content" and by capacity-planning queries; NOT included in
+        the chain canonical bytes (operational metric, not integrity).
+
+    T5.3 expanded the return from 2-tuple to 3-tuple to address the
+    follow-up flagged in T5.1's close — the column was added in
+    migration 0014 but no caller populated it. Now ingest paths
+    that store content can write the size alongside the hash.
 
     Raises ``ValueError`` for a malformed tenant_id (per the
     boundary-validation rule). Raises
@@ -232,6 +247,7 @@ def store_content(tenant_id: str, plaintext: bytes) -> tuple[str, bytes]:
 
     plaintext_bytes = bytes(plaintext)
     content_hash = hashlib.sha256(plaintext_bytes).digest()
+    content_size_bytes = len(plaintext_bytes)
     content_ref = _new_content_ref()
 
     # Pull the DEK once, AES-GCM-encrypt, then drop the in-memory
@@ -254,7 +270,7 @@ def store_content(tenant_id: str, plaintext: bytes) -> tuple[str, bytes]:
 
     blob = iv + ciphertext
     object_store.put_content(tenant_id, content_ref, blob)
-    return content_ref, content_hash
+    return content_ref, content_hash, content_size_bytes
 
 
 def retrieve_content(tenant_id: str, content_ref: str) -> bytes:

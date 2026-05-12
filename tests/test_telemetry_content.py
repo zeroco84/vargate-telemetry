@@ -114,10 +114,13 @@ def test_store_content_writes_to_minio_and_returns_hash(
     )
     expected_hash = hashlib.sha256(plaintext).digest()
 
-    content_ref, content_hash = content_mod.store_content(
+    content_ref, content_hash, content_size_bytes = content_mod.store_content(
         provisioned_tenant, plaintext
     )
     cleanup_objects.append(content_ref)
+
+    # T5.3: size is the uncompressed plaintext length.
+    assert content_size_bytes == len(plaintext)
 
     # Returned hash matches plaintext sha256 — the load-bearing
     # invariant (chain entry survives DEK rotation; see
@@ -138,7 +141,7 @@ def test_retrieve_content_decrypts_correctly(
     from vargate_telemetry.storage import content as content_mod
 
     plaintext = b"\x00\x01\x02 prompt with NULs and \xfe\xff bytes" * 8
-    content_ref, _ = content_mod.store_content(
+    content_ref, _, _ = content_mod.store_content(
         provisioned_tenant, plaintext
     )
     cleanup_objects.append(content_ref)
@@ -174,7 +177,7 @@ def test_content_hash_stable_across_encryption_with_new_dek(
         plaintext = b"identical plaintext across rotations"
 
         # Round 1: store under DEK v1
-        ref1, hash1 = content_mod.store_content(
+        ref1, hash1, _ = content_mod.store_content(
             smoke_tenant_id, plaintext
         )
         refs_to_clean.append(ref1)
@@ -196,7 +199,7 @@ def test_content_hash_stable_across_encryption_with_new_dek(
         provision_tenant_dek(smoke_tenant_id)
 
         # Round 2: store SAME plaintext under DEK v2
-        ref2, hash2 = content_mod.store_content(
+        ref2, hash2, _ = content_mod.store_content(
             smoke_tenant_id, plaintext
         )
         refs_to_clean.append(ref2)
@@ -251,7 +254,7 @@ def test_chain_integrity_holds_when_content_added(
 
     # Record 1: with content.
     plaintext = b"Compliance API captured prompt -- sensitive."
-    ref, content_hash = content_mod.store_content(
+    ref, content_hash, _ = content_mod.store_content(
         provisioned_tenant, plaintext
     )
     cleanup_objects.append(ref)
@@ -327,7 +330,7 @@ def test_integrity_error_on_tampered_ciphertext(
     from vargate_telemetry.storage import object_store
 
     plaintext = b"original-content-T5.1"
-    ref, _ = content_mod.store_content(provisioned_tenant, plaintext)
+    ref, _, _ = content_mod.store_content(provisioned_tenant, plaintext)
     cleanup_objects.append(ref)
 
     # Flip a byte deep in the ciphertext (well past the IV). The
@@ -374,7 +377,7 @@ def test_delete_content_removes_object_but_preserves_hash_in_chain(
     from vargate_telemetry.storage import object_store
 
     plaintext = b"to-be-shredded"
-    ref, content_hash = content_mod.store_content(
+    ref, content_hash, _ = content_mod.store_content(
         provisioned_tenant, plaintext
     )
     append_telemetry_record(
@@ -427,11 +430,12 @@ def test_store_with_empty_plaintext_creates_zero_byte_content(
         == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
     )
 
-    ref, content_hash = content_mod.store_content(
+    ref, content_hash, content_size_bytes = content_mod.store_content(
         provisioned_tenant, plaintext
     )
     cleanup_objects.append(ref)
     assert content_hash == expected_hash
+    assert content_size_bytes == 0  # zero-byte plaintext → zero-byte size
 
     retrieved = content_mod.retrieve_content(provisioned_tenant, ref)
     assert retrieved == b""
