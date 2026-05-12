@@ -6,6 +6,7 @@
 from vargate_telemetry.anthropic.client import AnthropicAdminClient
 from vargate_telemetry.anthropic.exceptions import (
     AnthropicAPIError,
+    InsufficientScope,
     RateLimited,
 )
 from vargate_telemetry.anthropic.factory import (
@@ -13,7 +14,17 @@ from vargate_telemetry.anthropic.factory import (
     admin_client_for_tenant,
 )
 from vargate_telemetry.anthropic.types import (
+    Activity,
+    Actor,
+    Chat,
+    ChatMessage,
+    ChatUser,
+    ChatWithMessages,
     Member,
+    MessageArtifact,
+    MessageContentBlock,
+    MessageFile,
+    MessageGeneratedFile,
     UsageBreakdown,
     UsageBucket,
     Workspace,
@@ -21,9 +32,20 @@ from vargate_telemetry.anthropic.types import (
 
 __all__ = [
     "ANTHROPIC_ADMIN_KEY_SECRET",
+    "Activity",
+    "Actor",
     "AnthropicAPIError",
     "AnthropicAdminClient",
+    "Chat",
+    "ChatMessage",
+    "ChatUser",
+    "ChatWithMessages",
+    "InsufficientScope",
     "Member",
+    "MessageArtifact",
+    "MessageContentBlock",
+    "MessageFile",
+    "MessageGeneratedFile",
     "RateLimited",
     "UsageBreakdown",
     "UsageBucket",
