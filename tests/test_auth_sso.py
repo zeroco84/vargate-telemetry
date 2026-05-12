@@ -218,6 +218,86 @@ def test_sso_callback_finds_existing_user_on_repeat_login(
     assert last_login is not None
 
 
+def test_sso_callback_preserves_existing_tenant_binding_on_repeat_login(
+    clean_auth_state: None,
+    client: TestClient,
+) -> None:
+    """T5.6 hotfix: a returning user with `users.tenant_id` already set
+    must get a JWT carrying that tenant_id, not `None`.
+
+    The original T4.2 code hardcoded ``tenant_id=None`` in the SSO
+    callback's ``issue_session_jwt`` call on the assumption that
+    T4.5's select-region would always be the next step. That's true
+    for first-time onboarding, but a returning sign-in for an
+    already-onboarded user would re-issue a tenant_id-less JWT,
+    making ``/me`` report ``tenants=[]``, which the frontend reads
+    as "not onboarded" and starts the flow over (re-paste key, etc.).
+
+    This test pins the fix: sign in → manually bind the user to a
+    tenant via direct SQL (simulating T4.5's commit) → sign in
+    again → /me MUST report the tenant.
+    """
+    from vargate_telemetry.auth.sso import set_exchanger_for_test
+    from vargate_telemetry.db import engine
+
+    # First sign-in. User row created, no tenant binding yet.
+    set_exchanger_for_test(
+        "google",
+        StubExchanger(
+            sub="google-returning", email="returning@example.com", nonce="n-1"
+        ),
+    )
+    _set_oauth_cookies(client, state="s-1", nonce="n-1")
+    r1 = _post_google_callback(client, code="c-1", state="s-1")
+    assert r1.status_code == 200
+    user_id = r1.json()["user_id"]
+
+    # Sanity: /me reports no tenants yet.
+    me_before = client.get("/me")
+    assert me_before.status_code == 200
+    assert me_before.json()["tenants"] == []
+
+    # Simulate T4.5 select-region: create a tenant + bind the user.
+    # (We don't go through the real route to keep the test surface
+    # narrow — the binding is what matters for this assertion.)
+    with engine.begin() as conn:
+        conn.execute(
+            sql_text(
+                "INSERT INTO tenants (tenant_id, region, active, "
+                "billing_status) VALUES "
+                "(:t, 'eu', TRUE, 'trial')"
+            ),
+            {"t": "tnt_eu_returning_test"},
+        )
+        conn.execute(
+            sql_text("UPDATE users SET tenant_id = :t WHERE id = :uid"),
+            {"t": "tnt_eu_returning_test", "uid": user_id},
+        )
+
+    # Sign out (clear cookies), then sign in again with the same
+    # (provider, sub).
+    client.cookies.clear()
+    set_exchanger_for_test(
+        "google",
+        StubExchanger(
+            sub="google-returning", email="returning@example.com", nonce="n-2"
+        ),
+    )
+    _set_oauth_cookies(client, state="s-2", nonce="n-2")
+    r2 = _post_google_callback(client, code="c-2", state="s-2")
+    assert r2.status_code == 200, r2.text
+    assert r2.json()["user_id"] == user_id  # same user row
+
+    # The new session's /me MUST report the tenant binding.
+    me_after = client.get("/me")
+    assert me_after.status_code == 200
+    body = me_after.json()
+    assert len(body["tenants"]) == 1, (
+        f"expected tenant binding preserved in re-issued JWT; got {body}"
+    )
+    assert body["tenants"][0]["tenant_id"] == "tnt_eu_returning_test"
+
+
 # ───────────────────────────────────────────────────────────────────────────
 # 3. JWT round-trip: issue → verify → expired-token rejection
 # ───────────────────────────────────────────────────────────────────────────
