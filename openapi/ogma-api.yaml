@@ -790,6 +790,27 @@ paths:
         '500':
           $ref: '#/components/responses/InternalError'
 
+  /auth/logout:
+    post:
+      tags: [auth]
+      summary: Clear the session cookie and sign the user out
+      description: |
+        Clears the `ogma_session` HttpOnly cookie. The response carries
+        `Set-Cookie: ogma_session=; Max-Age=0; ...` with the same
+        attributes (Path, HttpOnly, Secure, SameSite) that the original
+        cookie was set with — browsers only overwrite cookies whose
+        attributes match.
+
+        Intentionally NOT gated on a valid session. Calling logout
+        when no session exists (expired token, already signed out)
+        is a no-op success. The endpoint is idempotent.
+      operationId: logout
+      responses:
+        '204':
+          description: |
+            Session cleared. Body is empty; the cookie-clearing
+            `Set-Cookie` header is the only meaningful response shape.
+
   /sessions:
     get:
       tags: [sessions]
