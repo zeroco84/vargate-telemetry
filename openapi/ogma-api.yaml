@@ -344,6 +344,141 @@ components:
           items:
             $ref: '#/components/schemas/Tenant'
 
+    # ─────────────────────────────────────────────────────────────────────
+    # Sessions (T5.5) — first dashboard view of ingested content.
+    # A Session is one (date, actor) tuple aggregated across the
+    # `code_analytics` and `compliance_activities` streams. Admin API
+    # usage records are bucket-grain, not actor-grain, so they don't
+    # roll up into Sessions.
+    # ─────────────────────────────────────────────────────────────────────
+
+    SessionActor:
+      type: object
+      required: [type, key]
+      description: |
+        The principal behind a Session. `type` is the vendor's actor
+        discriminator (`user_actor` / `api_actor` / etc.); `key` is the
+        natural identifier — email for users, api_key_name (or
+        api_key_id) for keys. Forward-compatible with novel actor
+        types via `extra="allow"` semantics on the underlying records.
+      properties:
+        type:
+          type: string
+          examples: ["user_actor", "api_actor"]
+        key:
+          type: string
+          examples: ["dev@example.com", "ci-deploy-key"]
+
+    SessionSummary:
+      type: object
+      required: [session_id, date, actor, source_apis, event_count, first_seen, last_seen]
+      description: |
+        One row in the Sessions list. `session_id` is opaque (base64url
+        of `{date}|{actor_type}|{actor_key}`); pass it back to
+        `/sessions/{session_id}` for the detail view.
+      properties:
+        session_id:
+          type: string
+          description: Opaque, URL-safe identifier. Stable per (date, actor).
+        date:
+          type: string
+          format: date
+          description: UTC date of the session.
+        actor:
+          $ref: '#/components/schemas/SessionActor'
+        source_apis:
+          type: array
+          description: |
+            Which ingest streams contributed records to this session
+            (`code_analytics`, `compliance_activities`). T5.5 primarily
+            surfaces Code Analytics; Activity Feed feeds in for tenants
+            with `activity_feed: true`.
+          items:
+            type: string
+        event_count:
+          type: integer
+          description: Total underlying records folded into this session.
+        first_seen:
+          type: string
+          format: date-time
+        last_seen:
+          type: string
+          format: date-time
+
+    SessionListResponse:
+      type: object
+      required: [sessions, next_cursor]
+      properties:
+        sessions:
+          type: array
+          items:
+            $ref: '#/components/schemas/SessionSummary'
+        next_cursor:
+          type: string
+          nullable: true
+          description: |
+            Opaque cursor for the next page. `null` when no more.
+            Pass back as the `cursor` query param.
+
+    SessionRecord:
+      type: object
+      required: [record_id, source_api, occurred_at, external_id, metadata]
+      description: |
+        One underlying audit-chain record inside a Session. T5.5 returns
+        all records folded into the session in chain order. The
+        `content` field is populated when the record carries a MinIO
+        content blob (T5.1+); T5.6's Compliance Content path is the
+        first ingest that will surface non-null content here.
+      properties:
+        record_id:
+          type: string
+          format: uuid
+        source_api:
+          type: string
+        record_type:
+          type: string
+        occurred_at:
+          type: string
+          format: date-time
+        external_id:
+          type: string
+          description: Vendor-side stable id (or synthesized natural key).
+        metadata:
+          type: object
+          description: |
+            The full vendor record JSON, including type-specific extra
+            fields. T5.4's flat-model-with-extra-allow ingest pattern
+            means future fields land here without an API change.
+          additionalProperties: true
+        content_size_bytes:
+          type: integer
+          nullable: true
+          description: Plaintext size of the content blob, if any.
+        content:
+          type: string
+          nullable: true
+          description: |
+            Plaintext content blob (T5.6+). Decrypted server-side from
+            MinIO using the tenant DEK if `content_ref` is non-null
+            on the underlying record. `null` for records without an
+            attached blob (the common case in T5.5).
+
+    SessionDetailResponse:
+      type: object
+      required: [session_id, date, actor, records]
+      properties:
+        session_id:
+          type: string
+        date:
+          type: string
+          format: date
+        actor:
+          $ref: '#/components/schemas/SessionActor'
+        records:
+          type: array
+          items:
+            $ref: '#/components/schemas/SessionRecord'
+
   # ─────────────────────────────────────────────────────────────────────────
   # Reusable response bodies — every 4xx / 5xx is an ErrorResponse.
   # ─────────────────────────────────────────────────────────────────────────
@@ -652,5 +787,109 @@ paths:
                 $ref: '#/components/schemas/Me'
         '401':
           $ref: '#/components/responses/Unauthenticated'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /sessions:
+    get:
+      tags: [sessions]
+      summary: List Sessions for the authenticated tenant
+      description: |
+        Each Session is one (date, actor) tuple aggregated from the
+        `code_analytics` + `compliance_activities` streams. Sorted
+        newest-first (by `last_seen`); cursor-paginated.
+
+        T5.5 invariant: only `code_analytics` and
+        `compliance_activities` records contribute to Sessions. Admin
+        API usage records are bucket-grain and excluded. Tenants
+        without Code Analytics activity (e.g., Personal-plan orgs
+        that don't use Claude Code) see an empty list and the
+        dashboard renders the "no sessions yet" empty state.
+      operationId: listSessions
+      parameters:
+        - in: query
+          name: cursor
+          schema:
+            type: string
+          description: Opaque cursor from a prior response's `next_cursor`.
+        - in: query
+          name: limit
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+        - in: query
+          name: source_api
+          schema:
+            type: string
+            enum: [code_analytics, compliance_activities]
+          description: |
+            Filter to one ingest stream. Omit to include both.
+        - in: query
+          name: actor_key
+          schema:
+            type: string
+          description: Filter by the actor's natural identifier (email or api_key_name).
+        - in: query
+          name: since
+          schema:
+            type: string
+            format: date
+          description: Inclusive lower bound on session date (UTC).
+        - in: query
+          name: until
+          schema:
+            type: string
+            format: date
+          description: Inclusive upper bound on session date (UTC).
+      responses:
+        '200':
+          description: Sessions list page.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionListResponse'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /sessions/{session_id}:
+    get:
+      tags: [sessions]
+      summary: Get one Session's full record list
+      description: |
+        Returns every audit-chain record folded into this Session, in
+        chain order. Records carrying a MinIO content blob (T5.1+
+        feature; T5.6 first wires content ingest) have their plaintext
+        decrypted server-side via the tenant DEK and surfaced in the
+        `content` field; records without a blob have `content: null`.
+
+        `session_id` is the opaque identifier from the list response —
+        base64url of `{date}|{actor_type}|{actor_key}`. Malformed
+        session ids return 400; sessions that don't exist for the
+        authenticated tenant return 404 (RLS keeps cross-tenant lookups
+        impossible regardless).
+      operationId: getSessionDetail
+      parameters:
+        - in: path
+          name: session_id
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Session detail with all underlying records.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionDetailResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
         '500':
           $ref: '#/components/responses/InternalError'
