@@ -130,8 +130,14 @@ services:
       MICROSOFT_OAUTH_CLIENT_SECRET: ${MICROSOFT_OAUTH_CLIENT_SECRET:-}
       OGMA_OAUTH_REDIRECT_BASE: ${OGMA_OAUTH_REDIRECT_BASE:-https://vargate.ai}
       OGMA_CORS_ORIGINS: ${OGMA_CORS_ORIGINS:-http://localhost:5173}
+      # T4.8.1: shared multiproc dir for prometheus_client. The Counter
+      # and Histogram observations this worker emits land as files in
+      # this dir; the gateway's /metrics endpoint reads from the same
+      # dir to aggregate. See `vargate-prom-multiproc` volume below.
+      PROMETHEUS_MULTIPROC_DIR: /tmp/prometheus_multiproc
     volumes:
       - vargate-hsm-tokens:/var/lib/softhsm/tokens
+      - vargate-prom-multiproc:/tmp/prometheus_multiproc
     networks:
       - telemetry_internal
     depends_on:
@@ -187,8 +193,19 @@ services:
       # though the gateway never runs a worker itself.
       CELERY_BROKER_URL: ${CELERY_BROKER_URL}
       CELERY_RESULT_BACKEND: ${CELERY_RESULT_BACKEND}
+      # T4.8.1: shared multiproc dir for prometheus_client. The /metrics
+      # route in `vargate_telemetry.api.app` builds a fresh registry
+      # backed by `MultiProcessCollector`, which reads files from this
+      # dir to aggregate observations emitted by celery-worker (where
+      # the backfill task observes time-to-first-pull) and the gateway
+      # itself (validate-key / select-region / start-backfill step
+      # histograms). Without this dir + the matching volume mount, the
+      # worker's observations land in its own in-process REGISTRY and
+      # are invisible to any scrape — the structural gap T4.8 found.
+      PROMETHEUS_MULTIPROC_DIR: /tmp/prometheus_multiproc
     volumes:
       - vargate-hsm-tokens:/var/lib/softhsm/tokens
+      - vargate-prom-multiproc:/tmp/prometheus_multiproc
     # T4.7.1: gateway sits on BOTH networks. `telemetry_internal` for
     # in-stack DNS to postgres/redis/etc; `tyr_observability` so Tyr's
     # Prometheus can scrape `/metrics` from across the project boundary.
@@ -255,8 +272,15 @@ services:
       MICROSOFT_OAUTH_CLIENT_SECRET: ${MICROSOFT_OAUTH_CLIENT_SECRET:-}
       OGMA_OAUTH_REDIRECT_BASE: ${OGMA_OAUTH_REDIRECT_BASE:-https://vargate.ai}
       OGMA_CORS_ORIGINS: ${OGMA_CORS_ORIGINS:-http://localhost:5173}
+      # T4.8.1: same shared multiproc dir as gateway + celery-worker. Beat
+      # itself doesn't emit metrics today (the schedule fan-out is a
+      # plain Celery dispatch with no histogram observation), but joining
+      # the volume now means the first beat-emitted instrument lands
+      # without a follow-up compose edit. Cheap to include.
+      PROMETHEUS_MULTIPROC_DIR: /tmp/prometheus_multiproc
     volumes:
       - vargate-hsm-tokens:/var/lib/softhsm/tokens
+      - vargate-prom-multiproc:/tmp/prometheus_multiproc
     networks:
       - telemetry_internal
     depends_on:
@@ -283,3 +307,26 @@ volumes:
     name: vargate-redis-data
   vargate-hsm-tokens:
     name: vargate-hsm-tokens
+  # T4.8.1: shared multiproc dir for prometheus_client. tmpfs-backed
+  # so writes are in-RAM (the multiproc files are small but write-heavy
+  # — every Counter/Histogram observation does a file mmap update).
+  # All three Python-running services (gateway, celery-worker,
+  # celery-beat) mount this at /tmp/prometheus_multiproc so the
+  # gateway's /metrics route can aggregate observations across them.
+  #
+  # Linux-only: the `tmpfs` driver_opts work on the local driver on
+  # Linux hosts. Docker Desktop on macOS doesn't honor the same
+  # driver_opts shape — fine for now, prod box is Linux and dev box
+  # is Linux. If anyone develops on macOS, drop the `driver_opts`
+  # block and accept disk-backed multiproc files (still correct, just
+  # slower).
+  #
+  # Safe to `docker compose down` (volume persists, counter values
+  # survive); destroyed by `docker compose down -v` along with
+  # everything else (which is why CLAUDE.md says never run -v).
+  vargate-prom-multiproc:
+    name: vargate-prom-multiproc
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: "size=16m"
