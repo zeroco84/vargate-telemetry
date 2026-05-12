@@ -39,6 +39,18 @@ services:
     mem_limit: 1g
     mem_reservation: 256m
 
+  gateway:
+    # T4.5.5 — publish the Ogma gateway on host port 127.0.0.1:8001
+    # so the host's nginx (vhost ogma.vargate.ai) can proxy /api/*
+    # to it. Tyr's gateway already uses 127.0.0.1:8000 (in the
+    # vargate proxy repo's prod overlay), so 8001 keeps the two
+    # gateways distinct on the host's loopback.
+    #
+    # Localhost-only: nothing outside the box should reach this port
+    # directly; all public traffic comes in via nginx on 443 → /api/.
+    ports:
+      - "127.0.0.1:8001:8000"
+
   celery-worker:
     mem_limit: 1g
     mem_reservation: 256m
