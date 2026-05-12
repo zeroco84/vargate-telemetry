@@ -75,6 +75,47 @@ services:
       interval: 10s
       retries: 5
 
+  # T5.0: One-shot bootstrap that creates the tenant-content bucket if it
+  # doesn't exist. Uses MinIO's `mc` CLI (same upstream maintainer as the
+  # server, pinned to a release tag aligned with the server's). Runs to
+  # completion and exits — `restart: "no"` keeps it from looping forever
+  # in `docker compose up` after the bucket is created.
+  #
+  # Idempotent: `mc mb --ignore-existing` is a no-op if the bucket is
+  # already there, so this can run on every `up` without producing
+  # spurious errors. Compose's `service_completed_successfully` is the
+  # right depends_on condition for downstream services that need the
+  # bucket to exist (we'll wire that in T5.1 once an ingest task actually
+  # writes content).
+  minio-bootstrap:
+    image: minio/mc:RELEASE.2025-08-13T08-35-41Z
+    restart: "no"
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      MINIO_TENANT_CONTENT_BUCKET: ${MINIO_TENANT_CONTENT_BUCKET:-tenant-content}
+    networks:
+      - telemetry_internal
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        echo "▶ aliasing local MinIO as 'ogma'"
+        mc alias set ogma http://minio:9000 \
+          "$${MINIO_ROOT_USER}" "$${MINIO_ROOT_PASSWORD}"
+        echo "▶ ensuring bucket: $${MINIO_TENANT_CONTENT_BUCKET}"
+        mc mb --ignore-existing "ogma/$${MINIO_TENANT_CONTENT_BUCKET}"
+        # No lifecycle policy: tenant content retention is governed by
+        # explicit code paths (T5+ delete on `account_deleted`), not by
+        # MinIO auto-expiry. A future crypto-shred PRD lands here.
+        echo "▶ bucket inventory:"
+        mc ls "ogma/$${MINIO_TENANT_CONTENT_BUCKET}" || true
+        echo "✓ minio-bootstrap done"
+
   redis:
     image: redis:7-alpine
     restart: unless-stopped
@@ -135,6 +176,17 @@ services:
       # this dir; the gateway's /metrics endpoint reads from the same
       # dir to aggregate. See `vargate-prom-multiproc` volume below.
       PROMETHEUS_MULTIPROC_DIR: /tmp/prometheus_multiproc
+      # T5.0: object-store wrapper config. The worker reads/writes
+      # tenant content blobs (T5.1 onward) via boto3 against the
+      # in-stack MinIO. ENDPOINT + bucket name are env-driven so a
+      # future migration to a different MinIO cluster or AWS S3 is a
+      # config-only change. ROOT credentials are reused here for the
+      # half-day T5.0 scope; T5.x should mint a scoped MinIO service
+      # account with PutObject/GetObject on `tenant-content/*` only.
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT:-http://minio:9000}
+      MINIO_TENANT_CONTENT_BUCKET: ${MINIO_TENANT_CONTENT_BUCKET:-tenant-content}
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
     volumes:
       - vargate-hsm-tokens:/var/lib/softhsm/tokens
       - vargate-prom-multiproc:/tmp/prometheus_multiproc
@@ -203,6 +255,15 @@ services:
       # worker's observations land in its own in-process REGISTRY and
       # are invisible to any scrape — the structural gap T4.8 found.
       PROMETHEUS_MULTIPROC_DIR: /tmp/prometheus_multiproc
+      # T5.0: object-store wrapper config. The gateway itself doesn't
+      # currently call the storage layer (writes happen in worker
+      # tasks), but onboarding diagnostics and future read paths
+      # (T5.x dashboard content views) will. Same env wired here so
+      # the gateway can construct the boto3 client on demand.
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT:-http://minio:9000}
+      MINIO_TENANT_CONTENT_BUCKET: ${MINIO_TENANT_CONTENT_BUCKET:-tenant-content}
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
     volumes:
       - vargate-hsm-tokens:/var/lib/softhsm/tokens
       - vargate-prom-multiproc:/tmp/prometheus_multiproc

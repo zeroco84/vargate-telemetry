@@ -55,6 +55,15 @@ pyjwt[crypto]>=2.9,<3
 # single-worker startup.
 prometheus-client>=0.20,<1
 
+# T5.0: S3-compatible object store client for MinIO (tenant content
+# blobs). boto3 over minio-py for two reasons: (a) explicit migration
+# path to AWS S3 if we ever leave self-hosted MinIO — same client, just
+# swap `endpoint_url`; (b) botocore's retry layer composes cleanly with
+# the tenacity patterns already in use elsewhere in the codebase. The
+# S3 surface we use (put_object, get_object, delete_object, head_object)
+# is stable across 1.34+.
+boto3>=1.34,<2
+
 # T2.2: Shared chain + Merkle primitives extracted from vargate-proxy.
 # Apache 2.0 package; consumed via Git+SSH pinned to a specific SHA
 # for reproducible builds. Bump the SHA deliberately when picking up
