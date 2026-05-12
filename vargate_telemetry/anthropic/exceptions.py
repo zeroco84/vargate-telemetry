@@ -38,3 +38,30 @@ class RateLimited(Exception):
     def __init__(self, retry_after: int) -> None:
         super().__init__(f"rate limited; retry after {retry_after}s")
         self.retry_after = retry_after
+
+
+class InsufficientScope(AnthropicAPIError):
+    """403 Forbidden — the supplied key lacks the scope this endpoint requires.
+
+    T5.2: The Compliance API splits its surface across two key types.
+    The Activity Feed (``/v1/compliance/activities``) accepts both
+    Admin API keys (``sk-ant-admin01-...``) and Compliance Access Keys
+    (``sk-ant-api01-...``) carrying ``read:compliance_activities``;
+    the content endpoints (``/v1/compliance/apps/chats/*``, files,
+    projects) require a Compliance Access Key carrying
+    ``read:compliance_user_data``.
+
+    Calling a content endpoint with an Admin API key returns 403.
+    Surfacing this as a typed exception means T5.3's ingestion can
+    detect "no Compliance Access Key onboarded → skip content
+    capture, keep the Activity Feed flow" without parsing error
+    bodies.
+
+    Subclass of ``AnthropicAPIError`` so a broad ``except
+    AnthropicAPIError`` catches it; callers that want to distinguish
+    do ``except InsufficientScope``.
+    """
+
+    def __init__(self, body: str, required_scope: str | None = None) -> None:
+        super().__init__(403, body)
+        self.required_scope = required_scope

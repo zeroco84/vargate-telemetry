@@ -111,3 +111,255 @@ class UsageBucket(BaseModel):
     starting_at: datetime
     ending_at: datetime
     results: list[UsageBreakdown] = Field(default_factory=list)
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Compliance API (T5.2) — Activity Feed + chat content
+#
+# **Best-guess scaffolding** — refine against real cassettes during T5.3
+# ingestion. Field shapes track the public Compliance API docs at
+# https://platform.claude.com/docs/en/manage-claude/compliance-* as of
+# T5.2 authoring (May 2026). Every model sets `extra="allow"` so the
+# Anthropic team can add fields without breaking parsing.
+#
+# Two endpoint families are modeled here:
+#
+#   1. Activity Feed (`GET /v1/compliance/activities`). Reachable by
+#      both Admin API keys and Compliance Access Keys. Returns event
+#      metadata — NOT chat content. The `Activity.type` enum is open
+#      (hundreds of values; type-specific extra fields like
+#      `claude_chat_id` or `filename` ride along via `extra="allow"`).
+#   2. Chat content (`GET /v1/compliance/apps/chats/*`). Requires a
+#      Compliance Access Key with `read:compliance_user_data` scope.
+#      Returns full chat history including prompt/response text. T5.x
+#      onboarding must collect a Compliance Access Key in addition to
+#      the Admin API key for this path to be usable.
+#
+# The actor union is modeled as a single `Actor` class rather than six
+# discriminated subclasses — the field set across the six actor types is
+# small enough that a flat all-Optional model is more readable than the
+# discriminated-union machinery would be at this scope.
+# ───────────────────────────────────────────────────────────────────────────
+
+
+class Actor(BaseModel):
+    """The principal that performed an activity.
+
+    Endpoint: appears as ``Activity.actor``. The ``type`` field is a
+    discriminator: ``user_actor``, ``api_actor``, ``admin_api_key_actor``,
+    ``unauthenticated_user_actor``, ``anthropic_actor``,
+    ``scim_directory_sync_actor`` (and possibly others over time —
+    ``extra="allow"`` absorbs novel types).
+
+    Field-set varies by actor type (user_actor carries `email_address`
+    + `user_id`; api_actor carries `api_key_id`; scim_directory_sync_actor
+    carries `workos_event_id` + `directory_id` + `idp_connection_type`).
+    All modeled here as Optional so a single parser handles every
+    variant — the caller branches on `.type`.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    type: str
+    # Common (user_actor, unauthenticated_user_actor, api_actor)
+    email_address: Optional[str] = None
+    ip_address: Optional[str] = None
+    user_agent: Optional[str] = None
+    # user_actor
+    user_id: Optional[str] = None
+    # api_actor, admin_api_key_actor
+    api_key_id: Optional[str] = None
+    admin_api_key_id: Optional[str] = None
+    # unauthenticated_user_actor
+    unauthenticated_email_address: Optional[str] = None
+    # scim_directory_sync_actor
+    workos_event_id: Optional[str] = None
+    directory_id: Optional[str] = None
+    idp_connection_type: Optional[str] = None
+
+
+class Activity(BaseModel):
+    """One Activity Feed record.
+
+    Endpoint: ``GET /v1/compliance/activities``. The ``type`` field is
+    an open enum — hundreds of values like ``claude_chat_created``,
+    ``claude_file_uploaded``, ``sso_login_initiated``, etc. Type-specific
+    extra fields (``claude_chat_id``, ``claude_project_id``,
+    ``filename``, ``claude_artifact_id``, ...) ride along via
+    ``extra="allow"`` rather than being modeled per-type — T5.3's
+    ingestion pipeline can branch on ``type`` and read
+    ``model_extra`` for the variant fields.
+
+    ``organization_id`` / ``organization_uuid`` are nullable: events
+    not tied to an organization (sign-in/out, Compliance API calls
+    themselves) have both as ``None``.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    id: str
+    created_at: datetime
+    organization_id: Optional[str] = None
+    organization_uuid: Optional[str] = None
+    actor: Actor
+    type: str
+
+
+class ChatUser(BaseModel):
+    """The embedded user reference on a Chat.
+
+    Always present (chats have an owner). Stripped down compared to the
+    org users endpoint — just id + email here.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    id: str
+    email_address: str
+
+
+class Chat(BaseModel):
+    """One chat metadata record from the list-chats endpoint.
+
+    Endpoint: ``GET /v1/compliance/apps/chats?user_ids[]=...``.
+    Returns metadata only — message content is fetched separately via
+    ``GET /v1/compliance/apps/chats/{chat_id}/messages`` (modeled as
+    ``ChatWithMessages`` below).
+
+    ``deleted_at`` is non-null for chats soft-deleted in claude.ai but
+    still visible via the Compliance API. Hard-deleted chats stop
+    appearing in the list entirely.
+    """
+
+    model_config = ConfigDict(extra="allow", protected_namespaces=())
+
+    id: str
+    name: Optional[str] = None
+    created_at: datetime
+    updated_at: Optional[datetime] = None
+    deleted_at: Optional[datetime] = None
+    href: Optional[str] = None
+    # Pydantic 2.x reserves the `model_` namespace; the wire field is
+    # literally `model` (the claude model name like
+    # `claude-opus-4-7`), so we need `protected_namespaces=()`.
+    model: Optional[str] = None
+    organization_id: Optional[str] = None
+    organization_uuid: Optional[str] = None
+    project_id: Optional[str] = None
+    user: ChatUser
+
+
+class MessageContentBlock(BaseModel):
+    """One content block on a chat message.
+
+    Today the only documented block type is ``text`` (with a ``text``
+    field carrying the plaintext). Future types — tool_use, tool_result,
+    image attachments, structured content — ride along via
+    ``extra="allow"``; T5.3 will refine when real cassettes surface
+    additional shapes.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    type: str
+    text: Optional[str] = None
+
+
+class MessageFile(BaseModel):
+    """A user-uploaded file attached to a chat message.
+
+    ``id`` starts with ``claude_file_``. Download bytes via
+    ``GET /v1/compliance/apps/chats/files/{id}/content`` (not modeled
+    yet — that's a streaming binary endpoint, T5.3 may add when needed).
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    id: str
+    filename: Optional[str] = None
+    mime_type: Optional[str] = None
+
+
+class MessageGeneratedFile(BaseModel):
+    """A Claude-generated file produced via tool use on a chat message.
+
+    ``id`` starts with ``claude_gen_file_``. Download bytes via
+    ``GET /v1/compliance/apps/chats/generated_files/{id}/content``.
+    Distinct from ``MessageFile`` (which is a user upload).
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    id: str
+    filename: Optional[str] = None
+    mime_type: Optional[str] = None
+
+
+class MessageArtifact(BaseModel):
+    """A Claude-generated artifact (structured doc inside a chat).
+
+    Pass ``version_id`` — not ``id`` — to the artifact content endpoint
+    to fetch the version's bytes. Each artifact version is immutable;
+    a new version_id is minted when the artifact is updated.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    id: str
+    version_id: str
+    title: Optional[str] = None
+    artifact_type: Optional[str] = None
+
+
+class ChatMessage(BaseModel):
+    """One message in a chat.
+
+    ``role`` is ``user`` or ``assistant`` (system messages don't appear
+    here — they're carried as project instructions or model defaults).
+    For user messages, ``created_at`` is when the user sent the message;
+    for assistant messages, when Claude finished generating it.
+
+    ``content`` is always an array of blocks (even for a single-block
+    text response — the array shape gives forward compat with multi-block
+    responses, tool use, etc.).
+
+    ``files`` / ``generated_files`` / ``artifacts`` are nullable on a
+    given message; the spec uses `null` not `[]` for the empty case.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    id: str
+    role: str
+    created_at: datetime
+    content: list[MessageContentBlock] = Field(default_factory=list)
+    files: Optional[list[MessageFile]] = None
+    generated_files: Optional[list[MessageGeneratedFile]] = None
+    artifacts: Optional[list[MessageArtifact]] = None
+
+
+class ChatWithMessages(BaseModel):
+    """The envelope returned by ``GET /v1/compliance/apps/chats/{id}/messages``.
+
+    Same top-level chat metadata as ``Chat``, plus a ``chat_messages``
+    array and pagination cursors for very long chats (``after_id`` /
+    ``before_id`` advance through messages within one chat).
+    """
+
+    model_config = ConfigDict(extra="allow", protected_namespaces=())
+
+    id: str
+    name: Optional[str] = None
+    created_at: datetime
+    updated_at: Optional[datetime] = None
+    deleted_at: Optional[datetime] = None
+    href: Optional[str] = None
+    model: Optional[str] = None
+    organization_id: Optional[str] = None
+    organization_uuid: Optional[str] = None
+    project_id: Optional[str] = None
+    user: ChatUser
+    chat_messages: list[ChatMessage] = Field(default_factory=list)
+    has_more: bool = False
+    first_id: Optional[str] = None
+    last_id: Optional[str] = None

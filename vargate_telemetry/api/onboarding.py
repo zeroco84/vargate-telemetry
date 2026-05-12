@@ -57,6 +57,7 @@ from sqlalchemy import text as sql_text
 from vargate_telemetry.anthropic import AnthropicAdminClient
 from vargate_telemetry.anthropic.exceptions import (
     AnthropicAPIError,
+    InsufficientScope,
     RateLimited,
 )
 from vargate_telemetry.auth.jwt import (
@@ -216,13 +217,23 @@ _INVALID_KEY_MESSAGE = (
 def _is_auth_failure(exc: BaseException) -> bool:
     """True iff this exception is a 401/403 from Anthropic.
 
-    Both `AnthropicAdminClient` (5xx → AnthropicAPIError) and httpx
-    (4xx → HTTPStatusError) feed into the same set of "the credential
-    is bad" symptoms. Catch both shapes here so the call sites stay
-    short.
+    The Anthropic client surfaces three exception shapes for the
+    credential-rejection family:
+
+      - ``InsufficientScope`` (T5.2) — typed 403; AnthropicAPIError
+        subclass that carries the scope hint. For validate-key probing,
+        a 403 still means "this key can't probe workspaces" — user-
+        facing message is the same as a 401, so they're both auth
+        failures here.
+      - ``httpx.HTTPStatusError`` — bare 401 (no typed wrapper yet)
+        from ``raise_for_status()``.
+      - Anything else AnthropicAPIError (5xx, etc.) — NOT an auth
+        failure.
     """
+    if isinstance(exc, InsufficientScope):
+        return True
     if isinstance(exc, AnthropicAPIError):
-        return False  # AnthropicAPIError only fires for 5xx
+        return False  # 5xx — not an auth failure
     if isinstance(exc, httpx.HTTPStatusError):
         return exc.response.status_code in (401, 403)
     return False
