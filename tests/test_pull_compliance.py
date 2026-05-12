@@ -450,6 +450,17 @@ def test_validate_key_detects_no_activity_feed_when_403() -> None:
                 required_scope="read:compliance_activities",
             )
 
+        def list_code_analytics(self, **kwargs):
+            # T5.4: code_analytics is an independent capability. This
+            # test focuses on the activity_feed=False path; the org's
+            # Code Analytics access is gated separately. Mirror the
+            # test scenario shape: this no-activity-feed org also has
+            # no code_analytics access.
+            raise InsufficientScope(
+                '{"error": {"type": "permission_error"}}',
+                required_scope="admin_api",
+            )
+
         def list_members(self):  # for the older code path's compat
             yield from ()
 
@@ -521,6 +532,11 @@ def test_validate_key_returns_four_bool_capability_shape() -> None:
         def list_activities(self, **kwargs):
             yield _StubActivity()
 
+        def list_code_analytics(self, **kwargs):
+            # T5.4: fully-capable admin key gets code_analytics=True
+            # too. Empty iterator = endpoint reachable.
+            yield from ()
+
         def list_members(self):
             yield from ()
 
@@ -563,6 +579,9 @@ def test_validate_key_returns_four_bool_capability_shape() -> None:
         # requires a Compliance Access Key the onboarding doesn't
         # collect yet.
         assert body["capabilities"]["content_capture"] is False
-        assert body["capabilities"]["code_analytics"] is False
+        # T5.4: code_analytics is now a real live probe (was
+        # hardcoded False in T5.3). The fully-capable stub returns
+        # an empty iterator → endpoint reachable → True.
+        assert body["capabilities"]["code_analytics"] is True
     finally:
         onboarding_routes.set_client_factory_for_test(None)

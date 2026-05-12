@@ -143,19 +143,29 @@ class UsageBucket(BaseModel):
 
 
 class Actor(BaseModel):
-    """The principal that performed an activity.
+    """The principal that performed an activity or analytics-recorded action.
 
-    Endpoint: appears as ``Activity.actor``. The ``type`` field is a
-    discriminator: ``user_actor``, ``api_actor``, ``admin_api_key_actor``,
-    ``unauthenticated_user_actor``, ``anthropic_actor``,
-    ``scim_directory_sync_actor`` (and possibly others over time —
-    ``extra="allow"`` absorbs novel types).
+    Endpoint contexts:
+      - ``Activity.actor`` (Compliance Activity Feed, T5.2).
+      - ``CodeAnalyticsRecord.actor`` (Code Analytics, T5.4).
 
-    Field-set varies by actor type (user_actor carries `email_address`
-    + `user_id`; api_actor carries `api_key_id`; scim_directory_sync_actor
-    carries `workos_event_id` + `directory_id` + `idp_connection_type`).
-    All modeled here as Optional so a single parser handles every
-    variant — the caller branches on `.type`.
+    The ``type`` field is the discriminator. Known values:
+
+      - ``user_actor`` (Activity Feed: ``email_address`` + ``user_id`` +
+        ``ip_address`` + ``user_agent``; Code Analytics: just
+        ``email_address``).
+      - ``api_actor`` (Activity Feed: ``api_key_id`` + ``ip_address`` +
+        ``user_agent``; Code Analytics: ``api_key_name``).
+      - ``admin_api_key_actor`` (Activity Feed only).
+      - ``unauthenticated_user_actor`` (Activity Feed only).
+      - ``anthropic_actor`` (Activity Feed only).
+      - ``scim_directory_sync_actor`` (Activity Feed only).
+      - ...plus anything Anthropic adds later via ``extra="allow"``.
+
+    Field-set varies across the union (e.g., Code Analytics' api_actor
+    uses ``api_key_name`` while Activity Feed's api_actor uses
+    ``api_key_id``). All modeled here as Optional so a single parser
+    handles every variant — the caller branches on ``.type``.
     """
 
     model_config = ConfigDict(extra="allow")
@@ -167,8 +177,11 @@ class Actor(BaseModel):
     user_agent: Optional[str] = None
     # user_actor
     user_id: Optional[str] = None
-    # api_actor, admin_api_key_actor
+    # api_actor (Activity Feed)
     api_key_id: Optional[str] = None
+    # api_actor (Code Analytics — uses NAME, not ID, on this endpoint)
+    api_key_name: Optional[str] = None
+    # admin_api_key_actor
     admin_api_key_id: Optional[str] = None
     # unauthenticated_user_actor
     unauthenticated_email_address: Optional[str] = None
@@ -363,3 +376,68 @@ class ChatWithMessages(BaseModel):
     has_more: bool = False
     first_id: Optional[str] = None
     last_id: Optional[str] = None
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Claude Code Analytics API (T5.4) — daily per-user metrics
+#
+# **Best-guess scaffolding** — refine against real cassettes / probes
+# during T5.4+ ingest. Field shapes track the public docs at
+# https://platform.claude.com/docs/en/build-with-claude/claude-code-analytics-api
+# as of T5.4 authoring (May 2026).
+#
+# Endpoint: ``GET /v1/organizations/usage_report/claude_code``. Lives in
+# the Admin API namespace (NOT Compliance API) — reachable by the same
+# Admin API key our tenants already provision. Per the docs: "free to
+# use for all organizations with access to the Admin API" — NOT plan-
+# gated like Activity Feed.
+#
+# Pagination: opaque ``page`` token (NOT after_id cursors). Response
+# carries ``data``, ``has_more``, ``next_page``. The existing
+# ``client.paginate()`` already implements this scheme; T5.4 reuses it.
+#
+# Shape decisions (per the flat-model-with-extra-allow rule):
+#   - Top-level ``CodeAnalyticsRecord`` models the documented fields;
+#     nested objects (``core_metrics``, ``tool_actions``,
+#     ``model_breakdown``) ride along as raw dicts via ``extra="allow"``
+#     rather than per-class subtypes. T5.5+ dashboards branch into
+#     these dicts directly; nothing in ingest reads the nested shape.
+#   - That keeps "new metric type" friendly: a future
+#     ``review_tool.accepted/rejected`` lands in the existing
+#     ``tool_actions`` dict without a parser change.
+# ───────────────────────────────────────────────────────────────────────────
+
+
+class CodeAnalyticsRecord(BaseModel):
+    """One (actor, day) record from the Code Analytics endpoint.
+
+    Each record represents one user's (or one API key's) activity for
+    the day specified by the request's ``starting_at``. Daily
+    aggregation — no event-stream granularity.
+
+    Documented top-level fields are modeled here. The nested objects
+    (``core_metrics``, ``tool_actions``, ``model_breakdown``) ride
+    along via ``extra="allow"`` so per-tool-type and per-model
+    additions absorb without a parser change.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    # `date` is the day's UTC midnight timestamp (RFC 3339).
+    date: datetime
+    # The principal — same flat Actor model as the Compliance Activity
+    # Feed. For Code Analytics the union has only `user_actor` and
+    # `api_actor`; for the latter the field is `api_key_name` (NOT
+    # `api_key_id` like Activity Feed).
+    actor: Actor
+    organization_id: Optional[str] = None
+    # `api` for pay-as-you-go API customers, `subscription` for
+    # Pro/Team plans. Useful for billing-side breakdowns.
+    customer_type: Optional[str] = None
+    # Terminal/editor identifier (`vscode`, `iTerm.app`, `tmux`, ...).
+    # Open enum — new editors absorb via the string type.
+    terminal_type: Optional[str] = None
+    # The three nested metric objects live in `model_extra` via
+    # `extra="allow"`. T5.4 ingest stores the full record JSON in
+    # `telemetry_records.record_metadata`; T5.5 dashboards read the
+    # nested structure from there.

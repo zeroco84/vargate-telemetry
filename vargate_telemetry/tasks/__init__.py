@@ -10,5 +10,6 @@ from vargate_telemetry.tasks import (  # noqa: F401
     diagnostics,
     metering,
     pull_admin,
+    pull_code_analytics,
     pull_compliance,
 )
