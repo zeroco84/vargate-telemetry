@@ -25,7 +25,7 @@ T3.2 — this sprint is just the transport layer.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Iterator, Optional
 
 import httpx
@@ -46,6 +46,7 @@ from vargate_telemetry.anthropic.types import (
     Activity,
     Chat,
     ChatWithMessages,
+    CodeAnalyticsRecord,
     Member,
     UsageBucket,
     Workspace,
@@ -436,6 +437,61 @@ class AnthropicAdminClient:
             raise ValueError("chat_id required")
         raw = self._get(f"/v1/compliance/apps/chats/{chat_id}/messages")
         return ChatWithMessages.model_validate(raw)
+
+    # ───────────────────────────────────────────────────────────────────
+    # Claude Code Analytics (T5.4) — daily per-user usage metrics
+    #
+    # Endpoint: ``GET /v1/organizations/usage_report/claude_code``.
+    # Lives in the Admin API namespace; reachable by the same Admin
+    # API key our tenants already provision (NOT plan-gated like the
+    # Compliance Activity Feed). Per Anthropic's docs: "free to use
+    # for all organizations with access to the Admin API."
+    #
+    # Pagination scheme: opaque ``page`` token round-tripped from
+    # ``next_page`` in the response envelope. The existing
+    # ``paginate()`` helper already implements this — reused unchanged.
+    # ───────────────────────────────────────────────────────────────────
+
+    def list_code_analytics(
+        self,
+        *,
+        starting_at: date,
+        limit: Optional[int] = None,
+    ) -> Iterator[CodeAnalyticsRecord]:
+        """Yield Code Analytics records for the single UTC day
+        ``starting_at``.
+
+        The endpoint serves ONE day per request — there is no
+        date-range query. Daily aggregation; each yielded record
+        represents one (actor, day) tuple. T5.4's ingest task
+        wraps this in a per-day loop walking forward from the
+        cursor.
+
+        ``starting_at`` is a ``datetime.date`` (or anything with a
+        ``.isoformat()`` that produces YYYY-MM-DD); we serialize as
+        the API expects. ``limit`` is per-page (default 20, max 1000
+        per Anthropic's docs).
+
+        403 → ``InsufficientScope``. Should be rare here — the
+        endpoint is open to any Admin API key per the docs; the
+        documented exception is Claude Platform on AWS, which
+        doesn't expose this surface.
+        """
+        params: dict[str, Any] = {
+            "starting_at": (
+                starting_at.isoformat()
+                if hasattr(starting_at, "isoformat")
+                else str(starting_at)
+            ),
+        }
+        if limit is not None:
+            params["limit"] = str(limit)
+        # paginate() round-trips next_page ↔ page on each iteration —
+        # exactly the contract this endpoint advertises.
+        for raw in self.paginate(
+            "/v1/organizations/usage_report/claude_code", params
+        ):
+            yield CodeAnalyticsRecord.model_validate(raw)
 
     def _paginate_compliance_typed(
         self,

@@ -76,6 +76,21 @@ celery_app.conf.beat_schedule = {
         "schedule": 900.0,  # every 15 minutes
         "options": {"queue": "default"},
     },
+    # T5.4: Code Analytics stream. Daily aggregation (one
+    # `starting_at` per call), but the dispatcher fans out at the
+    # same 15-minute cadence as the other streams — the per-tenant
+    # task walks forward day-by-day from the persisted cursor, so a
+    # 15-minute tick usually only ingests "yesterday" once. Faster
+    # cadence keeps the catchup loop responsive when a new tenant
+    # onboards.
+    "dispatch-code-analytics-pulls": {
+        "task": (
+            "vargate_telemetry.tasks.pull_code_analytics."
+            "dispatch_code_analytics_pulls"
+        ),
+        "schedule": 900.0,  # every 15 minutes
+        "options": {"queue": "default"},
+    },
 }
 
 # Alias so `celery -A vargate_telemetry.celery_app worker` (which looks up

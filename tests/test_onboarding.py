@@ -207,16 +207,20 @@ class StubAdminClient:
         workspaces: list[_StubWorkspace] | None = None,
         members: list[_StubMember] | None = None,
         activities: list[object] | None = None,
+        code_analytics: list[object] | None = None,
         workspaces_raises: BaseException | None = None,
         members_raises: BaseException | None = None,
         activities_raises: BaseException | None = None,
+        code_analytics_raises: BaseException | None = None,
     ) -> None:
         self._workspaces = workspaces or []
         self._members = members or []
         self._activities = activities or []
+        self._code_analytics = code_analytics or []
         self._workspaces_raises = workspaces_raises
         self._members_raises = members_raises
         self._activities_raises = activities_raises
+        self._code_analytics_raises = code_analytics_raises
         self.calls: list[str] = []
 
     def list_workspaces(self) -> Iterator[_StubWorkspace]:
@@ -240,6 +244,17 @@ class StubAdminClient:
             raise self._activities_raises
         return iter(self._activities)
 
+    def list_code_analytics(self, **_kwargs: object) -> Iterator[object]:
+        """T5.4 capability probe. Default fixture: empty iterator
+        (endpoint reachable, no Claude Code usage on the probed day
+        → code_analytics=True). Per Anthropic's docs the endpoint is
+        free for all Admin-API-capable orgs, so 200 + empty is the
+        common case."""
+        self.calls.append("list_code_analytics")
+        if self._code_analytics_raises is not None:
+            raise self._code_analytics_raises
+        return iter(self._code_analytics)
+
 
 def _make_http_status_error(status_code: int) -> httpx.HTTPStatusError:
     """Build an httpx.HTTPStatusError that looks like one from a
@@ -261,19 +276,22 @@ def test_validate_key_returns_capabilities_for_valid_key(
     clean_onboarding_state: None,
     client: TestClient,
 ) -> None:
-    """Stubbed client returns workspaces + (non-403) activities →
-    admin_api + activity_feed True, content_capture + code_analytics
-    False (T5.3 invariants — see KeyCapabilities docstring).
+    """Stubbed client returns workspaces + (non-403) activities +
+    (non-403) code_analytics → admin_api + activity_feed +
+    code_analytics True, content_capture False (T5.3 invariant — see
+    KeyCapabilities docstring).
     """
     from vargate_telemetry.api.onboarding import set_client_factory_for_test
 
     stub = StubAdminClient(
         workspaces=[_StubWorkspace(name="Acme Corp")],
         # T5.3: activities[] is what `validate_key` now probes. Empty
-        # list still means "endpoint reachable" → activity_feed=True;
-        # a 403 raise on the activities call would mean
-        # activity_feed=False.
+        # list still means "endpoint reachable" → activity_feed=True.
         activities=[],
+        # T5.4: code_analytics[] is the new probe. Empty list →
+        # endpoint reachable but no Claude Code usage on probe day →
+        # code_analytics=True (matches the real-org probe behavior).
+        code_analytics=[],
     )
     set_client_factory_for_test(lambda _key: stub)
 
@@ -288,12 +306,18 @@ def test_validate_key_returns_capabilities_for_valid_key(
         # T5.3 invariant: content_capture is always False until the
         # Compliance Access Key onboarding flow lands.
         "content_capture": False,
-        # T5.4 will wire the real Code Analytics probe.
-        "code_analytics": False,
+        # T5.4: real probe replaces the previous hardcoded False.
+        # Stub returns 200 → True.
+        "code_analytics": True,
     }
-    # T5.3: validate_key probes list_workspaces + list_activities.
-    # list_members is no longer called from this endpoint.
-    assert stub.calls == ["list_workspaces", "list_activities"]
+    # T5.4: validate_key probes list_workspaces + list_activities +
+    # list_code_analytics. list_members is no longer called from this
+    # endpoint.
+    assert stub.calls == [
+        "list_workspaces",
+        "list_activities",
+        "list_code_analytics",
+    ]
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -357,6 +381,12 @@ def test_validate_key_returns_partial_capabilities_when_activity_feed_unavailabl
             '{"error": {"type": "permission_error"}}',
             required_scope="read:compliance_activities",
         ),
+        # T5.4: this tenant has Activity Feed gated but Code Analytics
+        # still works — the two capabilities are independent. Empty
+        # list = endpoint reachable → code_analytics=True. Mirrors
+        # the real-org-probe shape where the Personal-plan test org
+        # has no Activity Feed but full Code Analytics access.
+        code_analytics=[],
     )
     set_client_factory_for_test(lambda _key: stub)
 
@@ -371,7 +401,10 @@ def test_validate_key_returns_partial_capabilities_when_activity_feed_unavailabl
         "admin_api": True,
         "activity_feed": False,
         "content_capture": False,
-        "code_analytics": False,
+        # T5.4: code_analytics is the independent probe; this stub
+        # gates only activity_feed, so code_analytics still fires
+        # True. Mirrors the real Personal-plan test org's shape.
+        "code_analytics": True,
     }
 
 

@@ -343,9 +343,37 @@ def validate_key(
         # "Enable later — requires Compliance Access Key".
         content_capture_ok = False
 
-        # 4. Code Analytics: real probe lands in T5.4; for T5.3 default
-        # to False so the UI can render the "missing capability" row.
-        code_analytics_ok = False
+        # 4. Code Analytics probe (T5.4). Per Anthropic's docs,
+        # `/v1/organizations/usage_report/claude_code` is "free to use
+        # for all organizations with access to the Admin API" — so a
+        # 200 here is the common case, even for orgs on Personal /
+        # API-only plans. The 403 case is rare (e.g., Claude Platform
+        # on AWS, which doesn't expose this endpoint at all).
+        #
+        # We probe yesterday's date (UTC) with limit=1 because: today's
+        # data isn't complete (1-hour data-freshness lag per the docs),
+        # and limit=1 keeps the probe cost minimal. The endpoint
+        # responds 200 with empty `data` for any org that has Admin
+        # API access but zero Claude Code usage — that's still a
+        # "capability available" signal for our UI.
+        from datetime import date, timedelta
+
+        try:
+            probe_day = date.today() - timedelta(days=1)
+            # Eager-consume one item via `next(iter(...))` so the
+            # generator's first network call fires inside the try.
+            next(iter(client.list_code_analytics(starting_at=probe_day, limit=1)), None)
+            code_analytics_ok = True
+        except InsufficientScope:
+            code_analytics_ok = False
+        except Exception as exc:
+            if _is_auth_failure(exc):
+                code_analytics_ok = False
+            else:
+                # 5xx or other unexpected — default to False so we
+                # don't promise a capability we couldn't verify, but
+                # log loudly so we notice when this drifts.
+                code_analytics_ok = False
 
         return ValidateKeyResponse(
             org_name=org_name or "Your Anthropic Organization",
