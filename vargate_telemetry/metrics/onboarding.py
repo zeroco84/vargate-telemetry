@@ -98,6 +98,13 @@ for _outcome in (
 ):
     ONBOARDING_COMPLETION_TOTAL.labels(outcome=_outcome)
 
+# Same for the step-duration histogram. Without this, Prom never sees
+# `vargate_onboarding_step_seconds_bucket{step=...}` until the first
+# successful step completes — leaving the Grafana panel rendering
+# "No data" on freshly-deployed gateways instead of a flat-zero line.
+for _step in ("sso", "validate-key", "select-region", "start-backfill"):
+    ONBOARDING_STEP_SECONDS.labels(step=_step)
+
 
 # ───────────────────────────────────────────────────────────────────────────
 # track_step — context manager around each onboarding handler body.
