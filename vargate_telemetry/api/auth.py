@@ -215,3 +215,56 @@ def get_me(user: AuthenticatedUser = Depends(current_user)) -> MeResponse:
         sso_provider=user.sso_provider,
         tenants=tenants,
     )
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# POST /auth/logout — clear the session cookie
+# ───────────────────────────────────────────────────────────────────────────
+
+
+@router.post(
+    "/auth/logout",
+    status_code=status.HTTP_204_NO_CONTENT,
+    operation_id="logout",
+    tags=["auth"],
+    summary="Clear the session cookie and sign the user out",
+    responses={
+        status.HTTP_204_NO_CONTENT: {
+            "description": "Session cookie cleared. The response carries "
+            "a `Set-Cookie` that overwrites `ogma_session` with an "
+            "empty value and `Max-Age=0` so the browser drops it.",
+        },
+    },
+)
+def logout(response: Response) -> Response:
+    """Clear the session cookie.
+
+    Intentionally NOT gated on ``current_user``. The cookie may already
+    be expired or invalid by the time the user clicks "Sign out"; we
+    still want the cookie cleared. Logout is idempotent — calling it
+    when no session exists is a no-op success.
+
+    Cookie-clear shape MUST mirror ``_set_session_cookie`` exactly
+    (same name, path, httponly, secure, samesite). The browser only
+    overwrites cookies whose attributes match — a mismatch leaves the
+    original cookie in place. The trick is ``set_cookie(...value="",
+    max_age=0, ...)`` rather than ``delete_cookie`` because the latter
+    omits some attributes and produces inconsistent behavior across
+    browsers when the cookie was originally set with `Secure` /
+    `SameSite=Lax`.
+    """
+    # T4.2-style cookie set: same params as `_set_session_cookie` with
+    # value cleared + max_age=0 + expires=epoch. Belt-and-braces:
+    # browsers vary on which attribute triggers eviction.
+    response.set_cookie(
+        key=SESSION_COOKIE_NAME,
+        value="",
+        max_age=0,
+        expires=0,
+        httponly=True,
+        secure=True,
+        samesite="lax",
+        path="/",
+    )
+    response.status_code = status.HTTP_204_NO_CONTENT
+    return response

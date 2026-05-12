@@ -360,3 +360,83 @@ def test_me_requires_authentication_and_returns_user_payload(
     assert body["email"] == "me@example.com"
     assert body["sso_provider"] == "google"
     assert body["tenants"] == []
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Logout (T5.6) — clears the session cookie
+# ───────────────────────────────────────────────────────────────────────────
+
+
+def test_logout_returns_204_and_clears_session_cookie(
+    clean_auth_state: None,
+    client: TestClient,
+) -> None:
+    """POST /auth/logout returns 204 + a Set-Cookie that overwrites
+    the session cookie with an empty value and Max-Age=0. Browser
+    drops the cookie on receipt.
+
+    Cookie attributes (Path, HttpOnly, Secure, SameSite) must match
+    the set-cookie shape from the SSO callback — browsers only
+    overwrite cookies whose attributes match. A mismatch leaves the
+    original cookie in place.
+    """
+    r = client.post("/auth/logout")
+    assert r.status_code == 204, r.text
+    # Body is empty.
+    assert r.content == b""
+
+    set_cookie = r.headers.get("set-cookie", "")
+    assert "ogma_session=" in set_cookie
+    lower = set_cookie.lower()
+    # Both Max-Age=0 and the immediate Expires= are present; either
+    # triggers eviction across the browser matrix we care about.
+    assert "max-age=0" in lower
+    # Attributes must mirror the set path (Path + HttpOnly + Secure +
+    # SameSite).
+    assert "httponly" in lower
+    assert "secure" in lower
+    assert "samesite=lax" in lower
+    assert "path=/" in lower
+
+
+def test_logout_is_idempotent_without_a_session(
+    clean_auth_state: None,
+    client: TestClient,
+) -> None:
+    """Logout intentionally isn't gated on `current_user` — calling
+    it without a session (cookie expired, never had one) still
+    returns 204 + clears whatever cookie might still exist client-
+    side. Idempotent."""
+    r = client.post("/auth/logout")
+    assert r.status_code == 204
+
+    # Second call also succeeds.
+    r2 = client.post("/auth/logout")
+    assert r2.status_code == 204
+
+
+def test_logout_clears_cookie_even_with_active_session(
+    clean_auth_state: None,
+    client: TestClient,
+) -> None:
+    """If the caller has a valid session, logout still clears it.
+    The 204 carries the eviction Set-Cookie regardless of whether
+    the inbound cookie was valid."""
+    from vargate_telemetry.auth.jwt import issue_session_jwt
+
+    token = issue_session_jwt(
+        user_id="user-logout",
+        email="logout@example.com",
+        sso_provider="google",
+    )
+    # Sanity: /me succeeds first.
+    r_me = client.get("/me", headers={"Authorization": f"Bearer {token}"})
+    assert r_me.status_code == 200
+
+    # Logout returns 204 with the eviction Set-Cookie.
+    r_logout = client.post(
+        "/auth/logout",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert r_logout.status_code == 204
+    assert "ogma_session=" in r_logout.headers.get("set-cookie", "")
