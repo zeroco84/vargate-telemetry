@@ -421,15 +421,27 @@ def handle_sso_callback(
         user_id = str(user.id)
         email = user.email
         name = user.name
+        # T5.6 hotfix: a returning user's tenant_id MUST flow into
+        # the reissued JWT. The original T4.2 implementation hardcoded
+        # `tenant_id=None` here on the assumption that T4.5's
+        # select-region would always be the next step. That's true
+        # for FIRST onboarding, but a returning user who has already
+        # completed select-region has `users.tenant_id` set in the
+        # DB; reissuing a tenant_id-less JWT makes /me report
+        # `tenants=[]`, which the frontend reads as "not onboarded"
+        # and starts the onboarding flow over.
+        tenant_id = user.tenant_id
     finally:
         db.close()
 
     # 6. Issue the session JWT for the route to set in `ogma_session`.
+    #    `tenant_id` is None for first-time sign-in (no select-region
+    #    yet) and the user's existing binding for returning sign-ins.
     token = issue_session_jwt(
         user_id=user_id,
         email=email,
         sso_provider=provider,
-        tenant_id=None,  # T4.5 binds the tenant_id
+        tenant_id=tenant_id,
     )
     return SsoCallbackResult(
         user_id=user_id,
