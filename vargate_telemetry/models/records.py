@@ -62,6 +62,14 @@ class TelemetryRecord(Base, TenantOwned):
         String(512), nullable=True,
     )
     content_hash: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    # T5.1: uncompressed plaintext size of the content blob in bytes.
+    # NULL for records without content (Admin API usage buckets); set by
+    # `vargate_telemetry.storage.content.store_content` for records
+    # backed by a MinIO blob. NOT in the chain canonical bytes — see the
+    # 0014_content_size_bytes migration header.
+    content_size_bytes: Mapped[Optional[int]] = mapped_column(
+        BigInteger, nullable=True,
+    )
 
     # The SQL column is named `metadata` (per the schema spec); the
     # Python attribute can't be — SQLAlchemy's DeclarativeBase reserves
