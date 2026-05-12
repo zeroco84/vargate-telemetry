@@ -6,6 +6,7 @@
 import os
 
 from celery import Celery
+from celery.signals import worker_process_shutdown
 
 celery_app = Celery(
     "vargate_telemetry",
@@ -52,3 +53,42 @@ celery_app.conf.beat_schedule = {
 # Alias so `celery -A vargate_telemetry.celery_app worker` (which looks up
 # the default attribute name `app`) resolves the same instance.
 app = celery_app
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# T4.8.1: Prometheus multi-process cleanup hook.
+#
+# When a prefork worker child exits (worker shutdown, scale-down, OOM),
+# its files in PROMETHEUS_MULTIPROC_DIR linger. For Counters and
+# Histograms that's actually correct — the sum across alive + dead
+# workers is the right aggregate, and `multiprocess.MultiProcessCollector`
+# reads all files regardless. For Gauges (T5+ will ship some), the
+# default `multiprocess_mode="all"` would over-count.
+#
+# `multiprocess.mark_process_dead(pid)` removes the worker's Gauge
+# files (and only the Gauge files) so subsequent aggregations skip
+# them. Calling it now means the first Gauge ships in T5 already
+# benefits — no follow-up wiring needed.
+#
+# No-op when PROMETHEUS_MULTIPROC_DIR isn't set (unit tests, dev
+# without compose) — `mark_process_dead` checks the env var itself
+# before touching the filesystem.
+# ───────────────────────────────────────────────────────────────────────────
+
+
+@worker_process_shutdown.connect
+def _cleanup_prometheus_multiproc(pid: int, exitcode: int, **_: object) -> None:
+    """Mark this worker's multiproc Gauge files as dead on shutdown.
+
+    Called by Celery's per-prefork-child shutdown signal (not the
+    once-per-worker shutdown). Each prefork child has its own pid;
+    one shutdown signal fires per child.
+    """
+    if not os.environ.get("PROMETHEUS_MULTIPROC_DIR"):
+        return
+    # Import inside the hook so the celery module doesn't pull the
+    # prometheus_client dep at import time when the env isn't set
+    # (matters for the few celery-side scripts that boot without it).
+    from prometheus_client import multiprocess
+
+    multiprocess.mark_process_dead(pid)
