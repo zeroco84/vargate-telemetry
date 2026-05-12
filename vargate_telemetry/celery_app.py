@@ -48,6 +48,34 @@ celery_app.conf.beat_schedule = {
         "schedule": 900.0,  # every 15 minutes
         "options": {"queue": "default"},
     },
+    # T5.3: parallel to dispatch-admin-pulls but for the Compliance
+    # Activity Feed stream. Same 15-minute cadence, same per-tenant
+    # cursor model in `pull_state` (source_api='compliance_activities'),
+    # separate task name + cursor row so the two streams advance
+    # independently.
+    "dispatch-compliance-activity-pulls": {
+        "task": (
+            "vargate_telemetry.tasks.pull_compliance."
+            "dispatch_compliance_activity_pulls"
+        ),
+        "schedule": 900.0,  # every 15 minutes
+        "options": {"queue": "default"},
+    },
+    # T5.3: parallel to dispatch-compliance-activity-pulls but for the
+    # Content endpoints (chats, files, projects). Every tenant currently
+    # raises NotConfigured because no tenant has a sealed Compliance
+    # Access Key yet — the dispatcher catches and logs+skips. The
+    # schedule is live now so when a future sprint activates content
+    # ingest, it picks up on the next 15-minute tick without a beat-
+    # schedule change.
+    "dispatch-compliance-content-pulls": {
+        "task": (
+            "vargate_telemetry.tasks.pull_compliance."
+            "dispatch_compliance_content_pulls"
+        ),
+        "schedule": 900.0,  # every 15 minutes
+        "options": {"queue": "default"},
+    },
 }
 
 # Alias so `celery -A vargate_telemetry.celery_app worker` (which looks up

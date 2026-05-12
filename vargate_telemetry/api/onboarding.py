@@ -93,8 +93,25 @@ class ValidateKeyRequest(BaseModel):
 
 
 class KeyCapabilities(BaseModel):
+    """Per-key capability report — see OpenAPI ``KeyCapabilities``.
+
+    T5.3 split the earlier ``compliance_api: bool`` into two booleans:
+
+      - ``activity_feed`` — set by a real probe against
+        ``GET /v1/compliance/activities?limit=1``. True if 200,
+        False if 403 (or any other failure).
+      - ``content_capture`` — reserved field; T5.3 always returns
+        ``False`` because content endpoints require a Compliance
+        Access Key (a separate key type from the Admin API key
+        collected by today's onboarding). A future sprint adds the
+        Compliance Access Key onboarding step; until then the
+        frontend renders this row as "Enable later — requires
+        Compliance Access Key".
+    """
+
     admin_api: bool
-    compliance_api: bool
+    activity_feed: bool
+    content_capture: bool
     code_analytics: bool
 
 
@@ -294,32 +311,48 @@ def validate_key(
                 ) from exc
             raise
 
-        # 2. Members probe — used here as a loose proxy for Compliance
-        # API capability until T5 lands the real Compliance probe. If
-        # the admin probe worked but this one doesn't, the user's key
-        # has Admin scope but not the broader Compliance scope.
+        # 2. Activity Feed probe (T5.3). Real signal for "this key
+        # can ingest Compliance API activity events" — fetch a single
+        # activity and check the status code. The previous T4.4
+        # implementation probed `list_members` as a proxy, which was
+        # the wrong signal: list_members works on any plan with an
+        # admin key, but Activity Feed access is plan-gated
+        # (Enterprise only) and scope-gated (`read:compliance_activities`).
         try:
-            next(iter(client.list_members()), None)
-            compliance_api_ok = True
+            next(iter(client.list_activities(limit=1)), None)
+            activity_feed_ok = True
+        except InsufficientScope:
+            # 403 — key lacks `read:compliance_activities` scope, or
+            # the org's plan tier doesn't include Compliance API.
+            activity_feed_ok = False
         except Exception as exc:
             if _is_auth_failure(exc):
-                compliance_api_ok = False
+                activity_feed_ok = False
             else:
-                # A 5xx from Anthropic is not the user's fault — but it
-                # also doesn't tell us much about scope. Default to
-                # `False` here so the UI doesn't claim Compliance is
-                # available when we couldn't confirm.
-                compliance_api_ok = False
+                # A 5xx from Anthropic is not the user's fault — but
+                # also doesn't confirm scope. Default to False so the
+                # UI doesn't promise a capability we couldn't verify.
+                activity_feed_ok = False
 
-        # 3. Code Analytics: real probe lands in T5; for T4.4 default to
-        # `False` so the UI can render the "missing capability" row.
+        # 3. Content capture: reserved field, always False in T5.3.
+        # Content endpoints require a Compliance Access Key
+        # (sk-ant-api01-...), which is a separate key type from the
+        # Admin API key (sk-ant-admin01-...) collected by today's
+        # onboarding. A future sprint adds the Compliance Access Key
+        # onboarding step; until then the UI renders this as
+        # "Enable later — requires Compliance Access Key".
+        content_capture_ok = False
+
+        # 4. Code Analytics: real probe lands in T5.4; for T5.3 default
+        # to False so the UI can render the "missing capability" row.
         code_analytics_ok = False
 
         return ValidateKeyResponse(
             org_name=org_name or "Your Anthropic Organization",
             capabilities=KeyCapabilities(
                 admin_api=admin_api_ok,
-                compliance_api=compliance_api_ok,
+                activity_feed=activity_feed_ok,
+                content_capture=content_capture_ok,
                 code_analytics=code_analytics_ok,
             ),
         )

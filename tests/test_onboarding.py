@@ -206,13 +206,17 @@ class StubAdminClient:
         *,
         workspaces: list[_StubWorkspace] | None = None,
         members: list[_StubMember] | None = None,
+        activities: list[object] | None = None,
         workspaces_raises: BaseException | None = None,
         members_raises: BaseException | None = None,
+        activities_raises: BaseException | None = None,
     ) -> None:
         self._workspaces = workspaces or []
         self._members = members or []
+        self._activities = activities or []
         self._workspaces_raises = workspaces_raises
         self._members_raises = members_raises
+        self._activities_raises = activities_raises
         self.calls: list[str] = []
 
     def list_workspaces(self) -> Iterator[_StubWorkspace]:
@@ -226,6 +230,15 @@ class StubAdminClient:
         if self._members_raises is not None:
             raise self._members_raises
         return iter(self._members)
+
+    def list_activities(self, **_kwargs: object) -> Iterator[object]:
+        """T5.3 capability probe. Validate-key now hits this instead of
+        list_members. Default fixture: empty iterator (no activities
+        yet, but the endpoint reachable → activity_feed=True)."""
+        self.calls.append("list_activities")
+        if self._activities_raises is not None:
+            raise self._activities_raises
+        return iter(self._activities)
 
 
 def _make_http_status_error(status_code: int) -> httpx.HTTPStatusError:
@@ -248,14 +261,19 @@ def test_validate_key_returns_capabilities_for_valid_key(
     clean_onboarding_state: None,
     client: TestClient,
 ) -> None:
-    """Stubbed client returns workspaces + members → all probed
-    capabilities present, org_name comes from the first workspace.
+    """Stubbed client returns workspaces + (non-403) activities →
+    admin_api + activity_feed True, content_capture + code_analytics
+    False (T5.3 invariants — see KeyCapabilities docstring).
     """
     from vargate_telemetry.api.onboarding import set_client_factory_for_test
 
     stub = StubAdminClient(
         workspaces=[_StubWorkspace(name="Acme Corp")],
-        members=[_StubMember(id="user_alice")],
+        # T5.3: activities[] is what `validate_key` now probes. Empty
+        # list still means "endpoint reachable" → activity_feed=True;
+        # a 403 raise on the activities call would mean
+        # activity_feed=False.
+        activities=[],
     )
     set_client_factory_for_test(lambda _key: stub)
 
@@ -266,12 +284,16 @@ def test_validate_key_returns_capabilities_for_valid_key(
     assert body["org_name"] == "Acme Corp"
     assert body["capabilities"] == {
         "admin_api": True,
-        "compliance_api": True,
-        # T4.4 hardcodes false; T5 wires the real probe.
+        "activity_feed": True,
+        # T5.3 invariant: content_capture is always False until the
+        # Compliance Access Key onboarding flow lands.
+        "content_capture": False,
+        # T5.4 will wire the real Code Analytics probe.
         "code_analytics": False,
     }
-    # Endpoint called both probes (matches the spec's "one page each").
-    assert stub.calls == ["list_workspaces", "list_members"]
+    # T5.3: validate_key probes list_workspaces + list_activities.
+    # list_members is no longer called from this endpoint.
+    assert stub.calls == ["list_workspaces", "list_activities"]
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -308,20 +330,33 @@ def test_validate_key_returns_400_for_invalid_key(
 # ───────────────────────────────────────────────────────────────────────────
 
 
-def test_validate_key_returns_partial_capabilities_when_compliance_api_unavailable(
+def test_validate_key_returns_partial_capabilities_when_activity_feed_unavailable(
     clean_onboarding_state: None,
     client: TestClient,
 ) -> None:
-    """list_workspaces succeeds (admin scope) but list_members 403s
-    (compliance scope missing) → admin_api=True, compliance_api=False.
-    The endpoint still returns 200 because the key works for the
-    primary admin use case.
+    """list_workspaces succeeds (admin scope) but list_activities 403s
+    (no `read:compliance_activities` scope, or org's plan tier
+    doesn't include Compliance API) → admin_api=True,
+    activity_feed=False. The endpoint still returns 200 because the
+    key works for the primary admin use case; the UI renders the
+    Activity Feed row as "✗" with a help link.
+
+    Renamed in T5.3 from `_when_compliance_api_unavailable` —
+    activity_feed is the new specific signal, replacing the
+    overly-broad compliance_api bool.
     """
+    from vargate_telemetry.anthropic.exceptions import InsufficientScope
     from vargate_telemetry.api.onboarding import set_client_factory_for_test
 
     stub = StubAdminClient(
         workspaces=[_StubWorkspace(name="Partial Corp")],
-        members_raises=_make_http_status_error(403),
+        # T5.3: list_activities is what gates activity_feed. The
+        # client surfaces 403 as `InsufficientScope` (T5.2), which
+        # validate_key catches as the activity_feed=False signal.
+        activities_raises=InsufficientScope(
+            '{"error": {"type": "permission_error"}}',
+            required_scope="read:compliance_activities",
+        ),
     )
     set_client_factory_for_test(lambda _key: stub)
 
@@ -334,7 +369,8 @@ def test_validate_key_returns_partial_capabilities_when_compliance_api_unavailab
     assert body["org_name"] == "Partial Corp"
     assert body["capabilities"] == {
         "admin_api": True,
-        "compliance_api": False,
+        "activity_feed": False,
+        "content_capture": False,
         "code_analytics": False,
     }
 

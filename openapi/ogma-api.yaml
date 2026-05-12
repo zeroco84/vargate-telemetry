@@ -149,22 +149,55 @@ components:
 
     KeyCapabilities:
       type: object
-      required: [admin_api, compliance_api, code_analytics]
+      required: [admin_api, activity_feed, content_capture, code_analytics]
       description: |
-        Which Anthropic Admin sub-APIs the supplied key has access to.
-        Determined by probing each endpoint with a read-only request.
-        Used by the UI to render a "what we'll be able to show you"
-        capability matrix.
+        Which Anthropic capabilities the supplied admin key actually
+        unlocks. Each bool is determined by a read-only probe against
+        the corresponding endpoint family. The UI renders this as a
+        per-capability matrix so the user knows up-front what kind of
+        data the dashboard will surface.
+
+        T5.3 replaced the earlier `compliance_api` single-bool with
+        two distinct booleans: `activity_feed` (reachable by Admin
+        API keys with `read:compliance_activities` scope) and
+        `content_capture` (requires a separate Compliance Access Key
+        created in claude.ai by an Enterprise Primary Owner). The
+        previous single-bool was misleading — it returned True on
+        every Admin key with admin scope, but actual content capture
+        is gated behind plan tier + a second key type.
       properties:
         admin_api:
           type: boolean
-          description: Can call `/v1/organizations/usage_report/messages`.
-        compliance_api:
+          description: |
+            Can call `/v1/organizations/usage_report/messages`. The
+            Admin API surface used by T3+ for usage metering, member
+            enumeration, and workspace listing.
+        activity_feed:
           type: boolean
-          description: Can pull prompt/response content (T5 dependency).
+          description: |
+            Can call `/v1/compliance/activities`. T5.3 ingests
+            authentication / chat-created / file-uploaded / admin /
+            platform event metadata into `telemetry_records` every 15
+            minutes. Reachable by Admin API keys carrying the
+            `read:compliance_activities` scope. False if the key (or
+            the org's plan) doesn't include Activity Feed access.
+        content_capture:
+          type: boolean
+          description: |
+            Can pull underlying chat messages, files, and project
+            content (`/v1/compliance/apps/chats/*`). Requires a
+            **Compliance Access Key** (`sk-ant-api01-...`) created in
+            claude.ai by an Enterprise Primary Owner — NOT the same
+            as the Admin API key (`sk-ant-admin01-...`) that today's
+            onboarding collects. T5.3 always returns `false` here;
+            a future sprint adds the Compliance Access Key onboarding
+            step. The UI renders this row as
+            "Enable later — requires Compliance Access Key".
         code_analytics:
           type: boolean
-          description: Has Code Analytics access (T5 dependency).
+          description: |
+            Has Claude Code Analytics access. T5.4 will land the real
+            probe; today this is always `false`.
 
     ValidateKeyResponse:
       type: object
