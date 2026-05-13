@@ -1040,6 +1040,95 @@ def test_list_usage_cache_creation_nullif_falls_through_when_flat_is_zero(
     assert body["totals"]["cache_creation_tokens"] == 305_716
 
 
+def test_list_usage_totals_cost_equals_sum_of_per_row_costs(
+    clean_records: None,
+    clean_workspaces: None,
+    client: TestClient,
+) -> None:
+    """T5.5.7 regression pin: ``totals.total_cost_usd`` must equal
+    the sum of every row's ``estimated_cost_usd`` (within
+    rounding). The cost-by-model SQL and the per-row SQL share the
+    same cache_creation NULLIF logic; a divergence between them
+    means one SQL block is missing the fix and customers see
+    inconsistent figures between the row column and the totals
+    cell.
+
+    Real-data manifestation: founder's tnt_eu_38b3047725704cb1
+    sum-of-row-costs was $304.09 vs totals $236.59 because the
+    cost-by-model SQL was missing NULLIF over the flat
+    cache_creation_input_tokens, so Sonnet's ~$68 of cache-creation
+    cost dropped out of the aggregate.
+    """
+    from decimal import Decimal
+
+    tenant = "tnt_us_test_totals_match"
+    # Sonnet row with real cache_creation in the nested dict +
+    # flat 0 (the bug pattern that NULLIF unblocks).
+    metadata = {
+        "starting_at": "2026-05-11T00:00:00Z",
+        "ending_at": "2026-05-12T00:00:00Z",
+        "results": [
+            {
+                "workspace_id": None,
+                "model": "claude-sonnet-4-5-20250929",
+                "input_tokens": 1_000_000,
+                "output_tokens": 100_000,
+                "cache_read_input_tokens": 500_000,
+                "cache_creation_input_tokens": 0,
+                "cache_creation": {
+                    "ephemeral_5m_input_tokens": 2_000_000,
+                    "ephemeral_1h_input_tokens": 0,
+                },
+                "server_tool_use": {"web_search_requests": 0},
+            }
+        ],
+    }
+    from vargate_telemetry.db import engine
+
+    with engine.begin() as conn:
+        conn.execute(
+            sql_text(
+                """
+                INSERT INTO telemetry_records (
+                    tenant_id, record_type, source_api, external_id,
+                    occurred_at, content_hash, metadata,
+                    chain_seq, chain_prev_hash, chain_self_hash
+                ) VALUES (
+                    :t, 'usage', 'admin',
+                    'usage:2026-05-11T00:00:00Z:2026-05-12T00:00:00Z:claude-sonnet-4-5-20250929:-',
+                    '2026-05-11T00:00:00+00:00',
+                    decode('00' || repeat('0', 62), 'hex'),
+                    :metadata,
+                    (SELECT COALESCE(MAX(chain_seq), 0) + 1
+                       FROM telemetry_records WHERE tenant_id = :t2),
+                    decode('00' || repeat('0', 62), 'hex'),
+                    decode('11' || repeat('1', 62), 'hex')
+                )
+                """
+            ),
+            {"t": tenant, "t2": tenant, "metadata": json.dumps(metadata)},
+        )
+
+    r = client.get(
+        "/usage?since=2026-05-11&until=2026-05-11",
+        headers=_bearer_for_tenant(tenant),
+    )
+    body = r.json()
+
+    per_row_sum = Decimal("0")
+    for row in body["rows"]:
+        if row["estimated_cost_usd"]:
+            per_row_sum += Decimal(row["estimated_cost_usd"])
+
+    # The totals string is 2-decimal USD; round per_row_sum the
+    # same way before comparing.
+    rounded = per_row_sum.quantize(Decimal("0.01"))
+    assert body["totals"]["total_cost_usd"] == str(rounded), (
+        f"totals.total_cost_usd ({body['totals']['total_cost_usd']}) "
+        f"must equal sum of per-row costs ({rounded})"
+    )
+
+
 def test_list_usage_limit_1000_accepted(
     clean_records: None,
     clean_workspaces: None,
