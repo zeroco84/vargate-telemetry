@@ -496,16 +496,20 @@ def test_validate_key_detects_no_activity_feed_when_403() -> None:
             "activity_feed": False,
             "content_capture": False,
             "code_analytics": False,
+            # TM1: no MCP rows for this test tenant → False.
+            "mcp_connector": False,
         }
     finally:
         onboarding_routes.set_client_factory_for_test(None)
 
 
-def test_validate_key_returns_four_bool_capability_shape() -> None:
+def test_validate_key_returns_five_bool_capability_shape() -> None:
     """Sanity: a fully-capable admin key returns activity_feed=True,
     but content_capture stays False (T5.3 always returns False for
     content_capture — it requires a Compliance Access Key the
-    onboarding doesn't collect yet)."""
+    onboarding doesn't collect yet). TM1 added a fifth bool —
+    `mcp_connector` — which is False until at least one MCP row
+    arrives in `telemetry_records` (last 90 days)."""
     from fastapi.testclient import TestClient
     import os
 
@@ -566,12 +570,13 @@ def test_validate_key_returns_four_bool_capability_shape() -> None:
         assert response.status_code == 200, response.text
         body = response.json()
         assert body["org_name"] == "Big Enterprise Co"
-        # The four-bool shape lands.
+        # The five-bool shape lands (TM1: was four).
         assert set(body["capabilities"].keys()) == {
             "admin_api",
             "activity_feed",
             "content_capture",
             "code_analytics",
+            "mcp_connector",
         }
         assert body["capabilities"]["admin_api"] is True
         assert body["capabilities"]["activity_feed"] is True
@@ -583,5 +588,9 @@ def test_validate_key_returns_four_bool_capability_shape() -> None:
         # hardcoded False in T5.3). The fully-capable stub returns
         # an empty iterator → endpoint reachable → True.
         assert body["capabilities"]["code_analytics"] is True
+        # TM1: mcp_connector is False until a real `mcp` row
+        # arrives in telemetry_records. This stub never inserts
+        # one (caller has tenant_id=None anyway).
+        assert body["capabilities"]["mcp_connector"] is False
     finally:
         onboarding_routes.set_client_factory_for_test(None)
