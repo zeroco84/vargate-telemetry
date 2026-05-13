@@ -123,3 +123,63 @@ SELECT tenant_id, created_at, region FROM tenants ORDER BY created_at DESC LIMIT
 A tenant ID can become stale between when the spec is written and when the task runs — re-onboarding cycles, test runs, founder spinning up a new tenant, etc. Pasting a stale tenant ID and hitting "no rows" mid-task wastes a round-trip and (worse) can land work against the wrong tenant if a similar ID exists.
 
 T5.5.6 spec referenced `tnt_eu_4191a3cac6064abe` in one place and `tnt_eu_2f73d474ff0a489c` in another. The first didn't exist; the second did. Re-querying caught both before any code touched the wrong rows.
+
+---
+
+## MCP connectors are tool providers, not passive observers
+
+The Ogma MCP server (TM1) does NOT see raw user prompts, raw Claude responses, or the full tool-call chain. It sees **only what Claude chooses to summarize** when it calls our `log_interaction` tool. That's enough for compliance metadata and cost analytics; insufficient for forensic prompt/response review.
+
+This is the fundamental fidelity ceiling of the MCP capture model — not a bug to fix, an architectural reality to be transparent about in product copy. For "we see what your team types into Claude" pitching, MCP doesn't deliver. For "audited opt-in record of what kinds of work get done with Claude" it does.
+
+Enterprise tenants who need full fidelity use the Compliance API path. MCP is the Pro/Team/Free universal-tier surface.
+
+---
+
+## MCP capture depends on Claude reliably calling the logging tool every turn
+
+The most reliable mechanism is a **shared Claude Project with a custom instruction** that says "after every response, call `ogma.log_interaction` ...". Members work inside the Project; conversations outside the Project are NOT tracked.
+
+What does NOT exist:
+- Global org-wide "every conversation has these instructions" toggle outside Projects.
+- A way to FORCE Claude to call a specific tool on every turn — the instruction is advisory; Claude's compliance is high but not 100%.
+- A way to prevent users from disabling the connector mid-conversation.
+
+Surface the opt-in model honestly: Ogma sees what users choose to track, not everything. Customers who try to position this as universal coverage will be caught out.
+
+---
+
+## MCP tool calls block the conversation — handler MUST return <500ms p99
+
+Tool calls in Claude Desktop / claude.ai are synchronous with a ~60s client-side timeout. Latency added to `log_interaction` shows up as visible delay on every Claude response.
+
+The `log_interaction` handler MUST:
+1. Validate the bearer token (in-memory cache + Postgres fallback).
+2. Validate args (Pydantic).
+3. **Enqueue persistence to Celery** (fire-and-forget; do NOT await).
+4. Return `{logged: true, event_id}` immediately.
+
+Anything that synchronously writes to Postgres before returning will be felt by every customer. The Celery task retries on its own retry policy; the customer never knows if the chain insert had a transient blip.
+
+---
+
+## MCP tokens are audience-bound; main Ogma tokens are NOT accepted at the MCP surface
+
+Each MCP client (a Claude installation) maps 1:1 to one OAuth identity at one tenant. Tokens issued by the MCP authorization server carry an audience claim (RFC 8707 `resource`) of `mcp.ogma.vargate.ai`. The MCP `/mcp` endpoint rejects any bearer whose audience is not that exact value.
+
+This means main Ogma's session JWTs (audience: `ogma.vargate.ai`) cannot be replayed against the MCP server, and vice versa. The two surfaces are cryptographically separated even though they share the same SSO provider underneath. **Don't blur the line** by accepting one type of token at the other endpoint.
+
+---
+
+## MCP is the Team/Pro/Free ingest surface; Compliance API stays Enterprise-only
+
+Ogma now has three ingest paths:
+
+| Surface | Plan | Fidelity | UX |
+|---|---|---|---|
+| Admin API | Pro/Team/Enterprise | Daily token aggregates, no content | Always-on, server-side |
+| Code Analytics | Enterprise + entitlement | Per-actor sessions, no content | Always-on once entitled |
+| MCP (TM1) | Pro/Team/Free | Per-turn tool-call summaries | Opt-in via shared Project |
+| Compliance API | Enterprise + Compliance Access Key | Full chat/file/admin event metadata + content | Always-on once keyed |
+
+Position the MCP path as the universal-tier option. Recommend Compliance API for any tenant whose use case needs "every prompt and response, recorded."
