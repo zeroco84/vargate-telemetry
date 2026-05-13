@@ -12,7 +12,14 @@ celery_app = Celery(
     "vargate_telemetry",
     broker=os.environ["CELERY_BROKER_URL"],          # redis://redis:6379/1
     backend=os.environ["CELERY_RESULT_BACKEND"],     # redis://redis:6379/2
-    include=["vargate_telemetry.tasks"],             # populated in later sprints
+    # TM1: mcp_server.tasks lives outside the vargate_telemetry tree
+    # so it can be carved into its own package later (Apache 2.0 vs
+    # BSL-1.1). Include both module paths so the worker discovers
+    # both task sets.
+    include=[
+        "vargate_telemetry.tasks",
+        "mcp_server.tasks",
+    ],
 )
 
 celery_app.conf.update(
