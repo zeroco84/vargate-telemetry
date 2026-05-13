@@ -11,6 +11,10 @@ import httpx
 import pytest
 from sqlalchemy import text as sql_text
 
+from fixtures.admin_api_handlers import (
+    empty_workspaces_response,
+    is_workspaces_request,
+)
 from vargate_telemetry.anthropic import AnthropicAdminClient
 
 
@@ -74,8 +78,8 @@ def test_backfill_chunks_respect_window(clean_backfill_state: None) -> None:
         # T5.5.6: backfill also hits /v1/organizations/workspaces.
         # Don't count those against the 7-day-window tracker —
         # `seen_windows` pins the usage-endpoint windows only.
-        if "/workspaces" in request.url.path:
-            return _empty_data_handler(request)
+        if is_workspaces_request(request):
+            return empty_workspaces_response()
         seen_windows.append(
             (
                 request.url.params["starting_at"],
@@ -129,8 +133,8 @@ def test_backfill_resumes_after_crash(clean_backfill_state: None) -> None:
         # start. Don't count that against the crash trigger — the
         # test pins behavior at chunk granularity, not HTTP-call
         # granularity.
-        if "/workspaces" in request.url.path:
-            return _empty_data_handler(request)
+        if is_workspaces_request(request):
+            return empty_workspaces_response()
         call_count["n"] += 1
         if call_count["n"] == 3:
             raise httpx.NetworkError("simulated mid-backfill crash")
@@ -180,8 +184,8 @@ def test_backfill_resumes_after_crash(clean_backfill_state: None) -> None:
         # T5.5.6: backfill also hits /v1/organizations/workspaces.
         # Don't count those against the 7-day-window tracker —
         # `seen_windows` pins the usage-endpoint windows only.
-        if "/workspaces" in request.url.path:
-            return _empty_data_handler(request)
+        if is_workspaces_request(request):
+            return empty_workspaces_response()
         seen_windows.append(
             (
                 request.url.params["starting_at"],

@@ -24,6 +24,11 @@ from fastapi.testclient import TestClient
 from prometheus_client import REGISTRY
 from sqlalchemy import text as sql_text
 
+from fixtures.admin_api_handlers import (
+    empty_workspaces_response,
+    is_workspaces_request,
+)
+
 
 os.environ["JWT_SIGNING_KEY"] = (
     "test-jwt-signing-key-only-used-inside-the-test-suite-32b"
@@ -513,10 +518,8 @@ def test_first_pull_is_observed_only_once_per_tenant(
         # to keep the workspaces table fresh. Short-circuit those
         # requests so they don't burn the call-count counter that the
         # rest of the test pins.
-        if "/workspaces" in request.url.path:
-            return httpx.Response(
-                200, json={"data": [], "has_more": False}
-            )
+        if is_workspaces_request(request):
+            return empty_workspaces_response()
         call_count["n"] += 1
         if call_count["n"] == 1:
             return httpx.Response(
