@@ -36,10 +36,17 @@ import jwt as pyjwt
 # Cookie name surfaced through the OpenAPI spec.
 SESSION_COOKIE_NAME = "ogma_session"
 
-# 15-minute access token per the T4.2 spec. Refresh-token machinery
-# lands later; this short TTL keeps the blast radius of any leaked
-# token small.
-SESSION_TOKEN_TTL_SECONDS = 15 * 60
+# T5.5.8: bumped from 15 minutes → 8 hours. Refresh-token machinery
+# was scoped for T6+ but the 15-minute TTL combined with the lack of
+# any refresh path meant customers got kicked back to SSO mid-session
+# (Rick reported this on 2026-05-13). 8h is the typical workday — a
+# customer who closes their laptop at lunch and reopens it still has
+# a valid session. The blast-radius reasoning that motivated the
+# original 15-minute window was right for a leaked-token scenario,
+# but the leaked-token threat isn't worse at 8h than at 15min
+# without a revocation path — and the UX cost of repeated SSO trips
+# was concrete. Revisit when refresh tokens land.
+SESSION_TOKEN_TTL_SECONDS = 8 * 60 * 60
 
 # Algorithm — HS256 is fine for a single-issuer/single-audience
 # setup. RS256 becomes useful when external consumers need to

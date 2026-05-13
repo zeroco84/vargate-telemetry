@@ -25,6 +25,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Cookie, Depends, HTTPException, Response, status
 from pydantic import BaseModel, EmailStr, Field
+from sqlalchemy import text as sql_text
 
 from vargate_telemetry.auth.middleware import AuthenticatedUser, current_user
 from vargate_telemetry.auth.sso import (
@@ -33,6 +34,7 @@ from vargate_telemetry.auth.sso import (
     SsoCallbackError,
     handle_sso_callback,
 )
+from vargate_telemetry.db import scheduler_session_scope
 from vargate_telemetry.auth.jwt import (
     SESSION_COOKIE_NAME,
     SESSION_TOKEN_TTL_SECONDS,
@@ -206,9 +208,26 @@ def sso_microsoft_callback(
 def get_me(user: AuthenticatedUser = Depends(current_user)) -> MeResponse:
     tenants: list[TenantSummary] = []
     if user.tenant_id:
-        # T4.5 will surface tenant region + multi-tenant binding. For
-        # T4.2 the JWT carries a single tenant_id (always null today).
-        tenants.append(TenantSummary(tenant_id=user.tenant_id, region="us"))
+        # T5.5.8: look the real region up from the tenants table.
+        # Pre-T5.5.8 this was hardcoded "us" — a T4.2 placeholder
+        # that surfaced as a wrong region chip + wrong env label on
+        # the dashboard topbar for every EU customer. Use the
+        # scheduler scope (no app.tenant_id binding required) since
+        # we're reading a single row for the bound user; the RLS
+        # policy on `tenants` doesn't gate by app.tenant_id anyway.
+        region: str = "us"  # safe fallback if the tenant row is missing
+        with scheduler_session_scope() as s:
+            row = s.execute(
+                sql_text(
+                    "SELECT region FROM tenants WHERE tenant_id = :t"
+                ),
+                {"t": user.tenant_id},
+            ).first()
+            if row is not None and row.region in ("us", "eu"):
+                region = row.region
+        tenants.append(
+            TenantSummary(tenant_id=user.tenant_id, region=region)
+        )
     return MeResponse(
         user_id=user.user_id,
         email=user.email,

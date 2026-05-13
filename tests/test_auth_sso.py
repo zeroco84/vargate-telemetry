@@ -349,9 +349,13 @@ def test_jwt_round_trip(clean_auth_state: None) -> None:
     assert payload.sso == "google"
     assert payload.tenant_id is None
 
-    # Expired path — issue with `now` in the past so `exp` is also
-    # in the past, then decode should raise.
-    long_past = datetime.now(timezone.utc) - timedelta(hours=2)
+    # Expired path — issue with `now` far enough in the past that the
+    # token's exp (now + TTL) is BEFORE current time. T5.5.8 bumped
+    # SESSION_TOKEN_TTL_SECONDS from 15 min → 8 h; a 2-hour-old
+    # token is still valid for 6 more hours and wouldn't trip the
+    # expired branch. Use 12 hours back to comfortably clear any
+    # reasonable TTL.
+    long_past = datetime.now(timezone.utc) - timedelta(hours=12)
     expired_token = issue_session_jwt(
         user_id="user-1",
         email="bob@example.com",
@@ -463,6 +467,53 @@ def test_me_requires_authentication_and_returns_user_payload(
     assert body["email"] == "me@example.com"
     assert body["sso_provider"] == "google"
     assert body["tenants"] == []
+
+
+def test_me_returns_real_tenant_region_from_db(
+    clean_auth_state: None,
+    client: TestClient,
+) -> None:
+    """T5.5.8 regression pin: /me must look the region up from the
+    `tenants` table, not hardcode "us".
+
+    Pre-T5.5.8 the /me handler had a T4.2 placeholder
+    ``TenantSummary(tenant_id=..., region="us")`` that never got
+    updated. EU customers saw a "US-EAST · PROD" environment chip
+    and a "US" region in the tenant chip — the dashboard looked
+    misrouted even though the data was correctly EU-sealed.
+    """
+    from vargate_telemetry.auth.jwt import issue_session_jwt
+    from vargate_telemetry.db import engine
+
+    # Seed an EU tenant in the DB and a JWT bound to it.
+    eu_tenant = "tnt_eu_region_test"
+    with engine.begin() as conn:
+        conn.execute(
+            sql_text(
+                "INSERT INTO tenants (tenant_id, region, active, "
+                "billing_status) VALUES (:t, 'eu', TRUE, 'trial')"
+            ),
+            {"t": eu_tenant},
+        )
+
+    token = issue_session_jwt(
+        user_id="user-eu",
+        email="eu-user@example.com",
+        sso_provider="google",
+        tenant_id=eu_tenant,
+    )
+    r = client.get(
+        "/me",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["tenants"] == [
+        {"tenant_id": eu_tenant, "region": "eu"}
+    ], (
+        f"/me must return the EU tenant's real region; got "
+        f"{body['tenants']!r}"
+    )
 
 
 # ───────────────────────────────────────────────────────────────────────────
