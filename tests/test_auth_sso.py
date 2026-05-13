@@ -235,8 +235,16 @@ def test_sso_callback_preserves_existing_tenant_binding_on_repeat_login(
 
     This test pins the fix: sign in → manually bind the user to a
     tenant via direct SQL (simulating T4.5's commit) → sign in
-    again → /me MUST report the tenant.
+    again → decode the re-issued JWT and assert it carries the
+    tenant_id.
+
+    Implementation note: TestClient runs over HTTP, which means the
+    `Secure` session cookie is *received* (stored in the cookie jar)
+    but not *resent* on subsequent http:// requests. We pull the
+    JWT value directly out of the jar and decode it instead of
+    chasing it via /me.
     """
+    from vargate_telemetry.auth.jwt import decode_session_jwt
     from vargate_telemetry.auth.sso import set_exchanger_for_test
     from vargate_telemetry.db import engine
 
@@ -252,10 +260,11 @@ def test_sso_callback_preserves_existing_tenant_binding_on_repeat_login(
     assert r1.status_code == 200
     user_id = r1.json()["user_id"]
 
-    # Sanity: /me reports no tenants yet.
-    me_before = client.get("/me")
-    assert me_before.status_code == 200
-    assert me_before.json()["tenants"] == []
+    # First-sign-in JWT carries tenant_id=None (no binding yet).
+    first_jwt = client.cookies.get("ogma_session")
+    assert first_jwt is not None
+    first_payload = decode_session_jwt(first_jwt)
+    assert first_payload.tenant_id is None
 
     # Simulate T4.5 select-region: create a tenant + bind the user.
     # (We don't go through the real route to keep the test surface
@@ -288,12 +297,26 @@ def test_sso_callback_preserves_existing_tenant_binding_on_repeat_login(
     assert r2.status_code == 200, r2.text
     assert r2.json()["user_id"] == user_id  # same user row
 
-    # The new session's /me MUST report the tenant binding.
-    me_after = client.get("/me")
-    assert me_after.status_code == 200
+    # The re-issued JWT MUST carry the tenant_id binding — the
+    # whole point of the hotfix.
+    second_jwt = client.cookies.get("ogma_session")
+    assert second_jwt is not None
+    second_payload = decode_session_jwt(second_jwt)
+    assert second_payload.tenant_id == "tnt_eu_returning_test", (
+        f"expected tenant binding preserved in re-issued JWT; "
+        f"got tenant_id={second_payload.tenant_id!r}"
+    )
+
+    # And the JWT works as a Bearer token: /me reports the tenant.
+    # (Bearer side-steps the TestClient HTTP+Secure cookie limitation.)
+    me_after = client.get(
+        "/me",
+        headers={"Authorization": f"Bearer {second_jwt}"},
+    )
+    assert me_after.status_code == 200, me_after.text
     body = me_after.json()
     assert len(body["tenants"]) == 1, (
-        f"expected tenant binding preserved in re-issued JWT; got {body}"
+        f"expected one tenant in /me response; got {body}"
     )
     assert body["tenants"][0]["tenant_id"] == "tnt_eu_returning_test"
 
