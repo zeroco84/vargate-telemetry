@@ -78,10 +78,17 @@ def _seed_usage_record(
 ) -> None:
     """Insert one ``record_type='usage'`` row with the given result-groups.
 
-    Mirrors the Admin API connector's output shape (T3.2): a
+    Mirrors the Admin API connector's output shape: a
     `metadata.results` JSONB array, each element a single bucket
     breakdown. ``occurred_at`` is set to midnight UTC of
     ``bucket_date`` — matches the connector's normalization.
+
+    T5.5.6 made external_id granular — ``usage:{start}:{end}:{model_or_-}:{workspace_or_-}``
+    so multiple breakdown rows for the same date don't collide on
+    the dedup UNIQUE. The helper mirrors that format using the first
+    breakdown's model/workspace; tests that need to seed multiple
+    breakdowns on the same date should call this helper once per
+    breakdown with ``results=[single_dict]``.
     """
     from vargate_telemetry.db import engine
 
@@ -96,8 +103,15 @@ def _seed_usage_record(
         "ending_at": next_day.isoformat().replace("+00:00", "Z"),
         "results": results,
     }
+    model_key = "-"
+    workspace_key = "-"
+    if results:
+        first = results[0]
+        model_key = first.get("model") or "-"
+        workspace_key = first.get("workspace_id") or "-"
     external_id = (
         f"usage:{occurred.isoformat()}:{next_day.isoformat()}"
+        f":{model_key}:{workspace_key}"
     )
     with engine.begin() as conn:
         conn.execute(
@@ -684,9 +698,17 @@ def test_list_usage_mixed_known_and_unknown_models(
     clean_workspaces: None,
     client: TestClient,
 ) -> None:
-    """A bucket with both a costed and an unkown-model row returns a
-    total that's a FLOOR (rows_without_cost > 0). UI uses this signal
-    to show '≥ $X' rather than '$X exactly'."""
+    """Across DIFFERENT dates: one date has a costed (known-model) row,
+    another has an unknown-model row. Totals reflect a FLOOR
+    (rows_without_cost > 0). UI uses this signal to show '≥ $X' rather
+    than '$X exactly'.
+
+    (Mixing known + unknown on the SAME date is covered by the
+    supersession test below — the legacy aggregate gets hidden when a
+    breakdown for the same date exists. To exercise the rows_without_cost
+    path we need a date that has ONLY the legacy aggregate, so we seed
+    them on separate dates.)
+    """
     tenant = "tnt_us_test_usage_mixed_cost"
     _seed_usage_record(
         tenant,
@@ -699,6 +721,12 @@ def test_list_usage_mixed_known_and_unknown_models(
                 cache_read=0,
                 cache_creation=0,
             ),
+        ],
+    )
+    _seed_usage_record(
+        tenant,
+        bucket_date=date(2026, 5, 10),
+        results=[
             _result_group(
                 model=None,
                 input_tokens=999_999,
@@ -707,7 +735,7 @@ def test_list_usage_mixed_known_and_unknown_models(
     )
 
     r = client.get(
-        "/usage?since=2026-05-11&until=2026-05-11",
+        "/usage?since=2026-05-10&until=2026-05-11",
         headers=_bearer_for_tenant(tenant),
     )
     body = r.json()
@@ -773,6 +801,92 @@ def test_list_usage_unresolved_workspace_returns_null_name(
     row = body["rows"][0]
     assert row["workspace_id"] == "wrkspc_unknown"
     assert row["workspace_name"] is None
+
+
+def test_list_usage_supersedes_legacy_aggregate_when_breakdown_present(
+    clean_records: None,
+    clean_workspaces: None,
+    client: TestClient,
+) -> None:
+    """T5.5.6: a legacy aggregate record (model=null) on the same
+    date as a per-model breakdown record is HIDDEN by the Usage API
+    to avoid double-counting. The audit-chain rows stay in the DB —
+    only the view filters them."""
+    tenant = "tnt_us_test_supersession"
+    # Legacy aggregate row for 2026-05-11 — model=null, total counts.
+    _seed_usage_record(
+        tenant,
+        bucket_date=date(2026, 5, 11),
+        results=[
+            _result_group(model=None, input_tokens=186_313, output_tokens=32_349)
+        ],
+    )
+    # Per-model breakdown rows for the same day — these are what the
+    # T5.5.6 connector emits.
+    _seed_usage_record(
+        tenant,
+        bucket_date=date(2026, 5, 11),
+        results=[
+            _result_group(
+                model="claude-sonnet-4-5-20250929",
+                input_tokens=354,
+                output_tokens=13_411,
+            )
+        ],
+    )
+    _seed_usage_record(
+        tenant,
+        bucket_date=date(2026, 5, 11),
+        results=[
+            _result_group(
+                model="claude-haiku-4-5-20251001",
+                input_tokens=185_959,
+                output_tokens=18_938,
+            )
+        ],
+    )
+    # And a date with ONLY a legacy aggregate (no breakdown row).
+    # That row must NOT be hidden — it's the only data for that day.
+    _seed_usage_record(
+        tenant,
+        bucket_date=date(2026, 5, 8),
+        results=[_result_group(model=None, input_tokens=36, output_tokens=1738)],
+    )
+
+    r = client.get(
+        "/usage?since=2026-05-08&until=2026-05-11",
+        headers=_bearer_for_tenant(tenant),
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+
+    models_by_date: dict[str, set] = {}
+    for row in body["rows"]:
+        models_by_date.setdefault(row["date"], set()).add(row["model"])
+
+    # 2026-05-11: ONLY the two per-model rows. The legacy aggregate
+    # is hidden.
+    assert models_by_date.get("2026-05-11") == {
+        "claude-sonnet-4-5-20250929",
+        "claude-haiku-4-5-20251001",
+    }, f"expected breakdown-only on 2026-05-11; got {models_by_date.get('2026-05-11')}"
+
+    # 2026-05-08: only the legacy aggregate, so it survives.
+    assert models_by_date.get("2026-05-08") == {None}
+
+    # Totals reflect the dedup — should be (sonnet + haiku + legacy-08),
+    # NOT (legacy-11 + sonnet + haiku + legacy-08).
+    # legacy-11 was 186313, which equals sonnet 354 + haiku 185959 → if
+    # the dedup is broken, totals doubles 2026-05-11's input.
+    expected_input = 354 + 185_959 + 36  # 186,349
+    assert body["totals"]["input_tokens"] == expected_input, (
+        f"totals doubled — supersession filter failed; "
+        f"got {body['totals']['input_tokens']} expected {expected_input}"
+    )
+    # row_count is the un-superseded set: 3 (2 per-model + 1 legacy-only).
+    assert body["totals"]["row_count"] == 3
+    # rows_without_cost == 1 (the surviving legacy-only row).
+    assert body["totals"]["rows_without_cost"] == 1
 
 
 def test_list_usage_cache_creation_reads_nested_if_flat_missing(
