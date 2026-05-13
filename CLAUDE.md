@@ -42,3 +42,55 @@ Don't let any view fail silently into a dead-end empty state. There's always som
 Discovered T5.5: the recon seed for Code Analytics landed in the smoke tenant (most recently created at recon time), not the tenant under test, and the test passed against zero rows of real data.
 
 Pattern: argparse `--tenant-id` with `required=True`, validation against the `tenants` table at the top of `main()`, exit 1 if the tenant doesn't exist.
+
+---
+
+## Anthropic Admin API requires explicit `group_by` for breakdown rows
+
+The `/v1/organizations/usage_report/messages` endpoint defaults to **aggregate-per-day** rows — every row has `model=null` and `workspace_id=null`. Per-dimension breakdown is opt-in via repeated `group_by[]` params:
+
+```
+?group_by[]=model&group_by[]=workspace_id
+```
+
+Without `group_by`, the response is forward-compatible-but-useless: the shape includes all the fields a future caller might want, populated with `null`. Pass `group_by=["model", "workspace_id"]` on every backfill / poll call so cost computation has something to multiply rates against.
+
+T5.5.5 shipped without `group_by` and produced 77 rows of `model=null` for the founder's tenant — the Usage view rendered but the Est. Cost column was unrepresentable. T5.5.6 closes that.
+
+`external_id` format for the multi-row case becomes `usage:{starting_at}:{ending_at}:{model_or_-}:{workspace_id_or_-}` so per-bucket dedup still works when one daily bucket produces N breakdown rows.
+
+---
+
+## Pricing computation needs a versioned rate card, not a flat dict
+
+Per-model rates live in `vargate_telemetry/pricing/anthropic_rates.py` as a **versioned** structure (a `RATE_HISTORY` list of `(effective_from, effective_to, rates)` entries, plus a `CURRENT_RATES` shortcut). Rates change — Anthropic has bumped Opus pricing twice already in 2025 — and historical records must compute against the rate that was active **when `occurred_at` happened**, not against today's rate.
+
+Helper signature:
+```python
+def compute_cost_usd(
+    model: str | None,
+    input_tokens: int,
+    output_tokens: int,
+    cache_read_tokens: int,
+    cache_creation_tokens: int,
+    occurred_at: datetime,
+) -> Decimal | None
+```
+
+Returns `Decimal` (not `float`) because this is financial-adjacent data and float drift on rate × token-count can move totals by cents over a billing cycle.
+
+Returns `None` when the model is `null` (legacy aggregate rows) or unknown — **never fake a number**. The UI renders `—` for `None`. Faking would tell the customer a wrong dollar figure; surfacing `None` makes the gap visible and steerable.
+
+---
+
+## Tenant IDs in specs get re-verified before each task
+
+Sprint specs that reference a specific tenant ID (e.g., "backfill `tnt_eu_2f73d474ff0a489c`") MUST be re-verified at task start. Run:
+
+```sql
+SELECT tenant_id, created_at, region FROM tenants ORDER BY created_at DESC LIMIT 5;
+```
+
+A tenant ID can become stale between when the spec is written and when the task runs — re-onboarding cycles, test runs, founder spinning up a new tenant, etc. Pasting a stale tenant ID and hitting "no rows" mid-task wastes a round-trip and (worse) can land work against the wrong tenant if a similar ID exists.
+
+T5.5.6 spec referenced `tnt_eu_4191a3cac6064abe` in one place and `tnt_eu_2f73d474ff0a489c` in another. The first didn't exist; the second did. Re-querying caught both before any code touched the wrong rows.
