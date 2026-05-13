@@ -233,19 +233,44 @@ class AnthropicAdminClient:
         starting_at: datetime,
         ending_at: datetime,
         bucket_width: str = "1d",
+        group_by: Optional[list[str]] = None,
     ) -> Iterator[UsageBucket]:
         """Yield time-bucketed usage rows for `[starting_at, ending_at)`.
 
         `bucket_width` is the per-bucket granularity. Common values:
-        `1d` (daily, the default) and `1h` (hourly). T3.5's scheduled
-        pull task fans these out per tenant into `telemetry_records`.
+        `1d` (daily, the default) and `1h` (hourly).
+
+        ``group_by`` is the per-bucket dimension expansion. With the
+        default ``["model", "workspace_id"]`` (T5.5.6) the API emits
+        one ``results`` row per distinct (model, workspace_id) pair
+        within each bucket; without ``group_by`` the API emits one
+        aggregate row per bucket with ``model`` and ``workspace_id``
+        both ``null``. Pass ``[]`` to opt back into the legacy
+        aggregate response. Cost computation requires the breakdown,
+        so callers leave this at the default.
+
+        T5.5.6 also switches to the ``next_page`` cursor paginator
+        (``paginate``) — the usage endpoint uses next_page envelopes,
+        not the admin-list ``after_id`` envelope. Earlier code called
+        ``_paginate_admin`` and silently returned after one page; the
+        7-day chunking in ``_backfill_admin_for_tenant`` kept the bug
+        latent (one chunk = one page), but a single ``list_usage`` call
+        across >7 days dropped subsequent pages.
         """
-        params = {
+        params: dict[str, Any] = {
             "starting_at": starting_at.isoformat(),
             "ending_at": ending_at.isoformat(),
             "bucket_width": bucket_width,
         }
-        for raw in self._paginate_admin(
+        gb = ["model", "workspace_id"] if group_by is None else group_by
+        if gb:
+            # httpx serializes list values as repeated query params,
+            # which matches Anthropic's ``group_by[]=...&group_by[]=...``
+            # form. Anthropic accepts both ``group_by[]=`` and
+            # ``group_by=`` for the dimension keys; we use the bare
+            # form since httpx already handles the array semantics.
+            params["group_by[]"] = gb
+        for raw in self.paginate(
             "/v1/organizations/usage_report/messages", params
         ):
             yield UsageBucket.model_validate(raw)

@@ -62,7 +62,8 @@ from __future__ import annotations
 import base64
 import json
 import logging
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -71,6 +72,7 @@ from sqlalchemy import text as sql_text
 
 from vargate_telemetry.auth.middleware import AuthenticatedUser, current_user
 from vargate_telemetry.db import session_scope
+from vargate_telemetry.pricing import compute_cost_usd
 
 
 _log = logging.getLogger(__name__)
@@ -90,18 +92,30 @@ class UsageRow(BaseModel):
     returns fractional tokens; ``None`` for the breakdown keys means
     the connector didn't request ``group_by`` for that dimension —
     not "all workspaces" semantically.
+
+    ``estimated_cost_usd`` is ``None`` (rendered as ``—`` in the UI)
+    when ``model`` is null (legacy aggregate rows) or unknown to the
+    rate card. **Never faked** — a wrong dollar figure on a
+    dashboard is worse than no figure.
+
+    ``workspace_name`` is resolved from the ``workspaces`` side
+    table (populated by the backfill / pull task via
+    ``client.list_workspaces()``). ``None`` when not yet resolved or
+    when ``workspace_id`` is null.
     """
 
     model_config = {"populate_by_name": True}
 
     row_date: date = Field(alias="date")
     workspace_id: Optional[str] = None
+    workspace_name: Optional[str] = None
     model: Optional[str] = None
     input_tokens: int = 0
     output_tokens: int = 0
     cache_read_tokens: int = 0
     cache_creation_tokens: int = 0
     web_search_requests: int = 0
+    estimated_cost_usd: Optional[Decimal] = None
 
 
 class UsageTotals(BaseModel):
@@ -110,6 +124,12 @@ class UsageTotals(BaseModel):
     Mirrors UsageRow's counter fields. ``row_count`` is the number of
     rows that would be returned across all pages combined — useful
     for the UI to show "showing 50 of 137".
+
+    ``total_cost_usd`` sums every row's ``estimated_cost_usd`` where
+    the model was known; rows that returned ``None`` simply don't
+    contribute. The UI shows the figure as "≥ $X" rendering when
+    ``rows_without_cost > 0`` so customers know the number is a
+    floor, not a ceiling.
     """
 
     input_tokens: int = 0
@@ -118,6 +138,8 @@ class UsageTotals(BaseModel):
     cache_creation_tokens: int = 0
     web_search_requests: int = 0
     row_count: int = 0
+    total_cost_usd: Optional[Decimal] = None
+    rows_without_cost: int = 0
 
 
 class UsageListResponse(BaseModel):
@@ -285,12 +307,21 @@ def list_usage(
     # Expanded query: jsonb_array_elements_with_ordinality flattens
     # metadata.results into one row per element. ordinality starts at
     # 1 and is stable per record (input array order is preserved).
+    # `cache_creation_total` collapses the nested `cache_creation`
+    # (ephemeral_5m + ephemeral_1h) variant T5.5.6 receives from the
+    # group_by'd response with the legacy flat `cache_creation_input_tokens`
+    # field — COALESCE picks whichever is populated.
+    # Workspace-name resolution: LEFT JOIN on the `workspaces` table.
+    # Always LEFT JOIN — most tenants have null workspace_id today
+    # (Personal plan; no workspaces created) and we still want their
+    # rows.
     page_sql = f"""
         WITH expanded AS (
             SELECT
                 tr.id::text AS record_id,
                 tr.occurred_at,
                 DATE(tr.occurred_at AT TIME ZONE 'UTC') AS row_date,
+                tr.tenant_id,
                 r.result,
                 r.ordinality
             FROM telemetry_records tr,
@@ -301,21 +332,30 @@ def list_usage(
               {cursor_clause}
         )
         SELECT
-            row_date,
-            record_id,
-            occurred_at,
-            ordinality,
-            result->>'workspace_id' AS workspace_id,
-            result->>'model' AS model,
-            COALESCE((result->>'input_tokens')::bigint, 0) AS input_tokens,
-            COALESCE((result->>'output_tokens')::bigint, 0) AS output_tokens,
-            COALESCE((result->>'cache_read_input_tokens')::bigint, 0) AS cache_read_tokens,
-            COALESCE((result->>'cache_creation_input_tokens')::bigint, 0) AS cache_creation_tokens,
+            e.row_date,
+            e.record_id,
+            e.occurred_at,
+            e.ordinality,
+            e.result->>'workspace_id' AS workspace_id,
+            w.name AS workspace_name,
+            e.result->>'model' AS model,
+            COALESCE((e.result->>'input_tokens')::bigint, 0) AS input_tokens,
+            COALESCE((e.result->>'output_tokens')::bigint, 0) AS output_tokens,
+            COALESCE((e.result->>'cache_read_input_tokens')::bigint, 0) AS cache_read_tokens,
             COALESCE(
-                ((result->'server_tool_use')->>'web_search_requests')::bigint, 0
+                (e.result->>'cache_creation_input_tokens')::bigint,
+                ((e.result->'cache_creation')->>'ephemeral_5m_input_tokens')::bigint
+                + ((e.result->'cache_creation')->>'ephemeral_1h_input_tokens')::bigint,
+                0
+            ) AS cache_creation_tokens,
+            COALESCE(
+                ((e.result->'server_tool_use')->>'web_search_requests')::bigint, 0
             ) AS web_search_requests
-        FROM expanded
-        ORDER BY occurred_at DESC, record_id DESC, ordinality ASC
+        FROM expanded e
+        LEFT JOIN workspaces w
+          ON w.tenant_id = e.tenant_id
+         AND w.workspace_id = (e.result->>'workspace_id')
+        ORDER BY e.occurred_at DESC, e.record_id DESC, e.ordinality ASC
         LIMIT :limit + 1
     """
     params["limit"] = limit
@@ -340,7 +380,13 @@ def list_usage(
                 SUM((result->>'cache_read_input_tokens')::bigint), 0
             ) AS cache_read_tokens,
             COALESCE(
-                SUM((result->>'cache_creation_input_tokens')::bigint), 0
+                SUM(COALESCE(
+                    (result->>'cache_creation_input_tokens')::bigint,
+                    ((result->'cache_creation')->>'ephemeral_5m_input_tokens')::bigint
+                    + ((result->'cache_creation')->>'ephemeral_1h_input_tokens')::bigint,
+                    0
+                )),
+                0
             ) AS cache_creation_tokens,
             COALESCE(
                 SUM(((result->'server_tool_use')->>'web_search_requests')::bigint),
@@ -366,19 +412,101 @@ def list_usage(
             last.occurred_at, last.record_id, int(last.ordinality)
         )
 
-    rows = [
-        UsageRow(
-            row_date=r.row_date,
-            workspace_id=r.workspace_id,
-            model=r.model,
+    rows: list[UsageRow] = []
+    for r in page_rows_raw:
+        # Force UTC tz for the cost lookup; occurred_at from Postgres
+        # always carries tzinfo, but Pydantic-level callers might pass
+        # in naive datetimes via the unit-test path.
+        occurred = r.occurred_at
+        if occurred.tzinfo is None:
+            occurred = occurred.replace(tzinfo=timezone.utc)
+        cost = compute_cost_usd(
+            r.model,
             input_tokens=int(r.input_tokens),
             output_tokens=int(r.output_tokens),
             cache_read_tokens=int(r.cache_read_tokens),
             cache_creation_tokens=int(r.cache_creation_tokens),
-            web_search_requests=int(r.web_search_requests),
+            occurred_at=occurred,
         )
-        for r in page_rows_raw
-    ]
+        rows.append(
+            UsageRow(
+                row_date=r.row_date,
+                workspace_id=r.workspace_id,
+                workspace_name=r.workspace_name,
+                model=r.model,
+                input_tokens=int(r.input_tokens),
+                output_tokens=int(r.output_tokens),
+                cache_read_tokens=int(r.cache_read_tokens),
+                cache_creation_tokens=int(r.cache_creation_tokens),
+                web_search_requests=int(r.web_search_requests),
+                estimated_cost_usd=cost,
+            )
+        )
+
+    # Totals cost: a second pass that walks the expanded set with the
+    # per-model rate. The page cost lives on each row; the TOTALS
+    # cost has to aggregate across pages. Run a small per-model SUM
+    # over the same filtered set and apply rates server-side. This is
+    # a separate query so it doesn't bloat the page query's row
+    # shape, and the per-model SUM stays bounded (one row per model
+    # ever active in the window).
+    cost_by_model_sql = f"""
+        WITH expanded AS (
+            SELECT r.result, tr.occurred_at
+            FROM telemetry_records tr,
+                 jsonb_array_elements(tr.metadata->'results')
+                     WITH ORDINALITY AS r(result, ordinality)
+            WHERE {base_where}
+              {expanded_where}
+        )
+        SELECT
+            result->>'model' AS model,
+            MIN(occurred_at) AS earliest_occurred_at,
+            COUNT(*) AS row_count,
+            COALESCE(SUM((result->>'input_tokens')::bigint), 0) AS input_tokens,
+            COALESCE(SUM((result->>'output_tokens')::bigint), 0) AS output_tokens,
+            COALESCE(
+                SUM((result->>'cache_read_input_tokens')::bigint), 0
+            ) AS cache_read_tokens,
+            COALESCE(
+                SUM(COALESCE(
+                    (result->>'cache_creation_input_tokens')::bigint,
+                    ((result->'cache_creation')->>'ephemeral_5m_input_tokens')::bigint
+                    + ((result->'cache_creation')->>'ephemeral_1h_input_tokens')::bigint,
+                    0
+                )),
+                0
+            ) AS cache_creation_tokens
+        FROM expanded
+        GROUP BY result->>'model'
+    """
+
+    with session_scope(user.tenant_id) as s2:
+        cost_buckets = s2.execute(sql_text(cost_by_model_sql), params).all()
+
+    total_cost = Decimal("0")
+    rows_without_cost = 0
+    any_cost_computed = False
+    for cb in cost_buckets:
+        occurred = cb.earliest_occurred_at
+        if occurred is not None and occurred.tzinfo is None:
+            occurred = occurred.replace(tzinfo=timezone.utc)
+        elif occurred is None:
+            # No rows in this bucket — skip.
+            continue
+        bucket_cost = compute_cost_usd(
+            cb.model,
+            input_tokens=int(cb.input_tokens),
+            output_tokens=int(cb.output_tokens),
+            cache_read_tokens=int(cb.cache_read_tokens),
+            cache_creation_tokens=int(cb.cache_creation_tokens),
+            occurred_at=occurred,
+        )
+        if bucket_cost is None:
+            rows_without_cost += int(cb.row_count)
+        else:
+            any_cost_computed = True
+            total_cost += bucket_cost
 
     totals = UsageTotals(
         input_tokens=int(totals_row.input_tokens),
@@ -387,6 +515,10 @@ def list_usage(
         cache_creation_tokens=int(totals_row.cache_creation_tokens),
         web_search_requests=int(totals_row.web_search_requests),
         row_count=int(totals_row.row_count),
+        total_cost_usd=(
+            total_cost.quantize(Decimal("0.01")) if any_cost_computed else None
+        ),
+        rows_without_cost=rows_without_cost,
     )
 
     return UsageListResponse(rows=rows, totals=totals, next_cursor=next_cursor)

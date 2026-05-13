@@ -509,6 +509,14 @@ def test_first_pull_is_observed_only_once_per_tenant(
     call_count = {"n": 0}
 
     def _handler(request: httpx.Request) -> httpx.Response:
+        # T5.5.6: pull_admin now also fetches /v1/organizations/workspaces
+        # to keep the workspaces table fresh. Short-circuit those
+        # requests so they don't burn the call-count counter that the
+        # rest of the test pins.
+        if "/workspaces" in request.url.path:
+            return httpx.Response(
+                200, json={"data": [], "has_more": False}
+            )
         call_count["n"] += 1
         if call_count["n"] == 1:
             return httpx.Response(

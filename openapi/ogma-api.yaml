@@ -490,12 +490,12 @@ components:
         - web_search_requests
       description: |
         One (date, workspace_id, model) breakdown of Admin API token
-        usage. Today's connector calls the Anthropic usage endpoint
-        without `group_by`, so `workspace_id` and `model` are
-        typically `null` (one row per active day). When a future
-        connector revision requests `group_by=[workspace_id, model]`,
-        days produce N rows; clients should not assume one row per
-        date.
+        usage. T5.5.6's connector requests `group_by=[model,
+        workspace_id]` so every new daily bucket produces one row
+        per (model, workspace) pair. Pre-T5.5.6 records (aggregate
+        rows) coexist; they show as one row per day with `model:
+        null`, `workspace_id: null`, and `estimated_cost_usd: null`
+        (unknown model = unrepresentable cost).
       properties:
         date:
           type: string
@@ -505,17 +505,32 @@ components:
           type: string
           nullable: true
           description: |
-            Anthropic workspace identifier. `null` when the connector
-            did not request a workspace-level breakdown.
+            Anthropic workspace identifier. `null` for org-level
+            usage (no workspace bucketing) or for pre-T5.5.6 records
+            ingested without `group_by`.
+        workspace_name:
+          type: string
+          nullable: true
+          description: |
+            Human-friendly name resolved from the `workspaces` side
+            table (T5.5.6). `null` when `workspace_id` is null or
+            when the workspace hasn't been synced yet (the backfill
+            pulls the workspaces list at start time; missing entries
+            usually clear on the next steady-state pull).
         model:
           type: string
           nullable: true
           description: |
-            Model name (e.g., `claude-sonnet-4-5`). `null` when the
-            connector did not request a model-level breakdown.
+            Anthropic model identifier
+            (e.g. `claude-sonnet-4-5-20250929`). `null` for pre-T5.5.6
+            records ingested without `group_by`.
         input_tokens:
           type: integer
           format: int64
+          description: |
+            Fresh input tokens. Maps to Anthropic's
+            `uncached_input_tokens` in the group_by'd response;
+            equivalent to the old aggregate response's `input_tokens`.
         output_tokens:
           type: integer
           format: int64
@@ -526,7 +541,12 @@ components:
         cache_creation_tokens:
           type: integer
           format: int64
-          description: Tokens written to prompt cache.
+          description: |
+            Tokens written to prompt cache. With T5.5.6's group_by'd
+            response Anthropic emits a nested
+            `cache_creation.{ephemeral_5m, ephemeral_1h}` shape; this
+            field is the sum of those (pre-T5.5.6 records may also
+            populate this from the flat `cache_creation_input_tokens`).
         web_search_requests:
           type: integer
           format: int64
@@ -534,6 +554,18 @@ components:
             Count of Anthropic server-side web_search tool invocations
             in the bucket. Anthropic bills these separately from
             tokens; surfacing them avoids underreporting cost.
+        estimated_cost_usd:
+          type: string
+          nullable: true
+          description: |
+            Per-row cost in USD as a decimal string with 6 fractional
+            digits (e.g. `"1.142214"`). Computed from `model` × token
+            counts via the versioned rate card at the bucket's
+            `occurred_at`. `null` when `model` is null (legacy
+            aggregate row) or when the model isn't in the rate card
+            (a never-seen-before family). UI renders `null` as `—`
+            — **never faked**. A wrong dollar figure is worse than
+            no figure.
 
     UsageTotals:
       type: object
@@ -544,6 +576,7 @@ components:
         - cache_creation_tokens
         - web_search_requests
         - row_count
+        - rows_without_cost
       description: |
         Aggregates over the **full filtered set** (not just the
         current page). Computing this client-side from page rows
@@ -570,6 +603,24 @@ components:
           description: |
             Total rows across all pages. UI uses this to render
             "showing 50 of 137" affordance.
+        total_cost_usd:
+          type: string
+          nullable: true
+          description: |
+            Sum of per-row `estimated_cost_usd` across the filtered
+            set, as a 2-decimal USD string (e.g. `"47.20"`). `null`
+            when zero rows had a computable cost. Rows with a `null`
+            cost (model=null or unknown) DON'T contribute and are
+            counted in `rows_without_cost`.
+        rows_without_cost:
+          type: integer
+          format: int64
+          description: |
+            Count of rows in the filtered set whose
+            `estimated_cost_usd` was `null` (model=null or unknown).
+            When > 0, `total_cost_usd` is a **floor**, not an exact
+            figure — the UI renders "≥ $X" in that case so customers
+            know the displayed total understates real spend.
 
     UsageListResponse:
       type: object
