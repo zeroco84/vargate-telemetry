@@ -50,6 +50,11 @@ COPY alembic.ini ./
 # so changes to project metadata don't invalidate the dependency cache.
 COPY pyproject.toml ./
 COPY vargate_telemetry/ ./vargate_telemetry/
+# TM1 — mcp_server/ ships in the same image as the gateway. The
+# `mcp-server` compose service runs `uvicorn mcp_server.main:app`
+# off this same image. Apache-2.0 vs BSL-1.1 boundary lives in the
+# per-file headers, not the filesystem.
+COPY mcp_server/ ./mcp_server/
 COPY tests/ ./tests/
 COPY scripts/ ./scripts/
 # openapi/ogma-api.yaml is the contract source of truth (T4.0).
