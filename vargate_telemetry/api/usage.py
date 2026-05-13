@@ -517,7 +517,10 @@ def list_usage(
             ) AS cache_read_tokens,
             COALESCE(
                 SUM(COALESCE(
-                    (result->>'cache_creation_input_tokens')::bigint,
+                    -- Same NULLIF fix as the page + totals queries:
+                    -- the Pydantic default 0 must NOT mask the real
+                    -- nested cache_creation values.
+                    NULLIF((result->>'cache_creation_input_tokens')::bigint, 0),
                     ((result->'cache_creation')->>'ephemeral_5m_input_tokens')::bigint
                     + ((result->'cache_creation')->>'ephemeral_1h_input_tokens')::bigint,
                     0
