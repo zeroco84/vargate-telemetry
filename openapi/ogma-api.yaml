@@ -479,6 +479,115 @@ components:
           items:
             $ref: '#/components/schemas/SessionRecord'
 
+    UsageRow:
+      type: object
+      required:
+        - date
+        - input_tokens
+        - output_tokens
+        - cache_read_tokens
+        - cache_creation_tokens
+        - web_search_requests
+      description: |
+        One (date, workspace_id, model) breakdown of Admin API token
+        usage. Today's connector calls the Anthropic usage endpoint
+        without `group_by`, so `workspace_id` and `model` are
+        typically `null` (one row per active day). When a future
+        connector revision requests `group_by=[workspace_id, model]`,
+        days produce N rows; clients should not assume one row per
+        date.
+      properties:
+        date:
+          type: string
+          format: date
+          description: UTC date of the bucket.
+        workspace_id:
+          type: string
+          nullable: true
+          description: |
+            Anthropic workspace identifier. `null` when the connector
+            did not request a workspace-level breakdown.
+        model:
+          type: string
+          nullable: true
+          description: |
+            Model name (e.g., `claude-sonnet-4-5`). `null` when the
+            connector did not request a model-level breakdown.
+        input_tokens:
+          type: integer
+          format: int64
+        output_tokens:
+          type: integer
+          format: int64
+        cache_read_tokens:
+          type: integer
+          format: int64
+          description: Tokens read from prompt cache.
+        cache_creation_tokens:
+          type: integer
+          format: int64
+          description: Tokens written to prompt cache.
+        web_search_requests:
+          type: integer
+          format: int64
+          description: |
+            Count of Anthropic server-side web_search tool invocations
+            in the bucket. Anthropic bills these separately from
+            tokens; surfacing them avoids underreporting cost.
+
+    UsageTotals:
+      type: object
+      required:
+        - input_tokens
+        - output_tokens
+        - cache_read_tokens
+        - cache_creation_tokens
+        - web_search_requests
+        - row_count
+      description: |
+        Aggregates over the **full filtered set** (not just the
+        current page). Computing this client-side from page rows
+        would silently undercount on multi-page results.
+      properties:
+        input_tokens:
+          type: integer
+          format: int64
+        output_tokens:
+          type: integer
+          format: int64
+        cache_read_tokens:
+          type: integer
+          format: int64
+        cache_creation_tokens:
+          type: integer
+          format: int64
+        web_search_requests:
+          type: integer
+          format: int64
+        row_count:
+          type: integer
+          format: int64
+          description: |
+            Total rows across all pages. UI uses this to render
+            "showing 50 of 137" affordance.
+
+    UsageListResponse:
+      type: object
+      required: [rows, totals, next_cursor]
+      properties:
+        rows:
+          type: array
+          items:
+            $ref: '#/components/schemas/UsageRow'
+        totals:
+          $ref: '#/components/schemas/UsageTotals'
+        next_cursor:
+          type: string
+          nullable: true
+          description: |
+            Opaque cursor for the next page. `null` when no more.
+            Pass back as the `cursor` query param.
+
   # ─────────────────────────────────────────────────────────────────────────
   # Reusable response bodies — every 4xx / 5xx is an ErrorResponse.
   # ─────────────────────────────────────────────────────────────────────────
@@ -912,5 +1021,99 @@ paths:
           $ref: '#/components/responses/Unauthenticated'
         '404':
           $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /usage:
+    get:
+      tags: [usage]
+      summary: List Admin API token-usage rows for the authenticated tenant
+      description: |
+        Returns one row per (date, workspace_id, model) breakdown from
+        the Anthropic Admin API usage endpoint. The connector pulls
+        once per day per tenant; each row in the response is one
+        result-group inside one daily bucket (`metadata.results[idx]`
+        on a `record_type='usage'`, `source_api='admin'` record).
+
+        T5.5.5 invariant: only Admin API usage records contribute
+        here. Per-actor (developer-session) data lives in `/sessions`.
+
+        ## Totals
+        The `totals` object aggregates across the **entire filtered
+        set**, not just the current page — computing it client-side
+        from page rows would undercount on multi-page results.
+
+        ## Defaults
+        `since` defaults to 30 days before `until` so customers see
+        roughly "the last month" without thinking about it. `until`
+        defaults to today (UTC).
+
+        ## Pagination
+        Cursor-paginated, newest-first by `occurred_at` then by
+        record id then by result-group ordinality. Pass the
+        `next_cursor` from one response back as the `cursor` query
+        param on the next.
+
+        ## Not in T5.5.5
+        - `estimated_cost_usd`: today's connector calls the usage
+          endpoint without `group_by=model`, so model is null and
+          per-model pricing isn't computable. Tracked as a follow-up.
+        - Human-friendly workspace names: workspace_id is the vendor
+          opaque id; a Workspaces side table is owed.
+        - CSV export.
+      operationId: listUsage
+      parameters:
+        - in: query
+          name: cursor
+          schema:
+            type: string
+          description: Opaque cursor from a prior response's `next_cursor`.
+        - in: query
+          name: limit
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+        - in: query
+          name: since
+          schema:
+            type: string
+            format: date
+          description: Inclusive lower bound on bucket date (UTC). Defaults to 30 days before `until`.
+        - in: query
+          name: until
+          schema:
+            type: string
+            format: date
+          description: Inclusive upper bound on bucket date (UTC). Defaults to today.
+        - in: query
+          name: workspace_id
+          schema:
+            type: string
+          description: |
+            Filter to one workspace. When the connector did not
+            request a workspace breakdown, the only matching rows
+            are those with `workspace_id` literally equal to this
+            value (which is typically not what callers want).
+        - in: query
+          name: model
+          schema:
+            type: string
+          description: |
+            Filter to one model name (`claude-sonnet-4-5`,
+            `claude-opus-4-7`, etc.). Same caveat as `workspace_id`
+            when the connector did not request a model breakdown.
+      responses:
+        '200':
+          description: Usage rows page.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UsageListResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
         '500':
           $ref: '#/components/responses/InternalError'

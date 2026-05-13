@@ -28,6 +28,7 @@ from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from vargate_telemetry.api import auth as auth_routes
 from vargate_telemetry.api import onboarding as onboarding_routes
 from vargate_telemetry.api import sessions as sessions_routes
+from vargate_telemetry.api import usage as usage_routes
 
 # Side-effect import: registers the T4.7 onboarding instruments against
 # the default Prometheus registry at module-load time, so `/metrics`
@@ -74,6 +75,7 @@ def _build_app() -> FastAPI:
     app.include_router(auth_routes.router)
     app.include_router(onboarding_routes.router)
     app.include_router(sessions_routes.router)
+    app.include_router(usage_routes.router)
 
     @app.get("/_health", include_in_schema=False)
     def _health() -> dict:
