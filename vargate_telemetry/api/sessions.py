@@ -289,7 +289,10 @@ def _decode_list_cursor(cursor: str) -> tuple[datetime, str, str]:
 )
 def list_sessions(
     cursor: Optional[str] = Query(None),
-    limit: int = Query(50, ge=1, le=200),
+    # T5.5.7 raised the cap from 200 → 1000 so the chart strip can
+    # pull enough sessions to render a meaningful trend without a
+    # separate /chart endpoint (see vargate-frontend CLAUDE.md).
+    limit: int = Query(50, ge=1, le=1000),
     source_api: Optional[str] = Query(None),
     actor_key: Optional[str] = Query(None),
     since: Optional[date] = Query(None),

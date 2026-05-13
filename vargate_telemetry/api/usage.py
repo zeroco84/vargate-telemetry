@@ -213,7 +213,11 @@ _DEFAULT_LOOKBACK_DAYS = 30
 )
 def list_usage(
     cursor: Optional[str] = Query(None),
-    limit: int = Query(50, ge=1, le=200),
+    # T5.5.7 raised the cap from 200 → 1000 so chart fetches can pull
+    # ~30 days of per-model breakdown in one round-trip. Charts use
+    # the same /usage endpoint the table reads from — no separate
+    # /chart shape (see vargate-frontend CLAUDE.md).
+    limit: int = Query(50, ge=1, le=1000),
     since: Optional[date] = Query(None),
     until: Optional[date] = Query(None),
     workspace_id: Optional[str] = Query(None),
@@ -377,7 +381,14 @@ def list_usage(
             COALESCE((e.result->>'output_tokens')::bigint, 0) AS output_tokens,
             COALESCE((e.result->>'cache_read_input_tokens')::bigint, 0) AS cache_read_tokens,
             COALESCE(
-                (e.result->>'cache_creation_input_tokens')::bigint,
+                -- NULLIF: when the flat field is 0 (Pydantic default
+                -- because the group_by'd response shape DROPPED the
+                -- flat key entirely; UsageBreakdown.cache_creation_input_tokens
+                -- defaults to 0 → serializes as 0 even when the real
+                -- value is in the nested dict), fall through to the
+                -- nested sum. Without NULLIF, COALESCE picks the
+                -- non-null 0 and never reads the nested field.
+                NULLIF((e.result->>'cache_creation_input_tokens')::bigint, 0),
                 ((e.result->'cache_creation')->>'ephemeral_5m_input_tokens')::bigint
                 + ((e.result->'cache_creation')->>'ephemeral_1h_input_tokens')::bigint,
                 0
@@ -416,7 +427,7 @@ def list_usage(
             ) AS cache_read_tokens,
             COALESCE(
                 SUM(COALESCE(
-                    (result->>'cache_creation_input_tokens')::bigint,
+                    NULLIF((result->>'cache_creation_input_tokens')::bigint, 0),
                     ((result->'cache_creation')->>'ephemeral_5m_input_tokens')::bigint
                     + ((result->'cache_creation')->>'ephemeral_1h_input_tokens')::bigint,
                     0
