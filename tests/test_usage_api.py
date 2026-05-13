@@ -957,3 +957,124 @@ def test_list_usage_cache_creation_reads_nested_if_flat_missing(
     body = r.json()
     assert body["rows"][0]["cache_creation_tokens"] == 75_000  # 50k + 25k
     assert body["totals"]["cache_creation_tokens"] == 75_000
+
+
+def test_list_usage_cache_creation_nullif_falls_through_when_flat_is_zero(
+    clean_records: None,
+    clean_workspaces: None,
+    client: TestClient,
+) -> None:
+    """T5.5.7 regression pin: when the result blob has BOTH a flat
+    ``cache_creation_input_tokens: 0`` (Pydantic default) AND nested
+    real values, the SQL must use the nested sum. Without NULLIF the
+    COALESCE picks the non-null 0 and reports 0 cache creation —
+    silently understating cost and breaking the cache-efficiency
+    chart.
+
+    Real-data manifestation (founder's tnt_eu_38b3047725704cb1): the
+    T5.5.6 connector + Pydantic UsageBreakdown serialized
+    ``cache_creation_input_tokens: 0`` for every per-model row even
+    when ``cache_creation.ephemeral_5m_input_tokens`` was 305_716.
+    The bug hid ~$50 of real Sonnet cache-creation cost on Sera's
+    tenant across 90 days.
+    """
+    from vargate_telemetry.db import engine
+
+    tenant = "tnt_us_test_usage_cc_nullif"
+    metadata = {
+        "starting_at": "2026-05-11T00:00:00Z",
+        "ending_at": "2026-05-12T00:00:00Z",
+        "results": [
+            {
+                "workspace_id": None,
+                "model": "claude-sonnet-4-5-20250929",
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_read_input_tokens": 0,
+                # Flat field present BUT zero (the Pydantic default
+                # case that masks the nested value).
+                "cache_creation_input_tokens": 0,
+                "cache_creation": {
+                    "ephemeral_5m_input_tokens": 305_716,
+                    "ephemeral_1h_input_tokens": 0,
+                },
+                "server_tool_use": {"web_search_requests": 0},
+            }
+        ],
+    }
+    with engine.begin() as conn:
+        conn.execute(
+            sql_text(
+                """
+                INSERT INTO telemetry_records (
+                    tenant_id, record_type, source_api, external_id,
+                    occurred_at, content_hash, metadata,
+                    chain_seq, chain_prev_hash, chain_self_hash
+                ) VALUES (
+                    :t, 'usage', 'admin',
+                    'usage:2026-05-11T00:00:00Z:2026-05-12T00:00:00Z:claude-sonnet-4-5-20250929:-',
+                    '2026-05-11T00:00:00+00:00',
+                    decode('00' || repeat('0', 62), 'hex'),
+                    :metadata,
+                    (SELECT COALESCE(MAX(chain_seq), 0) + 1
+                       FROM telemetry_records WHERE tenant_id = :t2),
+                    decode('00' || repeat('0', 62), 'hex'),
+                    decode('11' || repeat('1', 62), 'hex')
+                )
+                """
+            ),
+            {
+                "t": tenant,
+                "t2": tenant,
+                "metadata": json.dumps(metadata),
+            },
+        )
+
+    r = client.get(
+        "/usage?since=2026-05-11&until=2026-05-11",
+        headers=_bearer_for_tenant(tenant),
+    )
+    body = r.json()
+    # NULLIF makes the flat 0 fall through to the nested sum.
+    assert body["rows"][0]["cache_creation_tokens"] == 305_716
+    assert body["totals"]["cache_creation_tokens"] == 305_716
+
+
+def test_list_usage_limit_1000_accepted(
+    clean_records: None,
+    clean_workspaces: None,
+    client: TestClient,
+) -> None:
+    """T5.5.7: chart fetches request limit=1000 so 30 days of
+    per-model breakdown lands in a single round-trip. The cap was 200
+    pre-T5.5.7; lifting it to 1000 is the no-parallel-chart-endpoint
+    contract."""
+    tenant = "tnt_us_test_usage_limit_1000"
+    _seed_usage_record(
+        tenant,
+        bucket_date=date(2026, 5, 11),
+        results=[
+            _result_group(
+                model="claude-sonnet-4-5-20250929", input_tokens=100
+            )
+        ],
+    )
+    r = client.get(
+        "/usage?since=2026-05-11&until=2026-05-11&limit=1000",
+        headers=_bearer_for_tenant(tenant),
+    )
+    assert r.status_code == 200, r.text
+
+
+def test_list_usage_limit_1001_rejected(
+    clean_records: None,
+    clean_workspaces: None,
+    client: TestClient,
+) -> None:
+    """Above-cap limit returns 422 (FastAPI's standard validation
+    response) so a runaway client can't drag back millions of rows."""
+    r = client.get(
+        "/usage?limit=1001",
+        headers=_bearer_for_tenant("tnt_us_test_limit_cap"),
+    )
+    assert r.status_code == 422, r.text

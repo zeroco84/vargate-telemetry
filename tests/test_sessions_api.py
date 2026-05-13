@@ -516,3 +516,24 @@ def test_list_sessions_rejects_invalid_source_api(
     )
     assert r.status_code == 400
     assert r.json()["detail"]["code"] == "invalid_source_api"
+
+
+def test_list_sessions_limit_1000_accepted(
+    clean_records: None, client: TestClient
+) -> None:
+    """T5.5.7: chart strip on /dashboard/sessions requests limit=1000
+    so the per-day trend has enough rows. Cap was 200 pre-T5.5.7."""
+    r = client.get(
+        "/sessions?limit=1000",
+        headers=_bearer_for_tenant("tnt_us_limit_1000"),
+    )
+    assert r.status_code == 200
+
+
+def test_list_sessions_limit_1001_rejected(client: TestClient) -> None:
+    """Above-cap is 422 — FastAPI's validation response."""
+    r = client.get(
+        "/sessions?limit=1001",
+        headers=_bearer_for_tenant("tnt_us_limit_cap"),
+    )
+    assert r.status_code == 422
