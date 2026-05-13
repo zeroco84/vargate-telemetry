@@ -12,6 +12,11 @@ import httpx
 import pytest
 from sqlalchemy import text as sql_text
 
+from fixtures.admin_api_handlers import (
+    empty_workspaces_response,
+    is_workspaces_request,
+    skip_workspaces,
+)
 from vargate_telemetry.anthropic import AnthropicAdminClient
 
 
@@ -31,14 +36,16 @@ def _stub_client(
     )
 
 
+@skip_workspaces
 def _two_bucket_handler(
     request: httpx.Request,
 ) -> httpx.Response:
-    """Returns two fixed-timestamp UsageBucket rows regardless of the window."""
-    # T5.5.6: pull_admin also calls /v1/organizations/workspaces. Short-
-    # circuit so the test's bucket-count assertions still apply.
-    if "/workspaces" in request.url.path:
-        return httpx.Response(200, json={"data": [], "has_more": False})
+    """Returns two fixed-timestamp UsageBucket rows regardless of the window.
+
+    ``@skip_workspaces`` shunts the T5.5.6 workspace-sync call to the
+    empty-envelope response so this handler only ever sees usage
+    requests.
+    """
     return httpx.Response(
         200,
         json={
@@ -175,10 +182,8 @@ def test_pull_handles_rate_limit_and_retries(
         # T5.5.6: skip the workspaces sync call from the count so
         # the 429-retry test pins the USAGE call's behavior, not
         # the workspace sync's.
-        if "/workspaces" in request.url.path:
-            return httpx.Response(
-                200, json={"data": [], "has_more": False}
-            )
+        if is_workspaces_request(request):
+            return empty_workspaces_response()
         call_count["n"] += 1
         if call_count["n"] < 3:
             return httpx.Response(

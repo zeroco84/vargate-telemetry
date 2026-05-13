@@ -27,16 +27,34 @@ and the test that reads it.
 WHAT IT DOES
 ============
 1. Validates the tenant exists in the `tenants` table.
-2. Refreshes `workspaces` rows for the tenant from the Admin API.
-3. Runs the standard `_backfill_admin_for_tenant(tenant_id,
+2. Optionally resets the `pull_state` cursor (``--reset-cursor``)
+   so the backfill walks the full ``--days`` window instead of
+   resuming from the steady-state cursor.
+3. Refreshes `workspaces` rows for the tenant from the Admin API.
+4. Runs the standard `_backfill_admin_for_tenant(tenant_id,
    days=days)` flow — which now passes `group_by=[model,
    workspace_id]` on every Anthropic call and emits per-breakdown
    `telemetry_records` rows.
-4. Prints counts on completion.
+5. Prints counts on completion.
 
 The script is idempotent: running it twice writes nothing new on
 the second run (every per-breakdown row dedups on its granular
 external_id).
+
+WHY ``--reset-cursor``
+======================
+The steady-state pull task advances the cursor every 15 minutes,
+so by the time you run this script post-T5.5.6-deploy the cursor
+is already pointing at "now". ``_backfill_admin_for_tenant`` uses
+``start = max(cursor, now-days)`` to avoid re-pulling the same
+window twice; that's the right behaviour for ordinary backfills
+but it makes a connector-upgrade backfill a no-op. Pass
+``--reset-cursor`` to delete the row before the run; the script
+re-creates it at the new HEAD when the backfill completes.
+
+T5.5.6 launch ran this manually (a `DELETE FROM pull_state ...`
+between two `--days=90` invocations). Codifying the flag here so
+the next connector upgrade is one command instead of two.
 """
 
 from __future__ import annotations
@@ -61,6 +79,16 @@ def main() -> int:
         type=int,
         default=90,
         help="History window in days. Default: 90.",
+    )
+    parser.add_argument(
+        "--reset-cursor",
+        action="store_true",
+        help=(
+            "DELETE the (tenant, 'admin') row from pull_state before "
+            "the backfill, forcing a full re-pull across the --days "
+            "window. Use after a connector upgrade where the steady-"
+            "state cursor would otherwise skip historical data."
+        ),
     )
     args = parser.parse_args()
 
@@ -90,7 +118,23 @@ def main() -> int:
         f"(region={row.region}, billing_status={row.billing_status})"
     )
 
-    # 2. Run the backfill. This already includes the workspace sync
+    # 2. Optionally reset the cursor so the backfill walks the full
+    # --days window rather than resuming from the steady-state head.
+    if args.reset_cursor:
+        with engine.begin() as conn:
+            deleted = conn.execute(
+                sql_text(
+                    "DELETE FROM pull_state "
+                    "WHERE tenant_id = :t AND source_api = 'admin'"
+                ),
+                {"t": args.tenant_id},
+            ).rowcount
+        print(
+            f"Reset cursor: {deleted} pull_state row(s) deleted. "
+            f"Next run will start at (now - {args.days} days)."
+        )
+
+    # 3. Run the backfill. This already includes the workspace sync
     # via _sync_workspaces called at the start.
     print(
         f"Running backfill — {args.days} days, group_by=[model, workspace_id]..."
