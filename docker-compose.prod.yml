@@ -58,3 +58,12 @@ services:
   celery-beat:
     mem_limit: 512m
     mem_reservation: 128m
+
+  # TM1 — Ogma MCP server. Host-binds to 127.0.0.1:8002 so nginx
+  # vhost mcp.ogma.vargate.ai can proxy 443 → here. Same pattern
+  # as gateway:8001 — localhost-only, nginx in front.
+  mcp-server:
+    ports:
+      - "127.0.0.1:8002:8000"
+    mem_limit: 512m
+    mem_reservation: 128m
