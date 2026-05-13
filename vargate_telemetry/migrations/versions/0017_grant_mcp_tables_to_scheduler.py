@@ -24,9 +24,15 @@ broaden ``vargate_scheduler`` with a blanket ``ALL TABLES IN SCHEMA``
 because that would defeat the role's "read-only on tenants" posture
 for the actual scheduler code.
 
-Revision ID: 0017_grant_mcp_tables_to_scheduler
+Revision ID: 0017_grant_mcp_scheduler
 Revises: 0016_mcp_oauth_tables
 Create Date: 2026-05-13 16:00:00.000000
+
+Note: the alembic_version.version_num column is varchar(32), so
+the revision ID itself is short; the file name is allowed to be
+longer because it isn't what gets persisted. Same trick 0012 uses
+(`0012_backfill_task_id` revision, `0012_add_backfill_task_id_
+to_tenants.py` filename).
 """
 
 from typing import Sequence, Union
@@ -34,7 +40,7 @@ from typing import Sequence, Union
 from alembic import op
 
 
-revision: str = "0017_grant_mcp_tables_to_scheduler"
+revision: str = "0017_grant_mcp_scheduler"
 down_revision: Union[str, None] = "0016_mcp_oauth_tables"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
