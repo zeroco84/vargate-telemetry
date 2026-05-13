@@ -14,6 +14,7 @@ behind nginx at ``mcp.ogma.vargate.ai``.
 """
 
 from __future__ import annotations
+from contextlib import asynccontextmanager
 
 import logging
 import os
@@ -27,8 +28,16 @@ from mcp_server.mcp.server import build_mcp_server
 
 _log = logging.getLogger(__name__)
 
-
 def _build_app() -> FastAPI:
+    # Build the FastMCP server first — its session_manager must be
+    # entered via lifespan before any /mcp request can be handled.
+    mcp = build_mcp_server()
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        async with mcp.session_manager.run():
+            yield
+
     app = FastAPI(
         title="Vargate Ogma MCP Server",
         description=(
@@ -41,6 +50,7 @@ def _build_app() -> FastAPI:
         docs_url=None,
         redoc_url=None,
         openapi_url=None,
+        lifespan=lifespan,
     )
 
     # CORS for the OAuth metadata endpoints — Claude's web client
@@ -67,16 +77,12 @@ def _build_app() -> FastAPI:
             in ("1", "true", "yes", "on"),
         }
 
-    # MCP surface — mounted as a sub-ASGI-app at /mcp. FastMCP
-    # handles all JSON-RPC framing, protocol-version negotiation,
-    # and tool dispatch.
-    mcp = build_mcp_server()
-    app.mount("/mcp", mcp.streamable_http_app())
+    # MCP surface — mounted at root since the MCP SDK's streamable_http_app
+    # already has its routes at /mcp. Our explicit APIRoutes (above) take
+    # precedence in the FastAPI route table.
+    app.mount("/", mcp.streamable_http_app())
 
-    if mcp.settings.host:  # log the configured surface for ops
-        _log.info(
-            "MCP server built; streamable_http mounted at /mcp"
-        )
+    _log.info("MCP server built; streamable_http mounted at /mcp")
     return app
 
 
