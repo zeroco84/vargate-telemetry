@@ -183,3 +183,67 @@ Ogma now has three ingest paths:
 | Compliance API | Enterprise + Compliance Access Key | Full chat/file/admin event metadata + content | Always-on once keyed |
 
 Position the MCP path as the universal-tier option. Recommend Compliance API for any tenant whose use case needs "every prompt and response, recorded."
+
+---
+
+## Production deploys via `docker compose build` need an SSH agent loaded in the current shell
+
+`docker compose build` of any service that runs `RUN --mount=type=ssh` (gateway, celery-worker, celery-beat — they all need it for `pip install vargate-audit-chain` from the private vargate-proxy repo) requires `SSH_AUTH_SOCK` to be set when the build runs. Without it:
+
+1. The build does NOT hard-fail. It silently falls back to using the previously-cached image layer with the OLD code.
+2. `docker compose up -d` then starts the OLD image. Containers report `(healthy)`.
+3. `alembic upgrade head` succeeds — but against the OLD schema-aware code, against the new migration files. Mismatch.
+4. New routes 404, new fields missing, the deploy looks successful and is broken.
+
+**The check for a successful deploy is `alembic current` showing the new revision, OR `docker compose exec gateway python -c "import <new_module>"`, NOT the absence of an error from `docker compose up`.** `su -` does NOT inherit ssh-agent; `sudo -u vargate` does NOT inherit ssh-agent. Use `sudo -u vargate -i bash -c 'eval $(ssh-agent -s) && ssh-add <key> && docker compose build ...'` to keep the agent alive in the same subshell as the build.
+
+---
+
+## Cloudflare Universal SSL covers ONE subdomain level only
+
+`*.vargate.ai` is covered by the free cert. `*.ogma.vargate.ai` (two-deep) is NOT. The failure mode is a TLS handshake error at the Cloudflare edge — origin never sees the request, certbot at origin can't help.
+
+Two ways to deploy a depth-≥2 subdomain:
+
+1. **DNS-only (grey cloud) in Cloudflare** — origin handles TLS via Let's Encrypt directly. We chose this for `mcp.ogma.vargate.ai`. Loses Cloudflare's DDoS layer for that hostname; fine for the API surface, would be bad for the marketing site.
+2. **Cloudflare Advanced Certificate Manager** — paid feature, $10/mo per zone for arbitrary-depth wildcards.
+
+Pre-deploy check for any new depth-≥2 subdomain: `curl -sI https://<host>/` from off-box, look for the TLS error. If it's a Cloudflare-edge error and not your origin's nginx, you hit the limit.
+
+---
+
+## MCP connector `resource` indicators are origin-level (RFC 8707), with trailing slash
+
+Anthropic's MCP client strips the path from the configured connector URL and sends only the origin as the `resource` value on `/authorize` and `/token` requests. Furthermore, it appends a trailing slash to the origin.
+
+So if you configure the connector at `https://mcp.ogma.vargate.ai/mcp`, Claude sends `resource=https://mcp.ogma.vargate.ai/`. The audience-binding comparison MUST be `.rstrip("/")` on both sides; string-equal is wrong and 401s every tool call. Don't try to use a path component (e.g. `/v1/mcp`) as part of the audience-binding identity — Anthropic will drop it.
+
+---
+
+## MCP capture: transparent framing or it doesn't fire
+
+For an "every-turn" MCP logging tool, Claude WILL refuse to call it (or quietly skip) if the framing in either the tool description OR the Project's custom-instructions implies hiding the call from the user. The words "invisible to user," "hidden," "without the user knowing," "silently" are all triggers — even when the user is the one writing them and asking for the logging.
+
+Frame as: "your organization uses [tool] for compliance auditing; the tool call is visible in this conversation; you should call it after every response." Claude's safety training correctly refuses the hidden-exfiltration shape, even with user consent — getting around that with prompt cleverness is both unethical and brittle. **Transparency is the only fix.**
+
+---
+
+## MCP feasibility-test checklist (catch the autodiscovery trap)
+
+When validating an "every-turn" tool call setup:
+
+1. **Connector installed at org level** (per-user installs don't work for the spike).
+2. **User-enabled per conversation** (defaults to off on each new thread).
+3. **Tool permission set to "Allow always"** ("Needs approval" produces gappy capture).
+4. **Transparent custom-instructions in the Project** (see framing rule above).
+5. **Verify the celery worker has the task registered** before declaring "no capture" a model issue:
+
+   ```
+   docker compose logs celery-worker | grep "tasks"
+   # expect to see e.g.:
+   #   . mcp_server.tasks.persist_event.persist_event
+   ```
+
+   If the task name is absent, autodiscovery is broken. `celery_app.include=["pkg.tasks"]` imports the package but does NOT recurse — `pkg/tasks/__init__.py` must explicitly `from pkg.tasks import <module>` for each submodule. Symptom: handler returns 200 to the client (logged via the fast path), but no row lands in Postgres and the worker raises `KeyError` in the broker log. Caught and fixed in TM1 — see `mcp_server/tasks/__init__.py`.
+
+The trap: every other layer can be working perfectly, and you'll still see zero capture if step 5 is broken — the model isn't the problem.
