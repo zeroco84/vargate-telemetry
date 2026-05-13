@@ -37,6 +37,10 @@ class SourceApi(str, enum.Enum):
     ADMIN = "admin"
     COMPLIANCE = "compliance"
     CODE_ANALYTICS = "code_analytics"
+    # TM1 — MCP connector telemetry. One row per `log_interaction`
+    # call from the Claude-side MCP client. The DB column is varchar
+    # (not enum), so adding the value here is the only wiring needed.
+    MCP = "mcp"
 
 
 class TelemetryRecordIn(BaseModel):
