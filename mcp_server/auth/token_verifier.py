@@ -174,7 +174,7 @@ class OgmaMcpTokenVerifier(TokenVerifier):
         # an attacker fabricated a row with our token_hash in the
         # other DB.
         expected = config.resource_indicator()
-        if row.resource != expected:
+        if row.resource.rstrip("/") != expected.rstrip("/"):
             _log.warning(
                 "token validator: resource mismatch token_hash=%s "
                 "got=%s expected=%s",
