@@ -83,6 +83,35 @@ Returns `None` when the model is `null` (legacy aggregate rows) or unknown — *
 
 ---
 
+## Connector-shape upgrades need a view-layer reconciliation, not a data wipe
+
+When a connector upgrade changes the shape of records it ingests (e.g., T5.5.6 added `group_by=[model, workspace_id]` and split one daily bucket into N per-model rows), the OLD pre-upgrade records stay in the database — the audit-chain principle is **never modify chain rows**. Both shapes coexist after the cutover.
+
+The dashboard view must reconcile them. Without reconciliation, totals double-count: the legacy aggregate row for day D carries the same tokens as the sum of the new per-model rows for day D. Customers see inflated spend and confusing duplicate rows.
+
+The fix is **filter at the API view, not the data layer**. Whenever a per-model row exists for `(tenant, date)`, hide the legacy aggregate rows for that same `(tenant, date)`. Days that have ONLY legacy data (pre-backfill state, or genuinely zero activity captured as an empty bucket) keep their legacy row so the view doesn't go blank.
+
+Pattern, in SQL:
+
+```sql
+AND NOT (
+    (result->>'model') IS NULL
+    AND EXISTS (
+        SELECT 1 FROM telemetry_records tr2,
+             jsonb_array_elements(tr2.metadata->'results') AS r2(result)
+        WHERE tr2.tenant_id = current_setting('app.tenant_id')
+          AND DATE(tr2.occurred_at AT TIME ZONE 'UTC') = DATE(tr.occurred_at AT TIME ZONE 'UTC')
+          AND (r2.result->>'model') IS NOT NULL
+    )
+)
+```
+
+Apply to **every** aggregating query on the same surface (page rows, totals, cost-by-model) — missing one shows up as inconsistent counters between the table and the totals row.
+
+T5.5.6 launch shipped without this filter and produced a Rick-facing screenshot of doubled "—" rows on every date that had per-model breakdowns. The fix is a four-line `NOT (null AND EXISTS ...)` clause applied to all three SQL queries. Don't repeat the regression on the next connector upgrade.
+
+---
+
 ## Tenant IDs in specs get re-verified before each task
 
 Sprint specs that reference a specific tenant ID (e.g., "backfill `tnt_eu_2f73d474ff0a489c`") MUST be re-verified at task start. Run:

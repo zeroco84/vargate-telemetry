@@ -280,6 +280,39 @@ def list_usage(
         ("AND " + " AND ".join(expanded_filters)) if expanded_filters else ""
     )
 
+    # T5.5.6: suppress legacy aggregate rows (model=null, ingested
+    # before the connector started passing group_by) on any date that
+    # ALSO has per-model breakdown rows. Both shapes coexist in
+    # ``telemetry_records`` because the per-model external_id format
+    # doesn't collide with the legacy external_id, so a re-pull
+    # writes new rows without disturbing the old ones — that's the
+    # right behaviour at the audit-chain layer, but the dashboard
+    # would otherwise double-count and confuse customers. Filter at
+    # the API view, not the data layer.
+    #
+    # The subquery EXISTS check is per-date: a date that has even one
+    # per-model row hides ALL of its legacy aggregates; a date that
+    # has only legacy rows (pre-backfill state, or genuinely zero
+    # activity recorded as an empty-results bucket) keeps them so
+    # the view doesn't go blank.
+    supersession_filter = """
+        AND NOT (
+            (r.result->>'model') IS NULL
+            AND EXISTS (
+                SELECT 1
+                FROM telemetry_records tr2,
+                     jsonb_array_elements(tr2.metadata->'results')
+                         AS r2(result)
+                WHERE tr2.tenant_id = current_setting('app.tenant_id')
+                  AND tr2.record_type = 'usage'
+                  AND tr2.source_api = 'admin'
+                  AND DATE(tr2.occurred_at AT TIME ZONE 'UTC')
+                      = DATE(tr.occurred_at AT TIME ZONE 'UTC')
+                  AND (r2.result->>'model') IS NOT NULL
+            )
+        )
+    """
+
     # Cursor filter — strictly after the cursor row in the sort order.
     # Sort: occurred_at DESC, record_id DESC, ordinality ASC.
     #
@@ -330,6 +363,7 @@ def list_usage(
             WHERE {base_where}
               {expanded_where}
               {cursor_clause}
+              {supersession_filter}
         )
         SELECT
             e.row_date,
@@ -371,6 +405,7 @@ def list_usage(
                      WITH ORDINALITY AS r(result, ordinality)
             WHERE {base_where}
               {expanded_where}
+              {supersession_filter}
         )
         SELECT
             COUNT(*) AS row_count,
@@ -458,6 +493,7 @@ def list_usage(
                      WITH ORDINALITY AS r(result, ordinality)
             WHERE {base_where}
               {expanded_where}
+              {supersession_filter}
         )
         SELECT
             result->>'model' AS model,
