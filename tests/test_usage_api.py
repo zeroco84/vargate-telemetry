@@ -577,3 +577,269 @@ def test_list_usage_excludes_code_analytics_records(
     assert len(body["rows"]) == 1
     assert body["rows"][0]["input_tokens"] == 100  # not 9999
     assert body["totals"]["input_tokens"] == 100
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# T5.5.6: cost computation + workspace name resolution
+# ───────────────────────────────────────────────────────────────────────────
+
+
+def _seed_workspace(tenant_id: str, workspace_id: str, name: str) -> None:
+    from vargate_telemetry.db import engine
+
+    with engine.begin() as conn:
+        conn.execute(
+            sql_text(
+                """
+                INSERT INTO workspaces (tenant_id, workspace_id, name)
+                VALUES (:t, :w, :n)
+                ON CONFLICT (tenant_id, workspace_id)
+                DO UPDATE SET name = EXCLUDED.name
+                """
+            ),
+            {"t": tenant_id, "w": workspace_id, "n": name},
+        )
+
+
+@pytest.fixture
+def clean_workspaces() -> Iterator[None]:
+    from vargate_telemetry.db import engine
+
+    with engine.begin() as conn:
+        conn.execute(sql_text("TRUNCATE TABLE workspaces"))
+    yield
+    with engine.begin() as conn:
+        conn.execute(sql_text("TRUNCATE TABLE workspaces"))
+
+
+def test_list_usage_populates_cost_for_known_model(
+    clean_records: None,
+    clean_workspaces: None,
+    client: TestClient,
+) -> None:
+    """A Sonnet 4.5 breakdown row gets ``estimated_cost_usd`` filled in
+    from the rate card; totals carry ``total_cost_usd`` over the
+    aggregated set."""
+    tenant = "tnt_us_test_usage_cost"
+    _seed_usage_record(
+        tenant,
+        bucket_date=date(2026, 5, 11),
+        results=[
+            _result_group(
+                model="claude-sonnet-4-5-20250929",
+                input_tokens=180_593,
+                output_tokens=26_235,
+                cache_read=689_700,
+                cache_creation=0,
+            )
+        ],
+    )
+
+    r = client.get(
+        "/usage?since=2026-05-11&until=2026-05-11",
+        headers=_bearer_for_tenant(tenant),
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    row = body["rows"][0]
+    # Expected: input 0.541779 + output 0.393525 + cache_read 0.206910
+    # = 1.142214. Pydantic serializes Decimal as a string.
+    assert row["estimated_cost_usd"] == "1.142214"
+
+    # Totals cost rounds to 2 decimals.
+    assert body["totals"]["total_cost_usd"] == "1.14"
+    assert body["totals"]["rows_without_cost"] == 0
+
+
+def test_list_usage_null_model_leaves_cost_null(
+    clean_records: None,
+    clean_workspaces: None,
+    client: TestClient,
+) -> None:
+    """Legacy aggregate rows (model=null) leave estimated_cost_usd as
+    null and bump rows_without_cost. Historical records DON'T DISAPPEAR
+    just because we can't compute their cost — the API still returns
+    them."""
+    tenant = "tnt_us_test_usage_null_model"
+    _seed_usage_record(
+        tenant,
+        bucket_date=date(2026, 5, 11),
+        results=[_result_group(model=None, input_tokens=1000)],
+    )
+
+    r = client.get(
+        "/usage?since=2026-05-11&until=2026-05-11",
+        headers=_bearer_for_tenant(tenant),
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert len(body["rows"]) == 1
+    assert body["rows"][0]["estimated_cost_usd"] is None
+    assert body["totals"]["total_cost_usd"] is None
+    assert body["totals"]["rows_without_cost"] == 1
+
+
+def test_list_usage_mixed_known_and_unknown_models(
+    clean_records: None,
+    clean_workspaces: None,
+    client: TestClient,
+) -> None:
+    """A bucket with both a costed and an unkown-model row returns a
+    total that's a FLOOR (rows_without_cost > 0). UI uses this signal
+    to show '≥ $X' rather than '$X exactly'."""
+    tenant = "tnt_us_test_usage_mixed_cost"
+    _seed_usage_record(
+        tenant,
+        bucket_date=date(2026, 5, 11),
+        results=[
+            _result_group(
+                model="claude-sonnet-4-5-20250929",
+                input_tokens=1_000_000,  # → $3.00
+                output_tokens=0,
+                cache_read=0,
+                cache_creation=0,
+            ),
+            _result_group(
+                model=None,
+                input_tokens=999_999,
+            ),
+        ],
+    )
+
+    r = client.get(
+        "/usage?since=2026-05-11&until=2026-05-11",
+        headers=_bearer_for_tenant(tenant),
+    )
+    body = r.json()
+    assert body["totals"]["total_cost_usd"] == "3.00"
+    assert body["totals"]["rows_without_cost"] == 1
+
+
+def test_list_usage_resolves_workspace_name(
+    clean_records: None,
+    clean_workspaces: None,
+    client: TestClient,
+) -> None:
+    """``workspaces`` row populated → Usage row carries ``workspace_name``."""
+    tenant = "tnt_us_test_usage_wsname"
+    _seed_workspace(tenant, "wrkspc_a", "Engineering")
+    _seed_usage_record(
+        tenant,
+        bucket_date=date(2026, 5, 11),
+        results=[
+            _result_group(
+                workspace_id="wrkspc_a",
+                model="claude-sonnet-4-5-20250929",
+                input_tokens=100,
+            )
+        ],
+    )
+
+    r = client.get(
+        "/usage?since=2026-05-11&until=2026-05-11",
+        headers=_bearer_for_tenant(tenant),
+    )
+    assert r.status_code == 200
+    body = r.json()
+    row = body["rows"][0]
+    assert row["workspace_id"] == "wrkspc_a"
+    assert row["workspace_name"] == "Engineering"
+
+
+def test_list_usage_unresolved_workspace_returns_null_name(
+    clean_records: None,
+    clean_workspaces: None,
+    client: TestClient,
+) -> None:
+    """Workspace ID present but no matching row in `workspaces` → name
+    is null. UI falls back to rendering the raw ID."""
+    tenant = "tnt_us_test_usage_unresolved"
+    _seed_usage_record(
+        tenant,
+        bucket_date=date(2026, 5, 11),
+        results=[
+            _result_group(
+                workspace_id="wrkspc_unknown",
+                model="claude-sonnet-4-5-20250929",
+            )
+        ],
+    )
+
+    r = client.get(
+        "/usage?since=2026-05-11&until=2026-05-11",
+        headers=_bearer_for_tenant(tenant),
+    )
+    body = r.json()
+    row = body["rows"][0]
+    assert row["workspace_id"] == "wrkspc_unknown"
+    assert row["workspace_name"] is None
+
+
+def test_list_usage_cache_creation_reads_nested_if_flat_missing(
+    clean_records: None,
+    clean_workspaces: None,
+    client: TestClient,
+) -> None:
+    """T5.5.6 group_by'd response drops the flat
+    ``cache_creation_input_tokens`` field and only ships the nested
+    ``cache_creation.{ephemeral_5m, ephemeral_1h}``. The Usage API
+    falls back to the nested sum when the flat field is missing."""
+    tenant = "tnt_us_test_usage_nested_cache"
+    # Manually seed a record whose result has NO flat cache_creation
+    # field — only the nested dict.
+    from vargate_telemetry.db import engine
+
+    metadata = {
+        "starting_at": "2026-05-11T00:00:00Z",
+        "ending_at": "2026-05-12T00:00:00Z",
+        "results": [
+            {
+                "workspace_id": None,
+                "model": "claude-sonnet-4-5-20250929",
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "cache_creation": {
+                    "ephemeral_5m_input_tokens": 50_000,
+                    "ephemeral_1h_input_tokens": 25_000,
+                },
+                "server_tool_use": {"web_search_requests": 0},
+                # NOTE: no cache_creation_input_tokens flat field
+            }
+        ],
+    }
+    with engine.begin() as conn:
+        conn.execute(
+            sql_text(
+                """
+                INSERT INTO telemetry_records (
+                    tenant_id, record_type, source_api, external_id,
+                    occurred_at, content_hash, metadata,
+                    chain_seq, chain_prev_hash, chain_self_hash
+                ) VALUES (
+                    :t, 'usage', 'admin',
+                    'usage:2026-05-11T00:00:00Z:2026-05-12T00:00:00Z:claude-sonnet-4-5-20250929:-',
+                    '2026-05-11T00:00:00+00:00',
+                    decode('00' || repeat('0', 62), 'hex'),
+                    :metadata,
+                    (SELECT COALESCE(MAX(chain_seq), 0) + 1
+                       FROM telemetry_records WHERE tenant_id = :t2),
+                    decode('00' || repeat('0', 62), 'hex'),
+                    decode('11' || repeat('1', 62), 'hex')
+                )
+                """
+            ),
+            {
+                "t": tenant,
+                "t2": tenant,
+                "metadata": json.dumps(metadata),
+            },
+        )
+
+    r = client.get(
+        "/usage?since=2026-05-11&until=2026-05-11",
+        headers=_bearer_for_tenant(tenant),
+    )
+    body = r.json()
+    assert body["rows"][0]["cache_creation_tokens"] == 75_000  # 50k + 25k
+    assert body["totals"]["cache_creation_tokens"] == 75_000

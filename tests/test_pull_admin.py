@@ -35,6 +35,10 @@ def _two_bucket_handler(
     request: httpx.Request,
 ) -> httpx.Response:
     """Returns two fixed-timestamp UsageBucket rows regardless of the window."""
+    # T5.5.6: pull_admin also calls /v1/organizations/workspaces. Short-
+    # circuit so the test's bucket-count assertions still apply.
+    if "/workspaces" in request.url.path:
+        return httpx.Response(200, json={"data": [], "has_more": False})
     return httpx.Response(
         200,
         json={
@@ -168,6 +172,13 @@ def test_pull_handles_rate_limit_and_retries(
     call_count = {"n": 0}
 
     def handler(request: httpx.Request) -> httpx.Response:
+        # T5.5.6: skip the workspaces sync call from the count so
+        # the 429-retry test pins the USAGE call's behavior, not
+        # the workspace sync's.
+        if "/workspaces" in request.url.path:
+            return httpx.Response(
+                200, json={"data": [], "has_more": False}
+            )
         call_count["n"] += 1
         if call_count["n"] < 3:
             return httpx.Response(

@@ -40,7 +40,7 @@ import json
 import logging
 import os
 from datetime import datetime, timedelta, timezone
-from typing import Callable, Optional
+from typing import Callable, Iterator, Optional
 
 from sqlalchemy import text as sql_text
 from sqlalchemy.exc import IntegrityError
@@ -154,30 +154,122 @@ def _save_cursor(
     )
 
 
-def _normalize_usage(bucket: UsageBucket) -> dict:
-    """Turn one UsageBucket into telemetry_records insert kwargs.
+def _sync_workspaces(
+    tenant_id: str, client: AnthropicAdminClient
+) -> int:
+    """Upsert workspace names for this tenant from the Admin API.
 
-    `external_id` is keyed off the bucket window so a re-pull of an
-    already-ingested window dedups on insert via the UNIQUE constraint.
-    `content_hash` is a SHA-256 over the canonical JSON of the whole
-    bucket, so a refresh that changes nested `results` content surfaces
-    as a hash mismatch even though the external_id matches.
+    Called once at the start of each pull / backfill so the Usage
+    view can resolve ``workspace_id`` → ``name``. Failures don't
+    block the usage pull — workspaces are display-only and a missing
+    name just renders the raw ID. Returns the count of workspaces
+    seen (for diagnostics; not a hard contract).
+
+    Idempotent: the underlying ``ON CONFLICT`` upsert means re-running
+    the sync is a no-op when names haven't changed.
+    """
+    try:
+        rows = list(client.list_workspaces())
+    except Exception:  # pragma: no cover — logged, soft-fail
+        _log.exception(
+            "_sync_workspaces: list_workspaces failed for %s", tenant_id
+        )
+        return 0
+
+    if not rows:
+        return 0
+
+    with session_scope(tenant_id) as s:
+        for ws in rows:
+            s.execute(
+                sql_text(
+                    """
+                    INSERT INTO workspaces (tenant_id, workspace_id, name)
+                    VALUES (:tenant_id, :workspace_id, :name)
+                    ON CONFLICT (tenant_id, workspace_id)
+                    DO UPDATE SET name = EXCLUDED.name, updated_at = now()
+                    """
+                ),
+                {
+                    "tenant_id": tenant_id,
+                    "workspace_id": ws.id,
+                    "name": ws.name,
+                },
+            )
+    return len(rows)
+
+
+def _normalize_usage(bucket: UsageBucket) -> Iterator[dict]:
+    """Yield one telemetry_records insert kwargs per (bucket, breakdown).
+
+    T5.5.6 splits a single ``UsageBucket`` into N records — one per
+    ``results[i]`` breakdown row — so per-(date, model, workspace_id)
+    cost computation, dedup, and audit-chain granularity all line up
+    with what the Usage view renders. The earlier shape stored the
+    whole bucket as one record with ``metadata.results`` carrying the
+    breakdown array; that worked for tabular display via
+    ``jsonb_array_elements`` but suppressed dedup at the granular
+    level (a re-pull of a changed breakdown couldn't write a new row
+    because the bucket-level external_id was unchanged).
+
+    ``external_id`` format: ``usage:{starting_at}:{ending_at}:{model_or_-}:{workspace_or_-}``.
+    The ``-`` sentinel covers two cases: (a) bucket-grain rows from
+    pre-T5.5.6 ingest (model/workspace null because no ``group_by``);
+    (b) per-bucket aggregate rows that Anthropic still emits alongside
+    breakdowns when ``model=null`` group entries exist (see
+    ``test_list_usage_accepts_null_model_in_breakdown``).
+
+    ``content_hash`` is SHA-256 over the canonical JSON of the
+    per-breakdown wrapper ``{starting_at, ending_at, results:
+    [single_breakdown]}`` — refreshing one breakdown's token counts
+    changes that record's hash without disturbing siblings.
+
+    Empty-results buckets (days the org had no API usage) still emit
+    one sentinel record per bucket so the cursor advances and we don't
+    re-pull the same empty day forever. The sentinel uses
+    ``model=-,workspace=-`` and an empty results array.
     """
     bucket_dict = bucket.model_dump(mode="json")
-    canonical = json.dumps(
-        bucket_dict, sort_keys=True, separators=(",", ":")
-    ).encode("utf-8")
-    return {
-        "record_type": "usage",
-        "source_api": SOURCE_API_ADMIN,
-        "external_id": (
-            f"usage:{bucket.starting_at.isoformat()}:"
-            f"{bucket.ending_at.isoformat()}"
-        ),
-        "occurred_at": bucket.starting_at,
-        "content_hash": hashlib.sha256(canonical).digest(),
-        "record_metadata": bucket_dict,
+    start_iso = bucket.starting_at.isoformat()
+    end_iso = bucket.ending_at.isoformat()
+    bucket_window = {
+        "starting_at": bucket_dict.get("starting_at"),
+        "ending_at": bucket_dict.get("ending_at"),
     }
+
+    if not bucket.results:
+        sub_meta = {**bucket_window, "results": []}
+        canonical = json.dumps(
+            sub_meta, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        yield {
+            "record_type": "usage",
+            "source_api": SOURCE_API_ADMIN,
+            "external_id": f"usage:{start_iso}:{end_iso}:-:-",
+            "occurred_at": bucket.starting_at,
+            "content_hash": hashlib.sha256(canonical).digest(),
+            "record_metadata": sub_meta,
+        }
+        return
+
+    for breakdown in bucket.results:
+        breakdown_dict = breakdown.model_dump(mode="json")
+        model_key = breakdown.model or "-"
+        ws_key = breakdown.workspace_id or "-"
+        sub_meta = {**bucket_window, "results": [breakdown_dict]}
+        canonical = json.dumps(
+            sub_meta, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        yield {
+            "record_type": "usage",
+            "source_api": SOURCE_API_ADMIN,
+            "external_id": (
+                f"usage:{start_iso}:{end_iso}:{model_key}:{ws_key}"
+            ),
+            "occurred_at": bucket.starting_at,
+            "content_hash": hashlib.sha256(canonical).digest(),
+            "record_metadata": sub_meta,
+        }
 
 
 def _pull_admin_for_tenant(
@@ -207,24 +299,29 @@ def _pull_admin_for_tenant(
     inserted = 0
     deduped = 0
     try:
+        # T5.5.6: refresh workspace names so the Usage view can
+        # resolve workspace_id → human name. Soft-fail; doesn't
+        # block usage ingestion.
+        _sync_workspaces(tenant_id, client)
+
         for bucket in client.list_usage(
             starting_at=starting_at,
             ending_at=pull_started,
         ):
-            fields = _normalize_usage(bucket)
-            try:
-                append_telemetry_record(tenant_id, **fields)
-                increment(tenant_id, "usage")
-                inserted += 1
-            except IntegrityError:
-                # Dedup hit on (tenant, source_api, external_id) UNIQUE.
-                # Expected for re-pulls of an already-ingested window.
-                deduped += 1
-                _log.info(
-                    "pull_admin: dedup hit for %s/%s",
-                    tenant_id,
-                    fields["external_id"],
-                )
+            for fields in _normalize_usage(bucket):
+                try:
+                    append_telemetry_record(tenant_id, **fields)
+                    increment(tenant_id, "usage")
+                    inserted += 1
+                except IntegrityError:
+                    # Dedup hit on (tenant, source_api, external_id) UNIQUE.
+                    # Expected for re-pulls of an already-ingested window.
+                    deduped += 1
+                    _log.info(
+                        "pull_admin: dedup hit for %s/%s",
+                        tenant_id,
+                        fields["external_id"],
+                    )
 
         # 3. Advance the cursor on success.
         with session_scope(tenant_id) as s:
@@ -317,6 +414,11 @@ def _backfill_admin_for_tenant(
     chunks_processed = 0
 
     try:
+        # T5.5.6: refresh workspace names so the Usage view can
+        # resolve workspace_id → human name. Once per backfill is
+        # enough — they don't change between chunks.
+        _sync_workspaces(tenant_id, client)
+
         chunk_start = start
         while chunk_start < now:
             chunk_end = min(chunk_start + timedelta(days=chunk_days), now)
@@ -325,13 +427,13 @@ def _backfill_admin_for_tenant(
                 starting_at=chunk_start,
                 ending_at=chunk_end,
             ):
-                fields = _normalize_usage(bucket)
-                try:
-                    append_telemetry_record(tenant_id, **fields)
-                    increment(tenant_id, "usage")
-                    inserted += 1
-                except IntegrityError:
-                    deduped += 1
+                for fields in _normalize_usage(bucket):
+                    try:
+                        append_telemetry_record(tenant_id, **fields)
+                        increment(tenant_id, "usage")
+                        inserted += 1
+                    except IntegrityError:
+                        deduped += 1
 
             # Cursor advances chunk-by-chunk so a later crash resumes
             # cleanly from this point.

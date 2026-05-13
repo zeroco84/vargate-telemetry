@@ -71,6 +71,11 @@ def test_backfill_chunks_respect_window(clean_backfill_state: None) -> None:
     seen_windows: list[tuple[str, str]] = []
 
     def tracking_handler(request: httpx.Request) -> httpx.Response:
+        # T5.5.6: backfill also hits /v1/organizations/workspaces.
+        # Don't count those against the 7-day-window tracker —
+        # `seen_windows` pins the usage-endpoint windows only.
+        if "/workspaces" in request.url.path:
+            return _empty_data_handler(request)
         seen_windows.append(
             (
                 request.url.params["starting_at"],
@@ -120,6 +125,12 @@ def test_backfill_resumes_after_crash(clean_backfill_state: None) -> None:
     call_count = {"n": 0}
 
     def crashing_handler(request: httpx.Request) -> httpx.Response:
+        # T5.5.6: backfill calls /v1/organizations/workspaces once at
+        # start. Don't count that against the crash trigger — the
+        # test pins behavior at chunk granularity, not HTTP-call
+        # granularity.
+        if "/workspaces" in request.url.path:
+            return _empty_data_handler(request)
         call_count["n"] += 1
         if call_count["n"] == 3:
             raise httpx.NetworkError("simulated mid-backfill crash")
@@ -166,6 +177,11 @@ def test_backfill_resumes_after_crash(clean_backfill_state: None) -> None:
     seen_windows: list[tuple[str, str]] = []
 
     def tracking_handler(request: httpx.Request) -> httpx.Response:
+        # T5.5.6: backfill also hits /v1/organizations/workspaces.
+        # Don't count those against the 7-day-window tracker —
+        # `seen_windows` pins the usage-endpoint windows only.
+        if "/workspaces" in request.url.path:
+            return _empty_data_handler(request)
         seen_windows.append(
             (
                 request.url.params["starting_at"],
