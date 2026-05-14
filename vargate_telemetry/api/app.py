@@ -26,6 +26,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 from vargate_telemetry.api import auth as auth_routes
+from vargate_telemetry.api import budgets as budgets_routes
 from vargate_telemetry.api import mcp_bridge as mcp_bridge_routes
 from vargate_telemetry.api import onboarding as onboarding_routes
 from vargate_telemetry.api import sessions as sessions_routes
@@ -78,6 +79,8 @@ def _build_app() -> FastAPI:
     app.include_router(onboarding_routes.router)
     app.include_router(sessions_routes.router)
     app.include_router(usage_routes.router)
+    # TM3 Phase B2: /api/budgets + /api/budget-alerts CRUD.
+    app.include_router(budgets_routes.router)
     # TM2 Phase B1: /.well-known/ogma-public-key.json — public JWK
     # the MCP server fetches at boot to verify bridge JWTs.
     app.include_router(well_known_routes.router)
