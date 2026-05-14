@@ -109,6 +109,55 @@ os.environ["DATABASE_URL"] = _test_url
 
 
 # ───────────────────────────────────────────────────────────────────────────
+# Module-load step 2: TM2 — bridge JWT keypair for tests.
+# Runs before any test imports vargate_telemetry.auth.bridge_keys.
+# Generates a fresh ECDSA P-256 keypair into a tmp path, sets the
+# env var pair the loader reads. The keypair lives in /tmp and is
+# orphaned at session end — the OS reaps it.
+# ───────────────────────────────────────────────────────────────────────────
+
+import tempfile  # noqa: E402
+
+from cryptography.hazmat.primitives import serialization  # noqa: E402
+from cryptography.hazmat.primitives.asymmetric import ec  # noqa: E402
+
+
+_test_bridge_key_dir = tempfile.mkdtemp(prefix="ogma-bridge-test-")
+_test_bridge_key_path = os.path.join(
+    _test_bridge_key_dir, "bridge_jwt_private.pem"
+)
+_test_bridge_private = ec.generate_private_key(ec.SECP256R1())
+_test_bridge_pem = _test_bridge_private.private_bytes(
+    encoding=serialization.Encoding.PEM,
+    format=serialization.PrivateFormat.PKCS8,
+    encryption_algorithm=serialization.NoEncryption(),
+)
+with open(_test_bridge_key_path, "wb") as _f:
+    _f.write(_test_bridge_pem)
+os.chmod(_test_bridge_key_path, 0o600)
+
+# Override unconditionally — docker-compose may have set
+# OGMA_BRIDGE_JWT_PRIVATE_KEY_PATH to /run/secrets/... (the
+# bind-mounted dev keypair) for the runtime app, but tests must
+# use the freshly-generated tmp keypair so the kid is predictable
+# (`ogma-bridge-test`) and the file lifecycle is owned by the
+# test session.
+os.environ["OGMA_BRIDGE_JWT_PRIVATE_KEY_PATH"] = _test_bridge_key_path
+os.environ["OGMA_BRIDGE_JWT_KID"] = "ogma-bridge-test"
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Module-load step 3: TM2 — opt the test suite out of the production
+# spike-mode guard. Production must NOT set this; its presence in a
+# prod env is itself a bug (see mcp_server.config.assert_spike_mode_safe).
+# Tests use the bypass so monkeypatch.setenv("MCP_SPIKE_MODE", ...) blocks
+# inside individual cases don't get rejected at module import.
+# ───────────────────────────────────────────────────────────────────────────
+
+os.environ["MCP_ALLOW_SPIKE_MODE_FOR_TESTING"] = "1"
+
+
+# ───────────────────────────────────────────────────────────────────────────
 # Test-DB bootstrap helpers
 # ───────────────────────────────────────────────────────────────────────────
 

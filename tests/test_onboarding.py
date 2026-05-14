@@ -309,6 +309,10 @@ def test_validate_key_returns_capabilities_for_valid_key(
         # T5.4: real probe replaces the previous hardcoded False.
         # Stub returns 200 → True.
         "code_analytics": True,
+        # TM1: mcp_connector is False until the tenant gets at least
+        # one telemetry_records row with source_api='mcp'. This test
+        # tenant has none, so False is the expected resting state.
+        "mcp_connector": False,
     }
     # T5.4: validate_key probes list_workspaces + list_activities +
     # list_code_analytics. list_members is no longer called from this
@@ -405,6 +409,8 @@ def test_validate_key_returns_partial_capabilities_when_activity_feed_unavailabl
         # gates only activity_feed, so code_analytics still fires
         # True. Mirrors the real Personal-plan test org's shape.
         "code_analytics": True,
+        # TM1: same resting-state — no MCP rows for this test tenant.
+        "mcp_connector": False,
     }
 
 
