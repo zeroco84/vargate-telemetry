@@ -22,11 +22,20 @@ import os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from mcp_server import config
 from mcp_server.auth.oauth_routes import router as oauth_router
 from mcp_server.mcp.server import build_mcp_server
 
 
 _log = logging.getLogger(__name__)
+
+
+# TM2 Phase A3: refuse to boot if MCP_SPIKE_MODE leaks into a
+# production environment. Raises before any port is bound or
+# FastAPI app is constructed — uvicorn surfaces the RuntimeError
+# at process start so a misconfigured .env never serves traffic.
+config.assert_spike_mode_safe()
+
 
 def _build_app() -> FastAPI:
     # Build the FastMCP server first — its session_manager must be

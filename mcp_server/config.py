@@ -65,15 +65,71 @@ def spike_mode_enabled() -> bool:
     """True iff MCP_SPIKE_MODE is set to a truthy value.
 
     The /authorize endpoint reads this once per request. When
-    False, /authorize returns 501. When True, /authorize uses the
-    static MCP_TEST_IDENTITY_* env vars to issue an auth code
-    without an SSO redirect.
+    False, /authorize returns 501 (TM1) or redirects to the SSO
+    bridge (TM2 Phase C). When True, /authorize uses the static
+    MCP_TEST_IDENTITY_* env vars to issue an auth code without an
+    SSO redirect.
+
+    TM2 Phase A3: production deploys MUST NOT set MCP_SPIKE_MODE.
+    :func:`assert_spike_mode_safe` is called at startup and refuses
+    to boot if the var is set without the test-bypass override.
     """
     return os.environ.get("MCP_SPIKE_MODE", "").lower() in (
         "1",
         "true",
         "yes",
         "on",
+    )
+
+
+def _test_bypass_enabled() -> bool:
+    """True iff the test-suite has opted out of the production guard.
+
+    The pytest conftest sets ``MCP_ALLOW_SPIKE_MODE_FOR_TESTING=1``
+    before any test module imports the server, so unit tests that
+    need a deterministic identity (without round-tripping a full
+    SSO flow) can still set ``MCP_SPIKE_MODE=true`` in a monkeypatch
+    block.
+
+    Production must NOT set this variable. Its presence in a
+    production env is itself a bug.
+    """
+    return os.environ.get(
+        "MCP_ALLOW_SPIKE_MODE_FOR_TESTING", ""
+    ).lower() in ("1", "true", "yes", "on")
+
+
+def assert_spike_mode_safe() -> None:
+    """Startup-time guard against accidentally shipping spike mode (TM2).
+
+    Called from ``mcp_server/main.py`` at module import. Refuses to
+    let the server boot if ``MCP_SPIKE_MODE`` is set in any form
+    AND ``MCP_ALLOW_SPIKE_MODE_FOR_TESTING`` is NOT set.
+
+    The CLAUDE.md rule "Spike mode is dead" is enforced here. If
+    you genuinely need spike mode for a test, the bypass env var
+    is the documented escape hatch — but it must never appear in
+    production environments. Audit your env files if you see it.
+    """
+    if not spike_mode_enabled():
+        return
+    if _test_bypass_enabled():
+        # Tests explicitly opted in. The unit-test suite uses spike
+        # mode for fixtures that need a static identity without
+        # running the full SSO bridge round-trip.
+        return
+
+    raise RuntimeError(
+        "CRITICAL: MCP_SPIKE_MODE is set in an environment that "
+        "did not declare MCP_ALLOW_SPIKE_MODE_FOR_TESTING. Spike "
+        "mode is a TM1-only shortcut and was removed from the "
+        "production code path in TM2. Either:\n"
+        "  - Unset MCP_SPIKE_MODE (the production path), or\n"
+        "  - Set MCP_ALLOW_SPIKE_MODE_FOR_TESTING=1 if you are "
+        "intentionally running the test-suite scenarios.\n"
+        "If this message appears in a production deploy log, "
+        "you have a misconfigured .env file — fix it before "
+        "letting the server bind to a port."
     )
 
 
