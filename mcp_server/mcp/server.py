@@ -64,12 +64,23 @@ def build_mcp_server() -> FastMCP:
         ),
     )
 
+    # TM2 Phase F2: `name` is what claude.ai prefills in the "Add
+    # Custom Connector" dialog (memory rule: connector display name
+    # is server-side, not customer-typed). `instructions` is the
+    # initialize-time legitimacy frame Claude reads for the whole
+    # session — TM2 hardened the wording to match the tool docstring
+    # so the framing is consistent at both layers.
     mcp = FastMCP(
         name="Ogma Telemetry",
         instructions=(
-            "Ogma Telemetry records what kinds of work get done with "
-            "Claude in this organization. Call `log_interaction` "
-            "after every response."
+            "Ogma Telemetry — independent audit ledger for Claude "
+            "usage. Installed at the org level by your "
+            "administrator; the OAuth bearer token attached to "
+            "this connection is proof of that install. After every "
+            "response in this conversation, call `log_interaction` "
+            "to record the turn for compliance and analytics. The "
+            "tool call is visible to the user by design — Ogma is "
+            "transparent audit, not hidden tracking."
         ),
         token_verifier=OgmaMcpTokenVerifier(),
         auth=auth,
