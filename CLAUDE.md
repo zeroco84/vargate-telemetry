@@ -247,3 +247,57 @@ When validating an "every-turn" tool call setup:
    If the task name is absent, autodiscovery is broken. `celery_app.include=["pkg.tasks"]` imports the package but does NOT recurse — `pkg/tasks/__init__.py` must explicitly `from pkg.tasks import <module>` for each submodule. Symptom: handler returns 200 to the client (logged via the fast path), but no row lands in Postgres and the worker raises `KeyError` in the broker log. Caught and fixed in TM1 — see `mcp_server/tasks/__init__.py`.
 
 The trap: every other layer can be working perfectly, and you'll still see zero capture if step 5 is broken — the model isn't the problem.
+
+---
+
+# TM2 conventions
+
+The MCP path graduates from spike to GA. The rules below are TM2's contract — break any of them and the productization assumptions don't hold.
+
+## Spike mode is dead
+
+`MCP_SPIKE_MODE` and the `MCP_TEST_IDENTITY_*` env vars must NOT be set on any production path after TM2 ships. The MCP server's `/authorize` endpoint always goes through real Ogma SSO. The startup check refuses to boot if `MCP_SPIKE_MODE=true` is observed in any environment — fail loud, don't silently re-enable the shortcut.
+
+A test environment may still set spike-mode for unit-test fixtures that need a deterministic token without round-tripping a full SSO flow. The startup-refusal applies to production; tests set the var inside a `monkeypatch` block, never in the docker-compose default env.
+
+---
+
+## Tool description is the trusted channel
+
+The MCP `log_interaction` tool's docstring — `LOG_INTERACTION_DESCRIPTION` in `mcp_server/mcp/tools/log_interaction.py` — is what Claude reads when deciding whether to call. It travels through the MCP protocol channel that Anthropic treats as trusted server metadata, not as user-channel input. Transparent legitimacy framing belongs there. Project-level custom instructions reinforce, but the docstring carries the load.
+
+Updating the docstring requires a `docker compose build mcp-server` + `up -d --force-recreate mcp-server` to take effect — Claude reads the description fresh on the `initialize` handshake, but only after the server is redeployed. Treat the docstring as a behavioral contract (capture rate is sensitive to the wording), not just documentation.
+
+---
+
+## MCP source attribution is per-event, not per-session
+
+A single `(date, actor)` session may have records from multiple `source_api` values — admin_api + mcp + activity_feed for an Enterprise+Team tenant using the API agent and Claude Desktop concurrently is the normal case once TM2 ships. Render the **source distribution** per session (e.g., "12 events (8 mcp, 3 admin, 1 activity_feed)"), don't pick one source as canonical and hide the rest.
+
+The Sessions row gets one badge per contributing source; SessionDetail breaks the events down by source in the timeline.
+
+---
+
+## Connector display name is `Ogma Telemetry` (server-side)
+
+When a customer installs the MCP connector via claude.ai's Add Custom Connector dialog, the "name" field prefills from the server's FastMCP `name=` parameter on the `initialize` response. Set this once in `mcp_server/mcp/server.py` and customers don't have to guess. Rick's TM1 install said "vargate.ai" because the field was a free-text input — that's how it appears when the server-side default is wrong.
+
+If Anthropic's UI ever stops prefilling from server metadata, document the limitation and update the onboarding-step copy to spell out the recommended name. Don't fight the UI.
+
+---
+
+## Bridge JWT keypair is file-mounted ECDSA P-256, not HSM-backed
+
+The TM2 SSO bridge issues 60-second JWTs from Ogma's gateway to the MCP server. The signing keypair is ECDSA P-256, mounted into both containers via a path env var (`OGMA_BRIDGE_JWT_PRIVATE_KEY_PATH` for the gateway, the public key fetched by the MCP server from `/.well-known/ogma-public-key.json`).
+
+This is intentionally NOT in SoftHSM2. The HSM is the right home for long-lived key material (per-tenant DEKs, the KEK). A 60-second token's blast radius from a key-leak is bounded by token lifetime; the operational cost of PKCS#11 signing on a hot path doesn't earn its complexity for that horizon. Manual rotation is fine — generate a fresh keypair, deploy gateway + mcp-server with the new public key, redeploy.
+
+**Move to HSM signing when general key-rotation infrastructure lands across the stack** (session JWTs, content encryption rotation, etc.). Until then this is a conscious shortcut.
+
+---
+
+## Onboarding ingest paths are parallel cards, not sequential steps
+
+The onboarding screen after region-select shows ingest paths as **side-by-side cards**, not as a sequence of mandatory steps. A customer can set up zero, one, or both. The deliberate UX claim is: "these are complementary integrations, you get to choose your shape." If we ever need a fourth path (e.g., Compliance API Access Key once that flow lands), it gets a card, not a step.
+
+This applies to the post-onboarding settings page too — the same card pattern, with each card showing connected/not-connected state and the action to set up the missing one.
