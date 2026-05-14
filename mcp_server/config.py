@@ -46,6 +46,57 @@ def server_url() -> str:
     return os.environ.get("MCP_SERVER_URL", "http://localhost:8001")
 
 
+# ───────────────────────────────────────────────────────────────────────────
+# TM2 — SSO bridge wiring
+# ───────────────────────────────────────────────────────────────────────────
+
+
+def ogma_bridge_url() -> str:
+    """The /auth/mcp-bridge endpoint on Ogma's gateway.
+
+    ``/authorize`` 302s the user-browser here with ``state=<mcp_state>&
+    return=<authorize_callback_url>`` query parameters. The bridge
+    JWT it eventually returns is verified using the public key
+    fetched from ``OGMA_PUBLIC_KEY_URL``.
+
+    Production default: ``https://ogma.vargate.ai/auth/mcp-bridge``.
+    Override via env for dev / staging.
+    """
+    return os.environ.get(
+        "OGMA_BRIDGE_URL", "https://ogma.vargate.ai/auth/mcp-bridge"
+    )
+
+
+def authorize_callback_url() -> str:
+    """The MCP server's ``/authorize/callback`` URL (the ``return`` value).
+
+    Sent to the SSO bridge as the ``return`` query parameter. The
+    bridge validates this against its own allowlist
+    (``OGMA_MCP_BRIDGE_ALLOWED_RETURN_URLS`` on the gateway side)
+    before signing a bridge JWT.
+
+    Defaults to ``<server_url()>/authorize/callback`` so it tracks
+    server_url(). Independent override exists in case nginx routing
+    ever wants to put the callback at a different path.
+    """
+    explicit = os.environ.get("MCP_AUTHORIZE_CALLBACK_URL")
+    if explicit:
+        return explicit
+    return f"{server_url().rstrip('/')}/authorize/callback"
+
+
+def ogma_public_key_url() -> str:
+    """Where the MCP server fetches the bridge JWT verification JWK.
+
+    Used at MCP-server startup (Phase C3) and by the daily refresh
+    Celery beat task (Phase C4).
+    """
+    return os.environ.get(
+        "OGMA_PUBLIC_KEY_URL",
+        "https://ogma.vargate.ai/.well-known/ogma-public-key.json",
+    )
+
+
 def resource_indicator() -> str:
     """RFC 8707 audience value embedded in every issued access token.
 

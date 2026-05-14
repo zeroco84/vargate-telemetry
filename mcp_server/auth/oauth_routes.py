@@ -43,6 +43,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import text as sql_text
 
 from mcp_server import config
+from mcp_server.auth import oauth_state
 from mcp_server.auth.token_verifier import (
     hash_bearer,
     reset_cache_for_test,
@@ -104,6 +105,9 @@ def reset_stores_for_test() -> None:
     _AUTH_CODE_STORE.clear()
     _REFRESH_TOKEN_STORE.clear()
     reset_cache_for_test()
+    # TM2 Phase C1: also wipe the Redis-backed OAuth state store so
+    # tests that exercise the SSO-bridge path start clean.
+    oauth_state.reset_for_test()
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -258,6 +262,51 @@ _SPIKE_WARNING_TEMPLATE = (
 )
 
 
+def _mint_code_and_redirect(
+    *,
+    client_id: str,
+    redirect_uri: str,
+    code_challenge: str,
+    code_challenge_method: str,
+    tenant_id: str,
+    user_id: str,
+    user_email: str,
+    resource: str,
+    scope: str,
+    claude_state: Optional[str],
+) -> RedirectResponse:
+    """Mint a one-shot OAuth auth code and 302 back to Claude.
+
+    Shared between the spike-mode branch and the SSO-callback handler
+    (Phase C2). Both reach the same shape — a validated identity plus
+    the OAuth parameters from Claude's original ``/authorize`` —
+    so the code-mint + redirect logic is one helper.
+    """
+    auth_code = secrets.token_urlsafe(32)
+    _store_put(
+        _AUTH_CODE_STORE,
+        auth_code,
+        {
+            "client_id": client_id,
+            "redirect_uri": redirect_uri,
+            "code_challenge": code_challenge,
+            "code_challenge_method": code_challenge_method,
+            "tenant_id": tenant_id,
+            "user_id": user_id,
+            "user_email": user_email,
+            "resource": resource,
+            "scope": scope,
+        },
+        _AUTH_CODE_TTL_SECONDS,
+    )
+
+    params = {"code": auth_code}
+    if claude_state is not None:
+        params["state"] = claude_state
+    location = f"{redirect_uri}?{urlencode(params)}"
+    return RedirectResponse(location, status_code=302)
+
+
 @router.get("/authorize")
 def authorize(
     request: Request,
@@ -270,29 +319,27 @@ def authorize(
     resource: Optional[str] = None,
     scope: Optional[str] = None,
 ):
-    """Authorization endpoint. SPIKE-MODE ONLY for TM1.
+    """Authorization endpoint — TM2 SSO bridge in production.
 
-    Production hardening (the SSO bridge described in TM1 §10) is
-    deferred to TM2 if §6 goes Green. Without ``MCP_SPIKE_MODE``,
-    this endpoint returns 501 — forcing the next sprint to consciously
-    enable the spike gate or build the real bridge.
+    Production path (TM2): validates the OAuth-protocol inputs,
+    persists the OAuth state in Redis keyed by a fresh
+    ``mcp_state`` token, then 302-redirects the user-browser to
+    Ogma's ``/auth/mcp-bridge`` for SSO. The bridge eventually
+    302s the user back to this server's ``/authorize/callback``
+    (Phase C2) with a signed bridge JWT — that handler claims the
+    state from Redis and reaches the same code-mint shape that
+    the spike branch below produces.
+
+    Test-bypass path: when both ``MCP_SPIKE_MODE`` and
+    ``MCP_ALLOW_SPIKE_MODE_FOR_TESTING`` are set (the conftest
+    sets the latter for the test session), the endpoint takes
+    the TM1 spike branch — pulls a static identity from env vars
+    and mints an auth code directly, without round-tripping
+    through Ogma. Production envs MUST NOT enable spike mode;
+    Phase A3's ``assert_spike_mode_safe`` startup check refuses
+    to let the server boot in that misconfiguration.
     """
-    if not config.spike_mode_enabled():
-        # Hard fail. Production builds without MCP_SPIKE_MODE must
-        # not pretend the OAuth flow works.
-        raise HTTPException(
-            status_code=status.HTTP_501_NOT_IMPLEMENTED,
-            detail={
-                "error": "authorize_not_implemented",
-                "error_description": (
-                    "/authorize is gated behind MCP_SPIKE_MODE=true. "
-                    "Production deployments must build the SSO bridge "
-                    "described in TM1 §10 before enabling this endpoint."
-                ),
-            },
-        )
-
-    # Validate basic OAuth-2.1 protocol shape.
+    # ── OAuth-protocol input validation (same for both branches) ─────
     if response_type != "code":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -353,56 +400,77 @@ def authorize(
             },
         )
 
-    # Pull the static test identity.
-    identity = config.test_identity()
-    if identity is None:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail={
-                "error": "spike_misconfigured",
-                "error_description": (
-                    "MCP_SPIKE_MODE is on but "
-                    "MCP_TEST_IDENTITY_{TENANT_ID,USER_ID,USER_EMAIL} "
-                    "is not fully populated."
-                ),
-            },
+    effective_resource = resource or config.resource_indicator()
+    effective_scope = scope or "log_interaction"
+
+    # ── Test-bypass spike branch ────────────────────────────────────
+    if config.spike_mode_enabled():
+        # The Phase A3 startup guard ensures this branch is
+        # unreachable in production. Tests enable both env vars
+        # to exercise the OAuth flow without standing up a real
+        # Ogma gateway.
+        identity = config.test_identity()
+        if identity is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={
+                    "error": "spike_misconfigured",
+                    "error_description": (
+                        "MCP_SPIKE_MODE is on but "
+                        "MCP_TEST_IDENTITY_{TENANT_ID,USER_ID,USER_EMAIL} "
+                        "is not fully populated."
+                    ),
+                },
+            )
+        _log.warning(
+            _SPIKE_WARNING_TEMPLATE,
+            client_id,
+            redirect_uri,
+            identity.tenant_id,
+            identity.user_id,
+        )
+        return _mint_code_and_redirect(
+            client_id=client_id,
+            redirect_uri=redirect_uri,
+            code_challenge=code_challenge,
+            code_challenge_method=code_challenge_method,
+            tenant_id=identity.tenant_id,
+            user_id=identity.user_id,
+            user_email=identity.user_email,
+            resource=effective_resource,
+            scope=effective_scope,
+            claude_state=state,
         )
 
-    # LOUD warning. See module docstring.
-    _log.warning(
-        _SPIKE_WARNING_TEMPLATE,
+    # ── Production SSO-bridge branch ────────────────────────────────
+    mcp_state = secrets.token_urlsafe(32)
+    oauth_state.store(
+        mcp_state=mcp_state,
+        client_id=client_id,
+        redirect_uri=redirect_uri,
+        code_challenge=code_challenge,
+        code_challenge_method=code_challenge_method,
+        scope=effective_scope,
+        resource=effective_resource,
+        claude_state=state,
+    )
+
+    bridge_url = (
+        f"{config.ogma_bridge_url()}?"
+        + urlencode(
+            {
+                "state": mcp_state,
+                "return": config.authorize_callback_url(),
+            }
+        )
+    )
+    _log.info(
+        "authorize: redirecting client_id=%s to Ogma SSO bridge "
+        "(mcp_state=%s)",
         client_id,
-        redirect_uri,
-        identity.tenant_id,
-        identity.user_id,
+        mcp_state[:12],  # truncate so the log isn't a full token
     )
-
-    # Mint a one-time auth code; bind to client_id + identity +
-    # code_challenge + resource so /token can verify.
-    auth_code = secrets.token_urlsafe(32)
-    _store_put(
-        _AUTH_CODE_STORE,
-        auth_code,
-        {
-            "client_id": client_id,
-            "redirect_uri": redirect_uri,
-            "code_challenge": code_challenge,
-            "code_challenge_method": code_challenge_method,
-            "tenant_id": identity.tenant_id,
-            "user_id": identity.user_id,
-            "user_email": identity.user_email,
-            "resource": resource or config.resource_indicator(),
-            "scope": scope or "log_interaction",
-        },
-        _AUTH_CODE_TTL_SECONDS,
-    )
-
-    # Redirect Claude back to its callback with the code.
-    params = {"code": auth_code}
-    if state is not None:
-        params["state"] = state
-    location = f"{redirect_uri}?{urlencode(params)}"
-    return RedirectResponse(location, status_code=302)
+    return RedirectResponse(bridge_url, status_code=302)
 
 
 # ───────────────────────────────────────────────────────────────────────────
