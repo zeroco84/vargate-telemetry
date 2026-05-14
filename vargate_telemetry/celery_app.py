@@ -98,6 +98,17 @@ celery_app.conf.beat_schedule = {
         "schedule": 900.0,  # every 15 minutes
         "options": {"queue": "default"},
     },
+    # TM2 Phase C4: re-fetch the bridge JWK from Ogma's well-known
+    # endpoint every 24h so key rotation propagates without a
+    # redeploy. The MCP server's lifespan primes the cache at boot;
+    # this task keeps it fresh while the server is long-running.
+    # On failure the task logs but does NOT raise — the stale cache
+    # stays warm and the next tick retries.
+    "refresh-bridge-jwk": {
+        "task": "mcp_server.tasks.refresh_bridge_jwk.refresh_bridge_jwk",
+        "schedule": 86400.0,  # 24 hours
+        "options": {"queue": "default"},
+    },
 }
 
 # Alias so `celery -A vargate_telemetry.celery_app worker` (which looks up

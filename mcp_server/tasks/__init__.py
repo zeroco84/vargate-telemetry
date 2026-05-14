@@ -8,3 +8,4 @@ worker (which includes `mcp_server.tasks` via celery_app's include=)
 discovers them.
 """
 from mcp_server.tasks import persist_event  # noqa: F401
+from mcp_server.tasks import refresh_bridge_jwk  # noqa: F401
