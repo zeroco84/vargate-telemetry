@@ -301,3 +301,61 @@ This is intentionally NOT in SoftHSM2. The HSM is the right home for long-lived 
 The onboarding screen after region-select shows ingest paths as **side-by-side cards**, not as a sequence of mandatory steps. A customer can set up zero, one, or both. The deliberate UX claim is: "these are complementary integrations, you get to choose your shape." If we ever need a fourth path (e.g., Compliance API Access Key once that flow lands), it gets a card, not a step.
 
 This applies to the post-onboarding settings page too — the same card pattern, with each card showing connected/not-connected state and the action to set up the missing one.
+
+---
+
+# TM3 conventions
+
+TM3 turns Ogma into an analytics layer on top of Anthropic's data, not a re-skin of console.anthropic.com. The rules below are the differentiator-defending guardrails — break them and we drift back into "duplicate of Anthropic's dashboard."
+
+## Surface labels, not raw source_api values, in the UI
+
+`source_api='mcp'` is a database value. End-user copy reads **"Claude (chat)"**. Same for `code_analytics` → **Claude Code**, `admin` → **API key** (with name suffix when available), `activity_feed` → **Admin event**, `content_capture` → **Claude (full content)**. The mapping lives in `packages/design-system/src/sourceLabels.ts` (or a colocated helper in `SourceBadge`). Backend keeps the raw values; frontend never renders them.
+
+The "API key" suffix matters: an "API key" row without a key name is a missed-context signal, so when the Admin API knows the name (sera-production, ci-deploy-key, etc.) the badge reads **"API key — sera-production"**. Em-dash separator, monospace for the name part.
+
+---
+
+## `/usage` is API-only and labels itself that way
+
+The `/usage` view is built entirely on the Admin API's `usage_report/messages`. It's API-key consumption. The sidebar reads **"API Usage"**, the page title matches, and the subtitle explicitly says "excludes Claude Code sessions and human Claude usage — see Sessions for those."
+
+The unqualified word "Usage" is reserved for a future tab that aggregates across all surfaces. Until that exists, calling the API-only view "Usage" is a lie of omission that drives "where's my Claude Code spend?" support tickets.
+
+---
+
+## Budget evaluation is per-budget-per-period-per-threshold
+
+The dedup contract on `budget_alert_events`: an alert fires at MOST once per `(budget_id, period_start, threshold_crossed)`. Three thresholds (0.70, 0.85, 1.00) means up to three alerts per budget per period. Each threshold's row is independent — crossing 70% then 85% then 100% fires three separate alerts, not one cumulative one.
+
+The unique-constraint enforcement is `ON CONFLICT (budget_id, period_start, threshold_crossed) DO NOTHING` on the INSERT. Email firing is gated on the insert succeeding (i.e. first time this threshold-period combo was seen).
+
+`scope_value` is `NULL` for tenant-wide budgets — the unique constraint includes `(budget_id, period_start, threshold_crossed)` only, not scope, so NULL scopes work without special-casing.
+
+---
+
+## Cross-surface user identity uses `user_aliases` with email-equality auto-match
+
+A user using API + Claude Code + Claude Desktop appears as three disconnected identities in Anthropic's view. Ogma stitches them via `user_aliases`: `(tenant_id, source_api, source_identifier)` → `users.id`.
+
+Auto-match: when a new telemetry record arrives with a `source_identifier` not yet in `user_aliases`, attempt to match by email-equality against `users.email`. If a single match exists, link automatically. Otherwise, the alias row gets inserted with `user_id = NULL` and surfaces in the admin's "Unmapped activity" panel for manual linking.
+
+Once linked manually, the row's `auto_matched = false` flag protects it from being overwritten by future auto-match attempts that might disagree.
+
+The never-delete rule applies: deleting a user nulls the `user_id` on their alias rows but keeps the rows around so historical telemetry stays grouped under that alias identifier.
+
+---
+
+## AWS SES is the email transport; sender identity + IAM live in `docs/ops/integrations/aws-ses.md`
+
+Outbound email (budget alerts initially, more channels later) uses AWS SES. The sender identity (verified by Twinlite's existing SES setup) and the IAM credential the gateway uses are documented in `docs/ops/integrations/aws-ses.md`. If you reach a SES-call site without that doc existing, write the doc first — the next deploy of a new env should not require source-reading to know which credential to wire.
+
+SES rate limits and sandbox status are also in that doc. Pin boto3 version in `requirements.txt`.
+
+---
+
+## Activity heatmap is a pure-SVG primitive in the design system
+
+The user-detail heatmap (GitHub-style 7-row × N-day grid) lives in `packages/design-system/src/Heatmap.tsx`, modeled on the existing `Sparkline` pattern: pure SVG, no chart library, props are `cells: HeatmapCell[]`. Cells colored by event density per day, tone-shifted by source. Tooltip on hover surfaces the date + count + source breakdown.
+
+Defer fancy interactions (zoom, multi-week ranges, click-to-drill) to TM4 if they're not needed for the demo. The cell hover is the only interaction this sprint needs.
