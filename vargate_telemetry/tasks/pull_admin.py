@@ -199,6 +199,61 @@ def _sync_workspaces(
     return len(rows)
 
 
+def _sync_api_keys(
+    tenant_id: str, client: AnthropicAdminClient
+) -> int:
+    """Upsert Anthropic API-key names for this tenant (TM3 Phase A4).
+
+    Mirrors :func:`_sync_workspaces`. Called once at the start of
+    each pull / backfill so the API Usage view can resolve
+    ``api_key_id`` → ``name``. Failures don't block the usage pull
+    — names are display-only and a missing one just renders the
+    raw ID (or the "API key" badge without a suffix per TM3 A3).
+
+    Idempotent: ON CONFLICT updates name + status + updated_at. Never
+    deletes (memory rule: keys that disappear from the org keep
+    their last-known row for historical resolution).
+    """
+    try:
+        rows = list(client.list_api_keys())
+    except Exception:  # pragma: no cover — logged, soft-fail
+        _log.exception(
+            "_sync_api_keys: list_api_keys failed for %s", tenant_id
+        )
+        return 0
+
+    if not rows:
+        return 0
+
+    with session_scope(tenant_id) as s:
+        for k in rows:
+            s.execute(
+                sql_text(
+                    """
+                    INSERT INTO api_keys
+                        (tenant_id, api_key_id, name, status,
+                         workspace_id)
+                    VALUES (:tenant_id, :api_key_id, :name,
+                            :status, :workspace_id)
+                    ON CONFLICT (tenant_id, api_key_id)
+                    DO UPDATE SET
+                        name = EXCLUDED.name,
+                        status = EXCLUDED.status,
+                        workspace_id = EXCLUDED.workspace_id,
+                        updated_at = now()
+                    """
+                ),
+                {
+                    "tenant_id": tenant_id,
+                    "api_key_id": k.id,
+                    "name": k.name,
+                    "status": k.status,
+                    "workspace_id": k.workspace_id,
+                },
+            )
+    return len(rows)
+
+
 def _normalize_usage(bucket: UsageBucket) -> Iterator[dict]:
     """Yield one telemetry_records insert kwargs per (bucket, breakdown).
 
@@ -256,6 +311,12 @@ def _normalize_usage(bucket: UsageBucket) -> Iterator[dict]:
         breakdown_dict = breakdown.model_dump(mode="json")
         model_key = breakdown.model or "-"
         ws_key = breakdown.workspace_id or "-"
+        # TM3 Phase A4: per-api-key breakdown means the external_id
+        # needs the api_key_id segment too — otherwise the more-
+        # granular breakdown rows would all collapse onto the same
+        # (model, workspace) external_id and dedup would silently
+        # drop everything but the first.
+        ak_key = breakdown_dict.get("api_key_id") or "-"
         sub_meta = {**bucket_window, "results": [breakdown_dict]}
         canonical = json.dumps(
             sub_meta, sort_keys=True, separators=(",", ":")
@@ -264,7 +325,7 @@ def _normalize_usage(bucket: UsageBucket) -> Iterator[dict]:
             "record_type": "usage",
             "source_api": SOURCE_API_ADMIN,
             "external_id": (
-                f"usage:{start_iso}:{end_iso}:{model_key}:{ws_key}"
+                f"usage:{start_iso}:{end_iso}:{model_key}:{ws_key}:{ak_key}"
             ),
             "occurred_at": bucket.starting_at,
             "content_hash": hashlib.sha256(canonical).digest(),
@@ -303,6 +364,11 @@ def _pull_admin_for_tenant(
         # resolve workspace_id → human name. Soft-fail; doesn't
         # block usage ingestion.
         _sync_workspaces(tenant_id, client)
+        # TM3 Phase A4: same pattern for API key names — the
+        # usage report references api_key_id but doesn't include
+        # the name; the API Usage table joins this for the
+        # "API key — sera-production" rendering.
+        _sync_api_keys(tenant_id, client)
 
         for bucket in client.list_usage(
             starting_at=starting_at,
