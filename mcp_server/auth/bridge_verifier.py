@@ -39,13 +39,33 @@ from __future__ import annotations
 import base64
 import logging
 import threading
+import time
 from typing import Any, Mapping, Optional
 
+import httpx
 import jwt as pyjwt
 from cryptography.hazmat.primitives.asymmetric import ec
 
+from mcp_server import config
+
 
 _log = logging.getLogger(__name__)
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Fetch the gateway's JWK from /.well-known/ and prime the cache
+# ───────────────────────────────────────────────────────────────────────────
+
+
+# 5-second per-attempt timeout — well below the lifespan budget but
+# generous enough for a TLS handshake + small JSON over the prod path.
+_FETCH_TIMEOUT_SECONDS = 5.0
+
+# Retry policy: small, bounded. The gateway is the same compose stack;
+# if it's not reachable after a few seconds, something's actually
+# wrong and a longer retry just hides the operator signal.
+_FETCH_RETRIES = 3
+_FETCH_BACKOFF_BASE_SECONDS = 1.0
 
 
 BRIDGE_JWT_ALGORITHM = "ES256"
@@ -108,6 +128,59 @@ def reset_for_test() -> None:
     with _cache_lock:
         _cached_jwk = None
         _cached_public_key = None
+
+
+def fetch_and_cache_jwk(*, url: Optional[str] = None) -> dict:
+    """Fetch the bridge JWK from Ogma's well-known endpoint, prime the cache.
+
+    Called from the MCP server's startup lifespan (Phase C3) and by
+    the daily Celery beat refresh task (Phase C4). Retries a small
+    number of times with linear backoff if the fetch fails; raises
+    the final exception if all retries are exhausted so the caller
+    can decide whether to hard-fail or degrade.
+
+    ``url`` defaults to ``config.ogma_public_key_url()`` — production
+    deploys override via the env var when staging / dev needs to
+    point at a different gateway.
+
+    Returns the JWK dict that was cached, so callers (e.g., the
+    Celery task) can log the active kid post-refresh.
+    """
+    target_url = url or config.ogma_public_key_url()
+    last_exc: Optional[Exception] = None
+
+    for attempt in range(1, _FETCH_RETRIES + 1):
+        try:
+            with httpx.Client(timeout=_FETCH_TIMEOUT_SECONDS) as client:
+                response = client.get(target_url)
+                response.raise_for_status()
+                jwk = response.json()
+            set_jwk(jwk)
+            _log.info(
+                "bridge_verifier: fetched + cached JWK from %s "
+                "(attempt %d, kid=%s)",
+                target_url,
+                attempt,
+                jwk.get("kid", "<unknown>"),
+            )
+            return jwk
+        except Exception as exc:  # network / DNS / TLS / 5xx / JSON
+            last_exc = exc
+            _log.warning(
+                "bridge_verifier: fetch attempt %d/%d failed: %s",
+                attempt,
+                _FETCH_RETRIES,
+                exc,
+            )
+            if attempt < _FETCH_RETRIES:
+                # Linear backoff: 1s, 2s, 3s. Total worst-case
+                # 5s + 1s + 5s + 2s + 5s + 3s ≈ 21s before giving up.
+                time.sleep(_FETCH_BACKOFF_BASE_SECONDS * attempt)
+
+    # All retries exhausted. Re-raise the last exception so the
+    # caller (the lifespan) can surface the failure to uvicorn.
+    assert last_exc is not None
+    raise last_exc
 
 
 # ───────────────────────────────────────────────────────────────────────────
