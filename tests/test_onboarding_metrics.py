@@ -25,7 +25,9 @@ from prometheus_client import REGISTRY
 from sqlalchemy import text as sql_text
 
 from fixtures.admin_api_handlers import (
+    empty_api_keys_response,
     empty_workspaces_response,
+    is_api_keys_request,
     is_workspaces_request,
 )
 
@@ -517,9 +519,12 @@ def test_first_pull_is_observed_only_once_per_tenant(
         # T5.5.6: pull_admin now also fetches /v1/organizations/workspaces
         # to keep the workspaces table fresh. Short-circuit those
         # requests so they don't burn the call-count counter that the
-        # rest of the test pins.
+        # rest of the test pins. TM3 Phase A4 adds the same pattern
+        # for /v1/organizations/api_keys (the API-key-name sync).
         if is_workspaces_request(request):
             return empty_workspaces_response()
+        if is_api_keys_request(request):
+            return empty_api_keys_response()
         call_count["n"] += 1
         if call_count["n"] == 1:
             return httpx.Response(

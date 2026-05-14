@@ -49,6 +49,11 @@ import httpx
 
 
 _WORKSPACES_PATH_SUBSTRING = "/workspaces"
+# TM3 Phase A4: `_sync_api_keys` adds a second admin-side fetch.
+# Same problem shape as T5.5.6's workspaces — handlers that don't
+# stub api_keys will either burn a call-counter or feed garbage to
+# ApiKey.model_validate. Sibling helpers below.
+_API_KEYS_PATH_SUBSTRING = "/api_keys"
 
 
 def is_workspaces_request(request: httpx.Request) -> bool:
@@ -61,21 +66,34 @@ def empty_workspaces_response() -> httpx.Response:
     return httpx.Response(200, json={"data": [], "has_more": False})
 
 
+def is_api_keys_request(request: httpx.Request) -> bool:
+    """Return True if the request targets the api_keys endpoint."""
+    return _API_KEYS_PATH_SUBSTRING in request.url.path
+
+
+def empty_api_keys_response() -> httpx.Response:
+    """Well-formed empty envelope from Anthropic's api_keys endpoint."""
+    return httpx.Response(200, json={"data": [], "has_more": False})
+
+
 def skip_workspaces(
     handler: Callable[[httpx.Request], httpx.Response],
 ) -> Callable[[httpx.Request], httpx.Response]:
-    """Decorator: short-circuit workspaces requests to the empty envelope.
+    """Decorator: short-circuit workspaces + api_keys to empty envelopes.
 
-    The wrapped handler only sees usage / messages traffic — so its
-    call-count counters, window-tracking lists, and parameter
-    assertions remain stable across the T5.5.6 ``_sync_workspaces``
-    addition.
+    Despite the legacy name, this decorator now also handles api_keys
+    requests (TM3 Phase A4 added a second admin-side sync). Test
+    handlers wrapped with this see only usage / messages traffic;
+    their call-count counters, window-tracking lists, and parameter
+    assertions remain stable across both syncs.
     """
 
     @wraps(handler)
     def wrapped(request: httpx.Request) -> httpx.Response:
         if is_workspaces_request(request):
             return empty_workspaces_response()
+        if is_api_keys_request(request):
+            return empty_api_keys_response()
         return handler(request)
 
     return wrapped
@@ -83,6 +101,8 @@ def skip_workspaces(
 
 __all__ = [
     "empty_workspaces_response",
+    "empty_api_keys_response",
     "is_workspaces_request",
+    "is_api_keys_request",
     "skip_workspaces",
 ]

@@ -102,6 +102,13 @@ class UsageRow(BaseModel):
     table (populated by the backfill / pull task via
     ``client.list_workspaces()``). ``None`` when not yet resolved or
     when ``workspace_id`` is null.
+
+    TM3 Phase A4: ``api_key_id`` + ``api_key_name`` — the rows now
+    surface which API key drove each (date, model, workspace_id)
+    breakdown. The Admin API returns ``api_key_id`` in the bucket
+    breakdown when ``group_by=[api_key_id]`` is requested but does
+    NOT include the name. ``api_key_name`` is resolved by a LEFT
+    JOIN onto the ``api_keys`` side table (synced same as workspaces).
     """
 
     model_config = {"populate_by_name": True}
@@ -109,6 +116,8 @@ class UsageRow(BaseModel):
     row_date: date = Field(alias="date")
     workspace_id: Optional[str] = None
     workspace_name: Optional[str] = None
+    api_key_id: Optional[str] = None
+    api_key_name: Optional[str] = None
     model: Optional[str] = None
     input_tokens: int = 0
     output_tokens: int = 0
@@ -376,6 +385,11 @@ def list_usage(
             e.ordinality,
             e.result->>'workspace_id' AS workspace_id,
             w.name AS workspace_name,
+            -- TM3 Phase A4: api_key_id from the bucket breakdown; the
+            -- name comes from a LEFT JOIN on the api_keys side table
+            -- (synced at backfill/pull time same as workspaces).
+            e.result->>'api_key_id' AS api_key_id,
+            ak.name AS api_key_name,
             e.result->>'model' AS model,
             COALESCE((e.result->>'input_tokens')::bigint, 0) AS input_tokens,
             COALESCE((e.result->>'output_tokens')::bigint, 0) AS output_tokens,
@@ -400,6 +414,9 @@ def list_usage(
         LEFT JOIN workspaces w
           ON w.tenant_id = e.tenant_id
          AND w.workspace_id = (e.result->>'workspace_id')
+        LEFT JOIN api_keys ak
+          ON ak.tenant_id = e.tenant_id
+         AND ak.api_key_id = (e.result->>'api_key_id')
         ORDER BY e.occurred_at DESC, e.record_id DESC, e.ordinality ASC
         LIMIT :limit + 1
     """
@@ -479,6 +496,8 @@ def list_usage(
                 row_date=r.row_date,
                 workspace_id=r.workspace_id,
                 workspace_name=r.workspace_name,
+                api_key_id=r.api_key_id,
+                api_key_name=r.api_key_name,
                 model=r.model,
                 input_tokens=int(r.input_tokens),
                 output_tokens=int(r.output_tokens),

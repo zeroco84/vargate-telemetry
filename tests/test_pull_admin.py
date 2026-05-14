@@ -13,7 +13,9 @@ import pytest
 from sqlalchemy import text as sql_text
 
 from fixtures.admin_api_handlers import (
+    empty_api_keys_response,
     empty_workspaces_response,
+    is_api_keys_request,
     is_workspaces_request,
     skip_workspaces,
 )
@@ -181,9 +183,12 @@ def test_pull_handles_rate_limit_and_retries(
     def handler(request: httpx.Request) -> httpx.Response:
         # T5.5.6: skip the workspaces sync call from the count so
         # the 429-retry test pins the USAGE call's behavior, not
-        # the workspace sync's.
+        # the workspace sync's. TM3 Phase A4 adds the api_keys
+        # sync — same short-circuit applies.
         if is_workspaces_request(request):
             return empty_workspaces_response()
+        if is_api_keys_request(request):
+            return empty_api_keys_response()
         call_count["n"] += 1
         if call_count["n"] < 3:
             return httpx.Response(

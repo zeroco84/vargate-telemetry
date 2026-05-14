@@ -44,6 +44,7 @@ from vargate_telemetry.anthropic.exceptions import (
 )
 from vargate_telemetry.anthropic.types import (
     Activity,
+    ApiKey,
     Chat,
     ChatWithMessages,
     CodeAnalyticsRecord,
@@ -227,6 +228,21 @@ class AnthropicAdminClient:
         for raw in self._paginate_admin("/v1/organizations/users"):
             yield Member.model_validate(raw)
 
+    def list_api_keys(self) -> Iterator[ApiKey]:
+        """Yield every API key in the organization (TM3 Phase A4).
+
+        Walks every page (cursor-paginated, up to 1000 per page, no
+        filter — we want the full catalog so the usage-report's
+        ``api_key_id`` column can be resolved to a human name).
+
+        Returned shape: see :class:`ApiKey`. The caller is responsible
+        for building a `{id: name}` lookup map; this iterator just
+        yields the raw records so unusual status values (expired,
+        archived) are still visible if needed for forensic queries.
+        """
+        for raw in self._paginate_admin("/v1/organizations/api_keys"):
+            yield ApiKey.model_validate(raw)
+
     def list_usage(
         self,
         *,
@@ -262,7 +278,16 @@ class AnthropicAdminClient:
             "ending_at": ending_at.isoformat(),
             "bucket_width": bucket_width,
         }
-        gb = ["model", "workspace_id"] if group_by is None else group_by
+        # TM3 Phase A4: default breakdown now includes api_key_id so
+        # the API Usage table can show "API key — sera-production".
+        # Pre-TM3 records lack the api_key_id segment in their
+        # breakdown rows (`results[].api_key_id` is null); the Usage
+        # view renders em-dash for those legacy rows.
+        gb = (
+            ["model", "workspace_id", "api_key_id"]
+            if group_by is None
+            else group_by
+        )
         if gb:
             # httpx serializes list values as repeated query params,
             # which matches Anthropic's ``group_by[]=...&group_by[]=...``

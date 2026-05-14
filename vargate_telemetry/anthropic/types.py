@@ -69,6 +69,32 @@ class Workspace(BaseModel):
     display_color: Optional[str] = None
 
 
+class ApiKey(BaseModel):
+    """One Anthropic API key.
+
+    Endpoint: ``GET /v1/organizations/api_keys``. The usage-report
+    `api_key_id` field references rows of this shape — Anthropic does
+    NOT return the key name in the usage report, only the id, so the
+    UI's "API key — sera-production" rendering requires this fetch
+    + an in-Ogma lookup map (TM3 Phase A4).
+
+    `partial_key_hint` is a redacted prefix like "sk-...wxyz" — safe
+    to log but useless for end-user display. The `name` field is the
+    human-readable label the customer assigned.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    id: str
+    type: str = "api_key"
+    name: str
+    status: str  # "active" | "inactive" | "archived" | "expired"
+    created_at: datetime
+    expires_at: Optional[datetime] = None
+    workspace_id: Optional[str] = None
+    partial_key_hint: Optional[str] = None
+
+
 class UsageBreakdown(BaseModel):
     """Tokens used inside one (model, workspace, key, tier, context) slice.
 
