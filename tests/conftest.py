@@ -143,6 +143,17 @@ os.environ.setdefault("OGMA_BRIDGE_JWT_KID", "ogma-bridge-test")
 
 
 # ───────────────────────────────────────────────────────────────────────────
+# Module-load step 3: TM2 — opt the test suite out of the production
+# spike-mode guard. Production must NOT set this; its presence in a
+# prod env is itself a bug (see mcp_server.config.assert_spike_mode_safe).
+# Tests use the bypass so monkeypatch.setenv("MCP_SPIKE_MODE", ...) blocks
+# inside individual cases don't get rejected at module import.
+# ───────────────────────────────────────────────────────────────────────────
+
+os.environ.setdefault("MCP_ALLOW_SPIKE_MODE_FOR_TESTING", "1")
+
+
+# ───────────────────────────────────────────────────────────────────────────
 # Test-DB bootstrap helpers
 # ───────────────────────────────────────────────────────────────────────────
 
