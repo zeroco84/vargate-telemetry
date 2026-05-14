@@ -109,6 +109,22 @@ celery_app.conf.beat_schedule = {
         "schedule": 86400.0,  # 24 hours
         "options": {"queue": "default"},
     },
+    # TM3 Phase B3: budget alert evaluation. Same 15-minute cadence
+    # as the ingest streams so threshold crossings show up in the
+    # dashboard within one tick of the spend that crossed them. The
+    # dispatcher uses scheduler_session_scope to enumerate tenants,
+    # per-tenant tasks run under session_scope(tenant_id) with RLS.
+    # Dedup via UNIQUE (budget_id, period_start, threshold_crossed)
+    # + ON CONFLICT DO NOTHING means at-most-once-firing per period
+    # per threshold; idle ticks are silent.
+    "dispatch-evaluate-budgets": {
+        "task": (
+            "vargate_telemetry.tasks.evaluate_budgets."
+            "dispatch_evaluate_budgets"
+        ),
+        "schedule": 900.0,  # every 15 minutes
+        "options": {"queue": "default"},
+    },
 }
 
 # Alias so `celery -A vargate_telemetry.celery_app worker` (which looks up

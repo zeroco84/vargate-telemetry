@@ -8,6 +8,7 @@
 # (which it does via celery_app's `include=[...]`) to discover them all.
 from vargate_telemetry.tasks import (  # noqa: F401
     diagnostics,
+    evaluate_budgets,
     metering,
     pull_admin,
     pull_code_analytics,
