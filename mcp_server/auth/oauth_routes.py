@@ -42,8 +42,10 @@ from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import text as sql_text
 
+import jwt as pyjwt
+
 from mcp_server import config
-from mcp_server.auth import oauth_state
+from mcp_server.auth import bridge_verifier, oauth_state
 from mcp_server.auth.token_verifier import (
     hash_bearer,
     reset_cache_for_test,
@@ -108,6 +110,10 @@ def reset_stores_for_test() -> None:
     # TM2 Phase C1: also wipe the Redis-backed OAuth state store so
     # tests that exercise the SSO-bridge path start clean.
     oauth_state.reset_for_test()
+    # TM2 Phase C2: drop the bridge-JWT verifier's cached JWK so
+    # tests that mint with one keypair don't accidentally verify
+    # against a stale cache from a previous case.
+    bridge_verifier.reset_for_test()
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -471,6 +477,155 @@ def authorize(
         mcp_state[:12],  # truncate so the log isn't a full token
     )
     return RedirectResponse(bridge_url, status_code=302)
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# /authorize/callback — TM2 Phase C2 SSO-bridge consumer
+# ───────────────────────────────────────────────────────────────────────────
+#
+# The Ogma gateway's /auth/mcp-bridge (Phase B2) mints a short-lived
+# (60s) ES256 JWT carrying:
+#   - tenant_id, user_id, user_email — the signed-in user
+#   - mcp_state — the round-trip key for our Redis state lookup
+#   - aud=mcp-bridge, iss=ogma.vargate.ai, exp=now+60s
+#
+# This handler verifies that JWT against the bridge_verifier cache
+# (populated at startup by Phase C3's well-known fetch), looks up
+# the OAuth state we stashed before redirecting to the bridge,
+# and reaches the same code-mint shape as the spike branch.
+
+
+def _bridge_callback_400(error_description: str) -> HTTPException:
+    """Generic invalid_grant 400 for callback verification failures.
+
+    The error_description never leaks which specific check failed
+    (signature / audience / expiry / state / etc.) — that would
+    let an attacker probe for the live boundary. The internal log
+    line on the way in carries the real reason.
+    """
+    return HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail={
+            "error": "invalid_grant",
+            "error_description": error_description,
+        },
+    )
+
+
+@router.get("/authorize/callback")
+def authorize_callback(
+    bridge_token: str,
+):
+    """Consume a bridge JWT, mint an auth code, 302 back to Claude.
+
+    Single-shot flow:
+
+      1. Verify the bridge JWT (ES256 only — pyjwt rejects ``none``
+         and ``HS256`` via the explicit algorithms list).
+      2. ``oauth_state.claim(mcp_state)`` to recover the OAuth
+         parameters Claude sent into /authorize. The claim is atomic
+         GETDEL, so a replay of the same bridge_token finds an empty
+         slot and 400s.
+      3. Call the shared ``_mint_code_and_redirect()`` helper to
+         persist the auth code + 302 back to Claude.
+
+    Every failure mode produces a single generic ``invalid_grant``
+    400 — no leak of which check failed. Specifics go to the log
+    only.
+    """
+    # Cache miss is a startup-wiring bug; surface 503 so ops can
+    # tell the difference between "Ogma rejected the user" (400)
+    # and "MCP server didn't load the bridge JWK at boot" (503).
+    if bridge_verifier.cached_jwk() is None:
+        _log.error(
+            "/authorize/callback: bridge_verifier JWK cache is "
+            "empty — startup public-key fetch did not complete."
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "error": "server_not_ready",
+                "error_description": (
+                    "Bridge JWT verifier not yet initialized."
+                ),
+            },
+        )
+
+    try:
+        claims = bridge_verifier.verify(bridge_token)
+    except pyjwt.PyJWTError as exc:
+        # PyJWTError is the umbrella for all of: InvalidSignatureError,
+        # ExpiredSignatureError, InvalidAudienceError, InvalidIssuerError,
+        # InvalidAlgorithmError, DecodeError, ImmatureSignatureError,
+        # MissingRequiredClaimError, etc. Collapse to a single
+        # generic response so an attacker can't probe boundaries by
+        # the specific error string.
+        _log.warning(
+            "/authorize/callback: bridge JWT verification failed: "
+            "%s: %s",
+            type(exc).__name__,
+            exc,
+        )
+        raise _bridge_callback_400(
+            "Bridge token verification failed."
+        ) from exc
+
+    mcp_state = claims.get("mcp_state")
+    if not isinstance(mcp_state, str) or not mcp_state:
+        _log.warning(
+            "/authorize/callback: bridge JWT missing mcp_state claim"
+        )
+        raise _bridge_callback_400(
+            "Bridge token missing mcp_state claim."
+        )
+
+    payload = oauth_state.claim(mcp_state)
+    if payload is None:
+        # Either:
+        #   - mcp_state was never stored (forged JWT with a random
+        #     mcp_state)
+        #   - state was already claimed (bridge_token replay)
+        #   - state expired (>10 min since /authorize was called)
+        # All three are indistinguishable to the caller — and that's
+        # by design.
+        _log.warning(
+            "/authorize/callback: no Redis state for mcp_state=%s",
+            mcp_state[:12],
+        )
+        raise _bridge_callback_400(
+            "Bridge state expired, replayed, or never registered."
+        )
+
+    tenant_id = claims.get("tenant_id")
+    user_id = claims.get("user_id")
+    user_email = claims.get("user_email")
+    if not all(isinstance(v, str) and v for v in (tenant_id, user_id, user_email)):
+        _log.warning(
+            "/authorize/callback: bridge JWT missing identity claims"
+        )
+        raise _bridge_callback_400(
+            "Bridge token missing identity claims."
+        )
+
+    _log.info(
+        "/authorize/callback: minting auth code for tenant_id=%s "
+        "user_id=%s client_id=%s",
+        tenant_id,
+        user_id,
+        payload["client_id"],
+    )
+    return _mint_code_and_redirect(
+        client_id=payload["client_id"],
+        redirect_uri=payload["redirect_uri"],
+        code_challenge=payload["code_challenge"],
+        code_challenge_method=payload["code_challenge_method"],
+        tenant_id=tenant_id,
+        user_id=user_id,
+        user_email=user_email,
+        resource=payload["resource"],
+        scope=payload["scope"],
+        claude_state=payload["claude_state"],
+    )
 
 
 # ───────────────────────────────────────────────────────────────────────────
