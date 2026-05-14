@@ -207,18 +207,22 @@ def test_register_rejects_off_allowlist_redirect_uri(
 # ───────────────────────────────────────────────────────────────────────────
 
 
-def test_authorize_returns_501_without_spike_mode(
+def test_authorize_without_spike_mode_redirects_to_sso_bridge(
     mcp_client: TestClient,
     clean_mcp_oauth: None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Production posture — /authorize is gated behind MCP_SPIKE_MODE."""
-    # Force the spike env to be off in this case (the other fixtures
-    # don't set it).
+    """TM2 contract: production /authorize redirects to Ogma SSO bridge.
+
+    Renamed from `test_authorize_returns_501_without_spike_mode` —
+    the TM1 501 behavior was the spike-only contract. TM2 wires the
+    real SSO bridge, so spike-off becomes the happy production
+    path. Detailed coverage of the bridge-redirect shape lives in
+    test_mcp_oauth_sso_bridge.py; this test just confirms the
+    contract change at the top of the OAuth surface.
+    """
     monkeypatch.delenv("MCP_SPIKE_MODE", raising=False)
 
-    # Register a client so we get past the client-validation branch
-    # — though we won't reach it; the spike-mode gate runs first.
     client_id, _ = _register_client(mcp_client)
     verifier, challenge = _pkce_pair()
 
@@ -234,9 +238,11 @@ def test_authorize_returns_501_without_spike_mode(
         },
         follow_redirects=False,
     )
-    assert response.status_code == 501, response.text
-    body = response.json()["detail"]
-    assert body["error"] == "authorize_not_implemented"
+    assert response.status_code == 302, response.text
+    location = response.headers["location"]
+    assert "/auth/mcp-bridge" in location
+    assert "state=" in location
+    assert "return=" in location
 
 
 def test_authorize_happy_path_emits_warning_and_redirects(
