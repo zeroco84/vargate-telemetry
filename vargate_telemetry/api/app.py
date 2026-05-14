@@ -26,6 +26,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 from vargate_telemetry.api import auth as auth_routes
+from vargate_telemetry.api import mcp_bridge as mcp_bridge_routes
 from vargate_telemetry.api import onboarding as onboarding_routes
 from vargate_telemetry.api import sessions as sessions_routes
 from vargate_telemetry.api import usage as usage_routes
@@ -80,6 +81,9 @@ def _build_app() -> FastAPI:
     # TM2 Phase B1: /.well-known/ogma-public-key.json — public JWK
     # the MCP server fetches at boot to verify bridge JWTs.
     app.include_router(well_known_routes.router)
+    # TM2 Phase B2: /auth/mcp-bridge — Ogma SSO → MCP authorization
+    # callback bridge. Browser-facing redirect endpoint.
+    app.include_router(mcp_bridge_routes.router)
 
     @app.get("/_health", include_in_schema=False)
     def _health() -> dict:
