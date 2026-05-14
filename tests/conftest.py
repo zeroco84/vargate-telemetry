@@ -136,10 +136,14 @@ with open(_test_bridge_key_path, "wb") as _f:
     _f.write(_test_bridge_pem)
 os.chmod(_test_bridge_key_path, 0o600)
 
-os.environ.setdefault(
-    "OGMA_BRIDGE_JWT_PRIVATE_KEY_PATH", _test_bridge_key_path
-)
-os.environ.setdefault("OGMA_BRIDGE_JWT_KID", "ogma-bridge-test")
+# Override unconditionally — docker-compose may have set
+# OGMA_BRIDGE_JWT_PRIVATE_KEY_PATH to /run/secrets/... (the
+# bind-mounted dev keypair) for the runtime app, but tests must
+# use the freshly-generated tmp keypair so the kid is predictable
+# (`ogma-bridge-test`) and the file lifecycle is owned by the
+# test session.
+os.environ["OGMA_BRIDGE_JWT_PRIVATE_KEY_PATH"] = _test_bridge_key_path
+os.environ["OGMA_BRIDGE_JWT_KID"] = "ogma-bridge-test"
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -150,7 +154,7 @@ os.environ.setdefault("OGMA_BRIDGE_JWT_KID", "ogma-bridge-test")
 # inside individual cases don't get rejected at module import.
 # ───────────────────────────────────────────────────────────────────────────
 
-os.environ.setdefault("MCP_ALLOW_SPIKE_MODE_FOR_TESTING", "1")
+os.environ["MCP_ALLOW_SPIKE_MODE_FOR_TESTING"] = "1"
 
 
 # ───────────────────────────────────────────────────────────────────────────
