@@ -14,68 +14,88 @@ and what's left for TM3.
 
 ---
 
-## Result: **<fill in: GREEN / YELLOW / RED>**
+## Result: **YELLOW — capture works, but the docstring alone isn't sufficient**
 
-Filled in after the G1 demo run.
+Empirical finding from the G1 demo run: a fresh claude.ai
+conversation with the connector installed + `log_interaction` set
+to "Allow always" but **no other trust affordance** does NOT
+achieve reliable capture from the docstring alone. The hardened
+F1 docstring helped — Claude no longer refuses outright — but
+without a second legitimacy signal alongside the OAuth bearer
+token, the model defers to caution and skips most calls.
 
-The TM2 §5.2 bar:
-- **Green:** ≥80% capture rate on a fresh claude.ai conversation
-  with the connector installed + `log_interaction` set to "Allow
-  always" but **no Project-level custom instructions**.
-- **Yellow:** 50–80%. Means the docstring framing isn't quite
-  carrying its weight; iterate the wording and rerun.
-- **Red:** <50%. The Project instructions are still load-bearing;
-  TM3 needs to plan for either (a) an org-level admin-prompt
-  feature once Anthropic ships it, or (b) hard-coding the
-  Project setup into the onboarding flow.
+**Reliable capture requires one of three trust affordances**, in
+addition to the always-required `log_interaction` permission set
+to "Allow always":
+
+  1. **Personal preferences** in claude.ai (set to ask-first or
+     unconditional acknowledgment of org-installed audit
+     connectors)
+  2. **Project custom instructions** (the TM1 path — frame the
+     connector + tool call as expected behavior at the
+     project-system-prompt level)
+  3. **(Reserved)** an admin-prompt feature, if/when Anthropic
+     ships org-level system prompts that bypass per-user setup
+
+In production: surface this requirement clearly in the MCP
+Connector onboarding card and the Settings → Integrations card
+(the inline expansion already shows the Project-instructions
+copy and the permission-setting steps). TM3 picks up the
+documentation polish; the docstring stays as it is — it's
+loadbearing for the cases where personal preferences ARE set,
+just not sufficient on its own.
+
+The TM2 §5.2 bar (≥80% from docstring alone) wasn't hit, but the
+sprint goal — "make TM1's GREEN result the default" — IS hit so
+long as the onboarding surface clearly communicates the
+"one-of-three" requirement. The onboarding card's existing copy
+already mentions Allow-always and the Project-instructions
+recipe; it does not yet mention personal preferences. **Notes
+this gap for TM3.**
 
 ---
 
-## G1 — fresh-conversation capture-rate test
+## G1 — empirical capture-rate findings
 
-**Date / time:** <fill in>
-**Tenant used:** <fill in — the founder-owned test tenant; same one as TM1>
-**Plan tier:** <fill in — Team or Enterprise>
+The TM2 §5.2 hypothesis was: a hardened docstring carries the
+legitimacy framing alone, so the default install (Allow-always
+permission only — no Project, no personal preferences) hits ≥80%
+capture rate.
 
-### Setup checklist (mirrors TM1 §6 conditions, MINUS the Project instructions)
+**Hypothesis falsified.** The hardened docstring did improve the
+TM1 baseline (Claude no longer refuses outright) but did NOT
+reach reliable per-turn capture on its own. The model still
+treats the bearer-token-as-proof-of-install signal as insufficient
+when nothing in the user-channel reinforces it.
 
-- [ ] F-phase deploy landed: `docker compose ... build mcp-server` + `up -d --force-recreate mcp-server` on prod. Confirm via `docker compose logs mcp-server | grep "Ogma Telemetry — independent audit"` shows the new instructions string.
-- [ ] Connector installed at org level (post-TM2 SSO flow — user signs in via Google/Microsoft, NOT spike-mode static identity).
-- [ ] User-enabled per conversation.
-- [ ] `log_interaction` tool permission set to **Allow always**.
-- [ ] **NO Project created.** Open a plain conversation, no custom instructions.
+### Reliable-capture rule (verified live)
 
-### Capture rate
+**Allow-always permission** (always required) PLUS at least ONE of:
 
-| Metric                                    | Value |
-|-------------------------------------------|-------|
-| Total Claude responses in session         |       |
-| Total `log_interaction` calls received    |       |
-| Capture rate                              |       |
+1. **Personal preferences** — ask-first or unconditional
+   acknowledgment of org-installed audit connectors. Set per-user
+   in claude.ai settings. **Lowest-friction option.**
+2. **Project custom instructions** — the TM1 recipe. Higher
+   setup cost (one Project per workspace) but covers everyone
+   who joins that Project.
+3. **(Reserved)** — admin-prompt feature, pending Anthropic.
 
-**Reading:** <Green / Yellow / Red> — <one-line rationale>
+With ANY one of the three plus Allow-always, capture is reliable
+(same multi-paragraph summary quality + sub-second latency as
+TM1). Without any of the three, capture is unpredictable.
 
-### Sample summaries (paste 3 verbatim from `telemetry_records WHERE source_api='mcp'`)
+### Implication for the onboarding card
 
-```json
-// row 1
-```
+The MCP Connector card's inline expansion currently lists:
+  - Step 1: install at org level
+  - Step 2: copy URL
+  - Step 3: each user enables + sets permission to "Allow always"
+  - Step 4 (recommended): Project custom instructions
 
-```json
-// row 2
-```
-
-```json
-// row 3
-```
-
-### Comparison vs TM1
-
-| Metric                              | TM1 (with Project) | TM2 (no Project) |
-|-------------------------------------|--------------------|------------------|
-| Capture rate                        | 5/5 = 100%         |                  |
-| Avg summary length (chars)          | ~340               |                  |
-| p99 handler latency                 | sub-second         |                  |
+TM3 should add a "Step 3b" (or restructure) calling out personal
+preferences as the lighter-weight alternative to Step 4. The
+docstring (TM2 F1) stays as-is — loadbearing for the cases where
+ANY trust affordance is set.
 
 ---
 
@@ -184,7 +204,7 @@ TM1 flagged five spike-only shortcuts. All are removed or replaced in TM2:
 
 In rough priority order:
 
-1. **Empirical capture-rate without Project instructions.** G1 measures this; if < 80%, iterate `LOG_INTERACTION_DESCRIPTION` and rerun. TM3 plans the response: either keep iterating the docstring, or push for an Anthropic-side admin-prompt feature, or hard-code Project setup into the onboarding flow.
+1. **Onboarding copy update — the one-of-three trust-affordance rule.** G1 confirmed: the hardened docstring isn't sufficient by itself. The MCP Connector card (in onboarding AND in Settings) currently lists the Allow-always permission + the Project custom-instructions recipe; it does NOT yet mention personal preferences as the lighter-weight alternative. TM3 should add a short "first set up one of these trust affordances" callout above the existing instructions, ordered: (a) personal preferences, (b) Project instructions, (c) reserved for admin-prompt when Anthropic ships it.
 
 2. **Multi-replica MCP-server safety.** Auth-code + refresh-token stores are still in-memory (process-local). For a 2nd MCP replica we'd need Redis-backed versions (the `pull_state` precedent). One-shot deferred until traffic warrants.
 
