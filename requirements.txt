@@ -70,6 +70,20 @@ boto3>=1.34,<2
 # upstream changes.
 vargate-audit-chain @ git+ssh://git@github.com/zeroco84/vargate.ai.git@2ef8ada#subdirectory=packages/audit-chain
 
+# TM1: MCP connector server.
+# - mcp: official Python SDK. JSON-RPC framing, protocol-version
+#   negotiation, Streamable HTTP transport. Pinned to the 1.x line.
+# - authlib: OAuth 2.1 + Dynamic Client Registration + PKCE without
+#   us re-implementing every RFC by hand.
+# - python-jose[cryptography]: JWT sign/verify for the SSO bridge
+#   token between main Ogma and the MCP server (60s TTL, audience-
+#   bound). Existing PyJWT-style helper in vargate_telemetry/auth/jwt.py
+#   is HS256 only; jose gives us RS256 for the bridge if we want
+#   key separation later.
+mcp>=1.0,<2
+authlib>=1.3,<2
+python-jose[cryptography]>=3.3,<4
+
 # Test deps. Kept in this single requirements file for now so the image
 # can run pytest without a second install layer; revisit when the prod
 # image is split out (later in the sprint plan).

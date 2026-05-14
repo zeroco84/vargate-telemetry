@@ -237,6 +237,101 @@ def get_me(user: AuthenticatedUser = Depends(current_user)) -> MeResponse:
 
 
 # ───────────────────────────────────────────────────────────────────────────
+# TM2 Phase D2 — GET /me/capabilities
+# ───────────────────────────────────────────────────────────────────────────
+#
+# The dashboard fetches this on mount to reconcile its sessionStorage
+# capability snapshot with the current tenant-state. Per the TM2
+# CLAUDE.md rule on capability surfacing, the value reflects ACTUAL
+# usage in the last 90 days, not "was this key probed at onboarding."
+# A tenant that's been onboarded but never had data ingest still
+# reads False everywhere — the SPA tiles only light up after rows
+# actually arrive.
+
+
+@router.get(
+    "/me/capabilities",
+    operation_id="getMeCapabilities",
+    tags=["me"],
+    summary="Active-data-based 5-bool capability snapshot for the tenant",
+    responses={
+        status.HTTP_401_UNAUTHORIZED: {
+            "description": "Missing or invalid session.",
+        },
+    },
+)
+def get_me_capabilities(
+    user: AuthenticatedUser = Depends(current_user),
+) -> dict:
+    """Return the 5-bool capability shape from telemetry_records state.
+
+    Each bool answers: "does the tenant have at least one row with
+    the matching ``source_api`` in the last 90 days?" Same uniform
+    semantics as the ``mcp_connector`` detector in onboarding.py.
+
+    Pre-tenant users (no tenant_id) get all False.
+    """
+    if not user.tenant_id:
+        return {
+            "admin_api": False,
+            "activity_feed": False,
+            "content_capture": False,
+            "code_analytics": False,
+            "mcp_connector": False,
+        }
+
+    from vargate_telemetry.db import session_scope
+
+    with session_scope(user.tenant_id) as s:
+        # One round-trip — five EXISTS subqueries. Each one is
+        # cheap (single-row probe against
+        # ix_telemetry_records_tenant_occurred). content_capture
+        # stays a hard False per the T5.3 invariant.
+        row = s.execute(
+            sql_text(
+                """
+                SELECT
+                  EXISTS (
+                    SELECT 1 FROM telemetry_records
+                    WHERE tenant_id = :t
+                      AND source_api = 'admin'
+                      AND ingested_at > now() - INTERVAL '90 days'
+                  ) AS admin_api,
+                  EXISTS (
+                    SELECT 1 FROM telemetry_records
+                    WHERE tenant_id = :t
+                      AND source_api = 'compliance_activities'
+                      AND ingested_at > now() - INTERVAL '90 days'
+                  ) AS activity_feed,
+                  EXISTS (
+                    SELECT 1 FROM telemetry_records
+                    WHERE tenant_id = :t
+                      AND source_api = 'code_analytics'
+                      AND ingested_at > now() - INTERVAL '90 days'
+                  ) AS code_analytics,
+                  EXISTS (
+                    SELECT 1 FROM telemetry_records
+                    WHERE tenant_id = :t
+                      AND source_api = 'mcp'
+                      AND ingested_at > now() - INTERVAL '90 days'
+                  ) AS mcp_connector
+                """
+            ),
+            {"t": user.tenant_id},
+        ).one()
+
+    return {
+        "admin_api": bool(row.admin_api),
+        "activity_feed": bool(row.activity_feed),
+        # T5.3 invariant: content_capture is always False until the
+        # Compliance Access Key onboarding step lands.
+        "content_capture": False,
+        "code_analytics": bool(row.code_analytics),
+        "mcp_connector": bool(row.mcp_connector),
+    }
+
+
+# ───────────────────────────────────────────────────────────────────────────
 # POST /auth/logout — clear the session cookie
 # ───────────────────────────────────────────────────────────────────────────
 

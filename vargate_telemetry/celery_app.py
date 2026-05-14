@@ -12,7 +12,14 @@ celery_app = Celery(
     "vargate_telemetry",
     broker=os.environ["CELERY_BROKER_URL"],          # redis://redis:6379/1
     backend=os.environ["CELERY_RESULT_BACKEND"],     # redis://redis:6379/2
-    include=["vargate_telemetry.tasks"],             # populated in later sprints
+    # TM1: mcp_server.tasks lives outside the vargate_telemetry tree
+    # so it can be carved into its own package later (Apache 2.0 vs
+    # BSL-1.1). Include both module paths so the worker discovers
+    # both task sets.
+    include=[
+        "vargate_telemetry.tasks",
+        "mcp_server.tasks",
+    ],
 )
 
 celery_app.conf.update(
@@ -89,6 +96,17 @@ celery_app.conf.beat_schedule = {
             "dispatch_code_analytics_pulls"
         ),
         "schedule": 900.0,  # every 15 minutes
+        "options": {"queue": "default"},
+    },
+    # TM2 Phase C4: re-fetch the bridge JWK from Ogma's well-known
+    # endpoint every 24h so key rotation propagates without a
+    # redeploy. The MCP server's lifespan primes the cache at boot;
+    # this task keeps it fresh while the server is long-running.
+    # On failure the task logs but does NOT raise — the stale cache
+    # stays warm and the next tick retries.
+    "refresh-bridge-jwk": {
+        "task": "mcp_server.tasks.refresh_bridge_jwk.refresh_bridge_jwk",
+        "schedule": 86400.0,  # 24 hours
         "options": {"queue": "default"},
     },
 }

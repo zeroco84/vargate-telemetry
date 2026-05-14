@@ -123,3 +123,181 @@ SELECT tenant_id, created_at, region FROM tenants ORDER BY created_at DESC LIMIT
 A tenant ID can become stale between when the spec is written and when the task runs — re-onboarding cycles, test runs, founder spinning up a new tenant, etc. Pasting a stale tenant ID and hitting "no rows" mid-task wastes a round-trip and (worse) can land work against the wrong tenant if a similar ID exists.
 
 T5.5.6 spec referenced `tnt_eu_4191a3cac6064abe` in one place and `tnt_eu_2f73d474ff0a489c` in another. The first didn't exist; the second did. Re-querying caught both before any code touched the wrong rows.
+
+---
+
+## MCP connectors are tool providers, not passive observers
+
+The Ogma MCP server (TM1) does NOT see raw user prompts, raw Claude responses, or the full tool-call chain. It sees **only what Claude chooses to summarize** when it calls our `log_interaction` tool. That's enough for compliance metadata and cost analytics; insufficient for forensic prompt/response review.
+
+This is the fundamental fidelity ceiling of the MCP capture model — not a bug to fix, an architectural reality to be transparent about in product copy. For "we see what your team types into Claude" pitching, MCP doesn't deliver. For "audited opt-in record of what kinds of work get done with Claude" it does.
+
+Enterprise tenants who need full fidelity use the Compliance API path. MCP is the Pro/Team/Free universal-tier surface.
+
+---
+
+## MCP capture depends on Claude reliably calling the logging tool every turn
+
+The most reliable mechanism is a **shared Claude Project with a custom instruction** that says "after every response, call `ogma.log_interaction` ...". Members work inside the Project; conversations outside the Project are NOT tracked.
+
+What does NOT exist:
+- Global org-wide "every conversation has these instructions" toggle outside Projects.
+- A way to FORCE Claude to call a specific tool on every turn — the instruction is advisory; Claude's compliance is high but not 100%.
+- A way to prevent users from disabling the connector mid-conversation.
+
+Surface the opt-in model honestly: Ogma sees what users choose to track, not everything. Customers who try to position this as universal coverage will be caught out.
+
+---
+
+## MCP tool calls block the conversation — handler MUST return <500ms p99
+
+Tool calls in Claude Desktop / claude.ai are synchronous with a ~60s client-side timeout. Latency added to `log_interaction` shows up as visible delay on every Claude response.
+
+The `log_interaction` handler MUST:
+1. Validate the bearer token (in-memory cache + Postgres fallback).
+2. Validate args (Pydantic).
+3. **Enqueue persistence to Celery** (fire-and-forget; do NOT await).
+4. Return `{logged: true, event_id}` immediately.
+
+Anything that synchronously writes to Postgres before returning will be felt by every customer. The Celery task retries on its own retry policy; the customer never knows if the chain insert had a transient blip.
+
+---
+
+## MCP tokens are audience-bound; main Ogma tokens are NOT accepted at the MCP surface
+
+Each MCP client (a Claude installation) maps 1:1 to one OAuth identity at one tenant. Tokens issued by the MCP authorization server carry an audience claim (RFC 8707 `resource`) of `mcp.ogma.vargate.ai`. The MCP `/mcp` endpoint rejects any bearer whose audience is not that exact value.
+
+This means main Ogma's session JWTs (audience: `ogma.vargate.ai`) cannot be replayed against the MCP server, and vice versa. The two surfaces are cryptographically separated even though they share the same SSO provider underneath. **Don't blur the line** by accepting one type of token at the other endpoint.
+
+---
+
+## MCP is the Team/Pro/Free ingest surface; Compliance API stays Enterprise-only
+
+Ogma now has three ingest paths:
+
+| Surface | Plan | Fidelity | UX |
+|---|---|---|---|
+| Admin API | Pro/Team/Enterprise | Daily token aggregates, no content | Always-on, server-side |
+| Code Analytics | Enterprise + entitlement | Per-actor sessions, no content | Always-on once entitled |
+| MCP (TM1) | Pro/Team/Free | Per-turn tool-call summaries | Opt-in via shared Project |
+| Compliance API | Enterprise + Compliance Access Key | Full chat/file/admin event metadata + content | Always-on once keyed |
+
+Position the MCP path as the universal-tier option. Recommend Compliance API for any tenant whose use case needs "every prompt and response, recorded."
+
+---
+
+## Production deploys via `docker compose build` need an SSH agent loaded in the current shell
+
+`docker compose build` of any service that runs `RUN --mount=type=ssh` (gateway, celery-worker, celery-beat — they all need it for `pip install vargate-audit-chain` from the private vargate-proxy repo) requires `SSH_AUTH_SOCK` to be set when the build runs. Without it:
+
+1. The build does NOT hard-fail. It silently falls back to using the previously-cached image layer with the OLD code.
+2. `docker compose up -d` then starts the OLD image. Containers report `(healthy)`.
+3. `alembic upgrade head` succeeds — but against the OLD schema-aware code, against the new migration files. Mismatch.
+4. New routes 404, new fields missing, the deploy looks successful and is broken.
+
+**The check for a successful deploy is `alembic current` showing the new revision, OR `docker compose exec gateway python -c "import <new_module>"`, NOT the absence of an error from `docker compose up`.** `su -` does NOT inherit ssh-agent; `sudo -u vargate` does NOT inherit ssh-agent. Use `sudo -u vargate -i bash -c 'eval $(ssh-agent -s) && ssh-add <key> && docker compose build ...'` to keep the agent alive in the same subshell as the build.
+
+---
+
+## Cloudflare Universal SSL covers ONE subdomain level only
+
+`*.vargate.ai` is covered by the free cert. `*.ogma.vargate.ai` (two-deep) is NOT. The failure mode is a TLS handshake error at the Cloudflare edge — origin never sees the request, certbot at origin can't help.
+
+Two ways to deploy a depth-≥2 subdomain:
+
+1. **DNS-only (grey cloud) in Cloudflare** — origin handles TLS via Let's Encrypt directly. We chose this for `mcp.ogma.vargate.ai`. Loses Cloudflare's DDoS layer for that hostname; fine for the API surface, would be bad for the marketing site.
+2. **Cloudflare Advanced Certificate Manager** — paid feature, $10/mo per zone for arbitrary-depth wildcards.
+
+Pre-deploy check for any new depth-≥2 subdomain: `curl -sI https://<host>/` from off-box, look for the TLS error. If it's a Cloudflare-edge error and not your origin's nginx, you hit the limit.
+
+---
+
+## MCP connector `resource` indicators are origin-level (RFC 8707), with trailing slash
+
+Anthropic's MCP client strips the path from the configured connector URL and sends only the origin as the `resource` value on `/authorize` and `/token` requests. Furthermore, it appends a trailing slash to the origin.
+
+So if you configure the connector at `https://mcp.ogma.vargate.ai/mcp`, Claude sends `resource=https://mcp.ogma.vargate.ai/`. The audience-binding comparison MUST be `.rstrip("/")` on both sides; string-equal is wrong and 401s every tool call. Don't try to use a path component (e.g. `/v1/mcp`) as part of the audience-binding identity — Anthropic will drop it.
+
+---
+
+## MCP capture: transparent framing or it doesn't fire
+
+For an "every-turn" MCP logging tool, Claude WILL refuse to call it (or quietly skip) if the framing in either the tool description OR the Project's custom-instructions implies hiding the call from the user. The words "invisible to user," "hidden," "without the user knowing," "silently" are all triggers — even when the user is the one writing them and asking for the logging.
+
+Frame as: "your organization uses [tool] for compliance auditing; the tool call is visible in this conversation; you should call it after every response." Claude's safety training correctly refuses the hidden-exfiltration shape, even with user consent — getting around that with prompt cleverness is both unethical and brittle. **Transparency is the only fix.**
+
+---
+
+## MCP feasibility-test checklist (catch the autodiscovery trap)
+
+When validating an "every-turn" tool call setup:
+
+1. **Connector installed at org level** (per-user installs don't work for the spike).
+2. **User-enabled per conversation** (defaults to off on each new thread).
+3. **Tool permission set to "Allow always"** ("Needs approval" produces gappy capture).
+4. **Transparent custom-instructions in the Project** (see framing rule above).
+5. **Verify the celery worker has the task registered** before declaring "no capture" a model issue:
+
+   ```
+   docker compose logs celery-worker | grep "tasks"
+   # expect to see e.g.:
+   #   . mcp_server.tasks.persist_event.persist_event
+   ```
+
+   If the task name is absent, autodiscovery is broken. `celery_app.include=["pkg.tasks"]` imports the package but does NOT recurse — `pkg/tasks/__init__.py` must explicitly `from pkg.tasks import <module>` for each submodule. Symptom: handler returns 200 to the client (logged via the fast path), but no row lands in Postgres and the worker raises `KeyError` in the broker log. Caught and fixed in TM1 — see `mcp_server/tasks/__init__.py`.
+
+The trap: every other layer can be working perfectly, and you'll still see zero capture if step 5 is broken — the model isn't the problem.
+
+---
+
+# TM2 conventions
+
+The MCP path graduates from spike to GA. The rules below are TM2's contract — break any of them and the productization assumptions don't hold.
+
+## Spike mode is dead
+
+`MCP_SPIKE_MODE` and the `MCP_TEST_IDENTITY_*` env vars must NOT be set on any production path after TM2 ships. The MCP server's `/authorize` endpoint always goes through real Ogma SSO. The startup check refuses to boot if `MCP_SPIKE_MODE=true` is observed in any environment — fail loud, don't silently re-enable the shortcut.
+
+A test environment may still set spike-mode for unit-test fixtures that need a deterministic token without round-tripping a full SSO flow. The startup-refusal applies to production; tests set the var inside a `monkeypatch` block, never in the docker-compose default env.
+
+---
+
+## Tool description is the trusted channel
+
+The MCP `log_interaction` tool's docstring — `LOG_INTERACTION_DESCRIPTION` in `mcp_server/mcp/tools/log_interaction.py` — is what Claude reads when deciding whether to call. It travels through the MCP protocol channel that Anthropic treats as trusted server metadata, not as user-channel input. Transparent legitimacy framing belongs there. Project-level custom instructions reinforce, but the docstring carries the load.
+
+Updating the docstring requires a `docker compose build mcp-server` + `up -d --force-recreate mcp-server` to take effect — Claude reads the description fresh on the `initialize` handshake, but only after the server is redeployed. Treat the docstring as a behavioral contract (capture rate is sensitive to the wording), not just documentation.
+
+---
+
+## MCP source attribution is per-event, not per-session
+
+A single `(date, actor)` session may have records from multiple `source_api` values — admin_api + mcp + activity_feed for an Enterprise+Team tenant using the API agent and Claude Desktop concurrently is the normal case once TM2 ships. Render the **source distribution** per session (e.g., "12 events (8 mcp, 3 admin, 1 activity_feed)"), don't pick one source as canonical and hide the rest.
+
+The Sessions row gets one badge per contributing source; SessionDetail breaks the events down by source in the timeline.
+
+---
+
+## Connector display name is `Ogma Telemetry` (server-side)
+
+When a customer installs the MCP connector via claude.ai's Add Custom Connector dialog, the "name" field prefills from the server's FastMCP `name=` parameter on the `initialize` response. Set this once in `mcp_server/mcp/server.py` and customers don't have to guess. Rick's TM1 install said "vargate.ai" because the field was a free-text input — that's how it appears when the server-side default is wrong.
+
+If Anthropic's UI ever stops prefilling from server metadata, document the limitation and update the onboarding-step copy to spell out the recommended name. Don't fight the UI.
+
+---
+
+## Bridge JWT keypair is file-mounted ECDSA P-256, not HSM-backed
+
+The TM2 SSO bridge issues 60-second JWTs from Ogma's gateway to the MCP server. The signing keypair is ECDSA P-256, mounted into both containers via a path env var (`OGMA_BRIDGE_JWT_PRIVATE_KEY_PATH` for the gateway, the public key fetched by the MCP server from `/.well-known/ogma-public-key.json`).
+
+This is intentionally NOT in SoftHSM2. The HSM is the right home for long-lived key material (per-tenant DEKs, the KEK). A 60-second token's blast radius from a key-leak is bounded by token lifetime; the operational cost of PKCS#11 signing on a hot path doesn't earn its complexity for that horizon. Manual rotation is fine — generate a fresh keypair, deploy gateway + mcp-server with the new public key, redeploy.
+
+**Move to HSM signing when general key-rotation infrastructure lands across the stack** (session JWTs, content encryption rotation, etc.). Until then this is a conscious shortcut.
+
+---
+
+## Onboarding ingest paths are parallel cards, not sequential steps
+
+The onboarding screen after region-select shows ingest paths as **side-by-side cards**, not as a sequence of mandatory steps. A customer can set up zero, one, or both. The deliberate UX claim is: "these are complementary integrations, you get to choose your shape." If we ever need a fourth path (e.g., Compliance API Access Key once that flow lands), it gets a card, not a step.
+
+This applies to the post-onboarding settings page too — the same card pattern, with each card showing connected/not-connected state and the action to set up the missing one.

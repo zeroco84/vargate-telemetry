@@ -20,7 +20,7 @@ from __future__ import annotations
 import json
 import os
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Iterator
 
 import pytest
@@ -181,6 +181,9 @@ def test_list_sessions_happy_path(
         assert s["actor"]["type"] == "user_actor"
         assert s["source_apis"] == ["code_analytics"]
         assert s["event_count"] == 1
+        # TM2 Phase E1: single-source session yields a single-key
+        # event_count_by_source map.
+        assert s["event_count_by_source"] == {"code_analytics": 1}
         assert s["date"] == "2026-05-11"
         assert isinstance(s["session_id"], str) and len(s["session_id"]) > 0
 
@@ -230,6 +233,13 @@ def test_list_sessions_aggregates_activity_feed_into_same_session(
     assert s["event_count"] == 3
     # Sorted by SQL ARRAY_AGG DISTINCT ORDER BY source_api ASC.
     assert s["source_apis"] == ["code_analytics", "compliance_activities"]
+    # TM2 Phase E1: per-source breakdown — keys match source_apis,
+    # values sum to event_count (1 code_analytics + 2 activity).
+    assert s["event_count_by_source"] == {
+        "code_analytics": 1,
+        "compliance_activities": 2,
+    }
+    assert sum(s["event_count_by_source"].values()) == s["event_count"]
 
 
 def test_list_sessions_excludes_admin_usage_records(
@@ -260,6 +270,172 @@ def test_list_sessions_excludes_admin_usage_records(
     body = r.json()
     assert len(body["sessions"]) == 1
     assert body["sessions"][0]["actor"]["key"] == "alice@example.com"
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# TM2 Phase E1 — MCP rows surface as sessions; mixed-source aggregation
+# ───────────────────────────────────────────────────────────────────────────
+
+
+def _seed_mcp_row(
+    tenant_id: str,
+    *,
+    occurred_at: datetime,
+    user_email: str,
+    user_id: str,
+    external_id: str | None = None,
+) -> None:
+    """Insert one MCP row with the FLAT metadata shape the persist task
+    actually writes (no nested `actor` envelope). Exercises the
+    Phase E1 actor-extraction fallback in _ACTOR_KEY_SQL + _ACTOR_TYPE_SQL.
+    """
+    from vargate_telemetry.db import engine
+
+    md = {
+        "user_email": user_email,
+        "subject_user_id": user_id,
+        "kind": "chat",
+        "model": "claude-opus-4-7",
+        "summary": "test row",
+    }
+    eid = external_id or f"mcp:{tenant_id}:{user_id}:{occurred_at.isoformat()}"
+    with engine.begin() as conn:
+        conn.execute(
+            sql_text(
+                """
+                INSERT INTO telemetry_records (
+                    tenant_id, record_type, source_api, external_id,
+                    subject_user_id,
+                    occurred_at, content_hash, metadata,
+                    chain_seq, chain_prev_hash, chain_self_hash
+                ) VALUES (
+                    :tenant_id, 'mcp_interaction', 'mcp', :external_id,
+                    :user_id,
+                    :occurred_at, decode(:hh, 'hex'),
+                    :metadata,
+                    (SELECT COALESCE(MAX(chain_seq), 0) + 1
+                       FROM telemetry_records
+                      WHERE tenant_id = :tenant_id_lookup),
+                    decode(:hh, 'hex'),
+                    decode(:hh, 'hex')
+                )
+                """
+            ),
+            {
+                "tenant_id": tenant_id,
+                "tenant_id_lookup": tenant_id,
+                "external_id": eid,
+                "user_id": user_id,
+                "occurred_at": occurred_at,
+                "hh": "00" * 32,
+                "metadata": json.dumps(md),
+            },
+        )
+
+
+def test_list_sessions_surfaces_mcp_records_with_flat_metadata(
+    clean_records: None, client: TestClient
+) -> None:
+    """An MCP-only session — flat metadata, no actor envelope —
+    still aggregates correctly into one (date, user_email) session."""
+    tenant = "tnt_us_test_mcp_solo"
+    base = datetime(2026, 5, 13, 14, 0, tzinfo=timezone.utc)
+    for hour_offset in (0, 1, 2):
+        _seed_mcp_row(
+            tenant,
+            occurred_at=base + timedelta(hours=hour_offset),
+            user_email="claude-user@example.com",
+            user_id="user-mcp-flat",
+        )
+
+    r = client.get("/sessions", headers=_bearer_for_tenant(tenant))
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert len(body["sessions"]) == 1
+    s = body["sessions"][0]
+    # The FLAT MCP metadata fell through the COALESCE chain to
+    # metadata->>'user_email'. Source extraction synthesizes
+    # 'user_actor' for source_api='mcp'.
+    assert s["actor"]["type"] == "user_actor"
+    assert s["actor"]["key"] == "claude-user@example.com"
+    assert s["source_apis"] == ["mcp"]
+    assert s["event_count"] == 3
+    assert s["event_count_by_source"] == {"mcp": 3}
+
+
+def test_list_sessions_aggregates_mcp_and_compliance_into_same_session(
+    clean_records: None, client: TestClient
+) -> None:
+    """Mixed-source session: same user has 2 MCP rows + 1 Compliance
+    activity row on the same date → ONE session, event_count_by_source
+    breaks down by stream."""
+    tenant = "tnt_us_test_mcp_mixed"
+    base = datetime(2026, 5, 13, 9, 0, tzinfo=timezone.utc)
+    email = "shared-user@example.com"
+
+    # Two MCP rows (flat metadata).
+    _seed_mcp_row(
+        tenant, occurred_at=base, user_email=email, user_id="u",
+    )
+    _seed_mcp_row(
+        tenant,
+        occurred_at=base + timedelta(hours=2),
+        user_email=email,
+        user_id="u",
+    )
+    # One Compliance Activities row (nested actor envelope).
+    _seed_record(
+        tenant,
+        occurred_at=base + timedelta(hours=4),
+        source_api="compliance_activities",
+        actor_type="user_actor",
+        actor_key_field="email_address",
+        actor_key=email,
+        external_id="activity_01mix",
+        extra_metadata={"type": "claude_chat_created"},
+    )
+
+    r = client.get("/sessions", headers=_bearer_for_tenant(tenant))
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert len(body["sessions"]) == 1
+    s = body["sessions"][0]
+    assert s["event_count"] == 3
+    # source_apis is sorted alphabetically.
+    assert s["source_apis"] == ["compliance_activities", "mcp"]
+    assert s["event_count_by_source"] == {
+        "compliance_activities": 1,
+        "mcp": 2,
+    }
+
+
+def test_list_sessions_source_filter_accepts_mcp(
+    clean_records: None, client: TestClient
+) -> None:
+    """The ?source=mcp filter is in the allowlist and surfaces only MCP rows."""
+    tenant = "tnt_us_test_mcp_filter"
+    base = datetime(2026, 5, 13, 12, 0, tzinfo=timezone.utc)
+    _seed_mcp_row(
+        tenant, occurred_at=base, user_email="a@x.com", user_id="ua",
+    )
+    _seed_record(
+        tenant,
+        occurred_at=base,
+        source_api="code_analytics",
+        actor_type="user_actor",
+        actor_key_field="email_address",
+        actor_key="b@x.com",
+    )
+
+    r = client.get(
+        "/sessions?source_api=mcp", headers=_bearer_for_tenant(tenant)
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert len(body["sessions"]) == 1
+    s = body["sessions"][0]
+    assert s["source_apis"] == ["mcp"]
+    assert s["actor"]["key"] == "a@x.com"
 
 
 # ───────────────────────────────────────────────────────────────────────────

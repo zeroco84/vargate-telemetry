@@ -107,12 +107,21 @@ class KeyCapabilities(BaseModel):
         Compliance Access Key onboarding step; until then the
         frontend renders this row as "Enable later — requires
         Compliance Access Key".
+
+    TM1 added ``mcp_connector``: True iff this tenant has at least
+    one ``telemetry_records`` row with ``source_api='mcp'`` in the
+    last 90 days. Unlike the other four (which probe Anthropic),
+    this signal reflects **actual runtime usage** — the capability
+    only lights up once Claude has called ``log_interaction`` for
+    real. If the caller has no bound tenant_id yet (i.e., they're
+    still in pre-tenant onboarding), this is False.
     """
 
     admin_api: bool
     activity_feed: bool
     content_capture: bool
     code_analytics: bool
+    mcp_connector: bool
 
 
 class ValidateKeyResponse(BaseModel):
@@ -229,6 +238,41 @@ _INVALID_KEY_MESSAGE = (
     "console and try again. The key needs Admin API access — make sure "
     "you selected `Full access` when creating it."
 )
+
+
+def _tenant_has_recent_mcp_traffic(tenant_id: Optional[str]) -> bool:
+    """TM1 — runtime signal for the ``mcp_connector`` capability.
+
+    Returns True iff this tenant has at least one row in
+    ``telemetry_records`` with ``source_api = 'mcp'`` ingested in
+    the last 90 days. Returns False if ``tenant_id`` is None — the
+    pre-select-region onboarding caller hasn't been assigned a
+    tenant yet, so they can't have any traffic.
+
+    Uses ``session_scope`` so RLS applies — even though we're only
+    SELECTing a literal, the tenant-pinned context lets PG short-
+    circuit the policy check.
+    """
+    if not tenant_id:
+        return False
+    # Late import — `session_scope` is the blessed entrypoint, but
+    # importing it at module load forces the env-dep `DATABASE_URL`
+    # to exist at import time, which would break a few unit tests
+    # that monkeypatch the client factory before any DB is up.
+    from vargate_telemetry.db import session_scope
+
+    with session_scope(tenant_id) as s:
+        row = s.execute(
+            sql_text(
+                "SELECT 1 FROM telemetry_records "
+                "WHERE tenant_id = :t "
+                "  AND source_api = 'mcp' "
+                "  AND ingested_at > now() - INTERVAL '90 days' "
+                "LIMIT 1"
+            ),
+            {"t": tenant_id},
+        ).first()
+        return row is not None
 
 
 def _is_auth_failure(exc: BaseException) -> bool:
@@ -375,6 +419,13 @@ def validate_key(
                 # log loudly so we notice when this drifts.
                 code_analytics_ok = False
 
+        # 5. MCP connector probe (TM1). Unlike the four above, this
+        # is NOT a probe of Anthropic — it's a runtime signal about
+        # whether THIS tenant has ever received an `mcp` row in
+        # telemetry_records (last 90 days). A bound tenant_id is
+        # required; the pre-select-region caller gets False.
+        mcp_connector_ok = _tenant_has_recent_mcp_traffic(user.tenant_id)
+
         return ValidateKeyResponse(
             org_name=org_name or "Your Anthropic Organization",
             capabilities=KeyCapabilities(
@@ -382,6 +433,7 @@ def validate_key(
                 activity_feed=activity_feed_ok,
                 content_capture=content_capture_ok,
                 code_analytics=code_analytics_ok,
+                mcp_connector=mcp_connector_ok,
             ),
         )
 
@@ -1046,3 +1098,96 @@ def get_backfill_status(
         payload["error"] = _format_failure(info)
 
     return BackfillStatusResponse(**payload)
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# TM2 Phase D1 — GET /onboarding/mcp-status
+# ───────────────────────────────────────────────────────────────────────────
+#
+# The onboarding SPA polls this endpoint after the user has clicked
+# "I've completed setup" on the MCP-Connector card. It reflects
+# whether any `mcp` row has landed for the signed-in user's tenant.
+# Same source of truth as the `mcp_connector` capability bool
+# (test_mcp_capability.py) — just exposed with timestamp + count
+# so the SPA can render "Connected — N interactions captured".
+
+
+class McpStatusResponse(BaseModel):
+    """Snapshot of MCP-connector ingest state for the caller's tenant.
+
+    All three fields update independently of the configured-at
+    timestamp on any DCR row — capability lights up by USAGE, not
+    by registration. See the `mcp_connector` capability detector
+    in this same module.
+    """
+
+    configured: bool = Field(
+        ...,
+        description=(
+            "True iff at least one telemetry_records row with "
+            "source_api='mcp' exists for this tenant in the last "
+            "90 days. Same condition as the capability bool."
+        ),
+    )
+    first_event_at: Optional[datetime] = Field(
+        default=None,
+        description=(
+            "ISO-8601 UTC timestamp of the earliest mcp record "
+            "for this tenant. Null if no events yet."
+        ),
+    )
+    events_count: int = Field(
+        ...,
+        description=(
+            "Total mcp records in the last 90 days. The SPA's poll "
+            "loop watches for this to transition from 0 → N."
+        ),
+    )
+
+
+@router.get(
+    "/onboarding/mcp-status",
+    response_model=McpStatusResponse,
+    operation_id="getMcpStatus",
+    tags=["onboarding"],
+    summary="MCP-connector ingest status for the caller's tenant",
+)
+def get_mcp_status(
+    user: AuthenticatedUser = Depends(current_user),
+) -> McpStatusResponse:
+    """Return the MCP-source ingest snapshot.
+
+    A pre-select-region caller (no bound tenant_id yet) gets the
+    not-configured shape — they can't have any MCP traffic by
+    construction.
+    """
+    if not user.tenant_id:
+        return McpStatusResponse(
+            configured=False, first_event_at=None, events_count=0
+        )
+
+    # Use the session-scope so RLS applies — the COUNT + MIN are
+    # cheap enough to run per poll without caching, especially with
+    # the (tenant_id, occurred_at) index that lands on
+    # telemetry_records via T2.1's ix_telemetry_records_tenant_occurred.
+    from vargate_telemetry.db import session_scope
+
+    with session_scope(user.tenant_id) as s:
+        row = s.execute(
+            sql_text(
+                "SELECT MIN(occurred_at) AS first_at, "
+                "       COUNT(*) AS n "
+                "FROM telemetry_records "
+                "WHERE tenant_id = :t "
+                "  AND source_api = 'mcp' "
+                "  AND ingested_at > now() - INTERVAL '90 days'"
+            ),
+            {"t": user.tenant_id},
+        ).one()
+
+    count = int(row.n or 0)
+    return McpStatusResponse(
+        configured=count > 0,
+        first_event_at=row.first_at if count > 0 else None,
+        events_count=count,
+    )
