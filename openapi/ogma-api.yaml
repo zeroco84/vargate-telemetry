@@ -40,6 +40,13 @@ tags:
     description: First-run flow that gets a paying customer to "data flowing" in <60 s.
   - name: me
     description: The authenticated caller's identity.
+  - name: budgets
+    description: |
+      CFO-facing budget caps + alerts. A budget targets one scope
+      (api_key | workspace | model | tenant) and one period
+      (daily | weekly | monthly). The evaluator runs every 15
+      minutes and fires an alert at 70 / 85 / 100 % of the cap,
+      dedup'd to at-most-once-per-period-per-threshold.
 
 # ───────────────────────────────────────────────────────────────────────────
 # Security schemes
@@ -677,6 +684,230 @@ components:
             Opaque cursor for the next page. `null` when no more.
             Pass back as the `cursor` query param.
 
+    # ───────────────────────────────────────────────────────────────────────
+    # Budgets (TM3 Phase B)
+    # ───────────────────────────────────────────────────────────────────────
+
+    BudgetScopeKind:
+      type: string
+      enum: [api_key, workspace, model, tenant]
+      description: |
+        What the budget caps. `tenant` is everything; the others
+        slice by Anthropic API key id / workspace id / model name.
+
+    BudgetPeriod:
+      type: string
+      enum: [daily, weekly, monthly]
+      description: |
+        Reset cadence. UTC-aligned: daily = UTC midnight,
+        weekly = ISO Monday, monthly = 1st of UTC month.
+
+    Budget:
+      type: object
+      required:
+        - id
+        - name
+        - scope_kind
+        - period
+        - threshold_usd
+        - alert_recipients
+        - created_at
+        - updated_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+          maxLength: 256
+        scope_kind:
+          $ref: '#/components/schemas/BudgetScopeKind'
+        scope_value:
+          type: string
+          nullable: true
+          maxLength: 256
+          description: |
+            api_key_id / workspace_id / model name. NULL only when
+            `scope_kind == tenant`. The view layer resolves
+            workspace and api_key ids to human names via the
+            existing side tables.
+        period:
+          $ref: '#/components/schemas/BudgetPeriod'
+        threshold_usd:
+          type: string
+          description: |
+            USD cap as a string-encoded Decimal (e.g. `"500.00"`).
+            Always positive; the CHECK constraint at the DB
+            forbids ≤ 0.
+        alert_recipients:
+          type: array
+          items:
+            type: string
+            format: email
+          description: |
+            Email addresses to notify when a threshold fires. May
+            be empty (alert event still records; no email goes
+            out).
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        created_by_user_id:
+          type: string
+          format: uuid
+          nullable: true
+          description: |
+            The user who created the budget (from the JWT subject).
+            Nulled if that user is later deleted (ON DELETE SET NULL).
+
+    BudgetCreate:
+      type: object
+      required: [name, scope_kind, period, threshold_usd]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 256
+        scope_kind:
+          $ref: '#/components/schemas/BudgetScopeKind'
+        scope_value:
+          type: string
+          nullable: true
+          maxLength: 256
+        period:
+          $ref: '#/components/schemas/BudgetPeriod'
+        threshold_usd:
+          type: string
+          description: USD cap as a string-encoded Decimal, > 0.
+        alert_recipients:
+          type: array
+          items:
+            type: string
+            format: email
+          default: []
+
+    BudgetUpdate:
+      type: object
+      description: |
+        Only the supplied fields are touched. Immutable axes
+        (scope_kind, scope_value, period) are NOT in the update
+        body — to change them, delete the budget and create a new
+        one. Empty body returns 400 (no_fields_to_update).
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 256
+        threshold_usd:
+          type: string
+          description: USD cap as a string-encoded Decimal, > 0.
+        alert_recipients:
+          type: array
+          items:
+            type: string
+            format: email
+
+    BudgetDetail:
+      allOf:
+        - $ref: '#/components/schemas/Budget'
+        - type: object
+          required:
+            - current_period_start
+            - current_period_end
+            - current_spend_usd
+            - current_ratio
+          properties:
+            current_period_start:
+              type: string
+              format: date
+            current_period_end:
+              type: string
+              format: date
+            current_spend_usd:
+              type: string
+              description: |
+                Sum of admin-API usage in the current period
+                matching the budget's scope, as a string Decimal
+                (e.g. `"73.14"`). Quantized to 2 decimals.
+            current_ratio:
+              type: string
+              description: |
+                current_spend_usd / threshold_usd, quantized to 4
+                decimals. Can exceed 1.0 (over budget).
+            current_threshold_crossed:
+              type: string
+              nullable: true
+              description: |
+                Highest threshold the current ratio has crossed
+                (0.70 / 0.85 / 1.00). NULL when the ratio is
+                below the lowest threshold. UI uses this for the
+                progress bar's color tier.
+
+    BudgetListResponse:
+      type: object
+      required: [rows]
+      properties:
+        rows:
+          type: array
+          items:
+            $ref: '#/components/schemas/Budget'
+
+    BudgetAlertEvent:
+      type: object
+      required:
+        - id
+        - budget_id
+        - budget_name
+        - period_start
+        - threshold_crossed
+        - current_spend_usd
+        - fired_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        budget_id:
+          type: string
+          format: uuid
+        budget_name:
+          type: string
+          description: Joined from `budgets` for the alert list view.
+        period_start:
+          type: string
+          format: date
+        threshold_crossed:
+          type: string
+          description: One of `0.70`, `0.85`, `1.00`.
+        current_spend_usd:
+          type: string
+          description: |
+            The spend figure that fired the alert (as a string
+            Decimal). Snapshot at fire time; the budget's
+            current spend may diverge later as more usage
+            arrives.
+        fired_at:
+          type: string
+          format: date-time
+        acknowledged_at:
+          type: string
+          format: date-time
+          nullable: true
+        acknowledged_by_user_id:
+          type: string
+          format: uuid
+          nullable: true
+
+    BudgetAlertListResponse:
+      type: object
+      required: [rows]
+      properties:
+        rows:
+          type: array
+          items:
+            $ref: '#/components/schemas/BudgetAlertEvent'
+
   # ─────────────────────────────────────────────────────────────────────────
   # Reusable response bodies — every 4xx / 5xx is an ErrorResponse.
   # ─────────────────────────────────────────────────────────────────────────
@@ -1206,3 +1437,153 @@ paths:
           $ref: '#/components/responses/Unauthenticated'
         '500':
           $ref: '#/components/responses/InternalError'
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Budgets (TM3 Phase B)
+  # ─────────────────────────────────────────────────────────────────────────
+
+  /budgets:
+    get:
+      tags: [budgets]
+      summary: List the authenticated tenant's live (non-deleted) budgets
+      operationId: listBudgets
+      responses:
+        '200':
+          description: Budget rows.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BudgetListResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+    post:
+      tags: [budgets]
+      summary: Create a new budget for the authenticated tenant
+      operationId: createBudget
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BudgetCreate'
+      responses:
+        '201':
+          description: The created budget.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Budget'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+
+  /budgets/{budget_id}:
+    parameters:
+      - in: path
+        name: budget_id
+        required: true
+        schema:
+          type: string
+          format: uuid
+    get:
+      tags: [budgets]
+      summary: Budget detail with current-period spend + ratio
+      operationId: getBudgetDetail
+      responses:
+        '200':
+          description: Budget detail.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BudgetDetail'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+    patch:
+      tags: [budgets]
+      summary: Update mutable fields on a budget
+      operationId: updateBudget
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BudgetUpdate'
+      responses:
+        '200':
+          description: The updated budget.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Budget'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+    delete:
+      tags: [budgets]
+      summary: Soft-delete a budget (sets deleted_at; row stays in the table)
+      operationId: deleteBudget
+      responses:
+        '204':
+          description: Budget soft-deleted; no body.
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+
+  /budget-alerts:
+    get:
+      tags: [budgets]
+      summary: List alert events fired against this tenant's budgets
+      operationId: listBudgetAlerts
+      parameters:
+        - in: query
+          name: unack
+          schema:
+            type: boolean
+            default: false
+          description: |
+            When true, exclude already-acknowledged alerts (active-
+            alerts view). When false / omitted, the full alert
+            history is returned (paged by fired_at DESC, capped at
+            200 most-recent).
+      responses:
+        '200':
+          description: Alert rows.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BudgetAlertListResponse'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+
+  /budget-alerts/{alert_id}/acknowledge:
+    parameters:
+      - in: path
+        name: alert_id
+        required: true
+        schema:
+          type: string
+          format: uuid
+    post:
+      tags: [budgets]
+      summary: Mark a fired alert as acknowledged by the current user
+      operationId: acknowledgeBudgetAlert
+      responses:
+        '200':
+          description: Acknowledged alert.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BudgetAlertEvent'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
