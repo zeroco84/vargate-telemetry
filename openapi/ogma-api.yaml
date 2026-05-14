@@ -371,7 +371,15 @@ components:
 
     SessionSummary:
       type: object
-      required: [session_id, date, actor, source_apis, event_count, first_seen, last_seen]
+      required:
+        - session_id
+        - date
+        - actor
+        - source_apis
+        - event_count
+        - event_count_by_source
+        - first_seen
+        - last_seen
       description: |
         One row in the Sessions list. `session_id` is opaque (base64url
         of `{date}|{actor_type}|{actor_key}`); pass it back to
@@ -390,14 +398,23 @@ components:
           type: array
           description: |
             Which ingest streams contributed records to this session
-            (`code_analytics`, `compliance_activities`). T5.5 primarily
-            surfaces Code Analytics; Activity Feed feeds in for tenants
-            with `activity_feed: true`.
+            (`code_analytics`, `compliance_activities`, `mcp`). TM2
+            added MCP as a contributing source — see
+            `event_count_by_source` for the per-source breakdown.
           items:
             type: string
         event_count:
           type: integer
           description: Total underlying records folded into this session.
+        event_count_by_source:
+          type: object
+          description: |
+            TM2 Phase E1 — per-source breakdown. Keys are the
+            `source_api` values in `source_apis`; values are how many
+            events each contributed. Sums to `event_count`. Frontend
+            renders the per-source badges from this map.
+          additionalProperties:
+            type: integer
         first_seen:
           type: string
           format: date-time
