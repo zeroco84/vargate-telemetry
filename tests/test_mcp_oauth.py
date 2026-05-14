@@ -1,37 +1,41 @@
 # Copyright (C) Twinlite Services Limited
 # Licensed under the Apache License, Version 2.0
 # See LICENSE for the full license text.
-"""TM1 — OAuth surface tests for the MCP server.
+"""TM2 — OAuth surface tests for the MCP server.
 
-Covers:
+This file covers the parts of the OAuth surface that are NOT
+already exercised by the dedicated TM2 phase-test files:
 
-- ``/.well-known/oauth-authorization-server`` (RFC 8414 shape)
-- ``/.well-known/oauth-protected-resource`` (RFC 9728 shape)
-- ``POST /register`` (RFC 7591 DCR) — accepts claude.ai redirect_uri,
-  rejects everything else.
-- ``GET /authorize`` — 501 without ``MCP_SPIKE_MODE``; happy-path 302
-  with code when the gate is on; rejects bad PKCE / bad
-  redirect_uri / unknown client / bad response_type.
-- ``POST /token`` — code exchange happy path; PKCE-verifier mismatch;
-  unknown code; refresh-token rotation.
+  - Metadata endpoints (RFC 8414 + RFC 9728)
+  - Dynamic Client Registration (RFC 7591 POST /register)
+  - Token exchange (POST /token) — happy path, PKCE-mismatch
+    replay defence, code-reuse replay defence, refresh-token
+    rotation. **The /token tests mint codes via the TM2 SSO-
+    bridge flow** (see _complete_authorize) — no spike-mode.
+  - Spike-mode WARNING regression. The spike branch is unreachable
+    in production (Phase A3 startup guard refuses to boot if
+    MCP_SPIKE_MODE is set without the test bypass), but the
+    WARNING log line is still part of the contract for test
+    fixtures that lean on the bypass.
+  - /_health probe — reports the spike_mode flag for ops.
 
-The MCP server is mounted as its own FastAPI app at
-``mcp_server.main:app``. Tests against the OAuth surface don't need
-the FastMCP-mounted ``/mcp`` sub-app — those are exercised in
-``test_mcp_token_verifier.py`` and ``test_mcp_log_interaction.py``.
+The /authorize and /authorize/callback flows have their own files:
+  - test_mcp_oauth_sso_bridge.py — /authorize redirect-to-bridge
+  - test_mcp_authorize_callback.py — bridge-token consumption
 
-Spike-mode is toggled via the ``MCP_SPIKE_MODE`` env var. The
-fixtures below set/unset it per-test so cases that need 501 and
-cases that need 302 can both run in one session.
+C5 dropped the TM1-era redundant tests (validation duplicates,
+plain-spike-flow happy-paths) since the SSO files cover them
+more comprehensively against the production path.
 """
 
 from __future__ import annotations
 
 import base64
 import hashlib
-import secrets
 import os
+import secrets
 from typing import Iterator
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 from fastapi.testclient import TestClient
@@ -45,10 +49,12 @@ from sqlalchemy import text as sql_text
 
 @pytest.fixture
 def spike_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    """Turn on MCP_SPIKE_MODE + populate the static test identity.
+    """Turn on MCP_SPIKE_MODE for the WARNING-regression test only.
 
-    Used by every test that needs /authorize to succeed. Tests
-    that need /authorize to 501 do NOT use this fixture.
+    Production must NOT enable spike mode (the Phase A3 startup
+    guard refuses to boot). Tests use this fixture in isolation
+    when they specifically need to exercise the spike branch's
+    behavior — currently only the WARNING-log regression.
     """
     monkeypatch.setenv("MCP_SPIKE_MODE", "true")
     monkeypatch.setenv("MCP_TEST_IDENTITY_TENANT_ID", "tnt_us_test_mcp_oauth")
@@ -61,32 +67,47 @@ def spike_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
 
 
 @pytest.fixture
-def clean_mcp_oauth() -> Iterator[None]:
-    """Empty mcp_oauth_clients + mcp_access_tokens before/after each test."""
+def primed_verifier() -> None:
+    """Seed bridge_verifier with the conftest keypair's public JWK."""
+    from mcp_server.auth import bridge_verifier
+    from vargate_telemetry.auth import bridge_keys
+
+    bridge_verifier.reset_for_test()
+    bridge_keys.reset_cache_for_test()
+    bridge_verifier.set_jwk(bridge_keys.public_jwk())
+    yield
+    bridge_verifier.reset_for_test()
+
+
+@pytest.fixture
+def clean_mcp_oauth(primed_verifier) -> Iterator[None]:
+    """Empty Redis + DB OAuth tables + in-memory stores + verifier cache."""
+    from mcp_server.auth import bridge_verifier, oauth_state
+    from mcp_server.auth.oauth_routes import reset_stores_for_test
+    from vargate_telemetry.auth import bridge_keys
     from vargate_telemetry.db import engine
 
     with engine.begin() as conn:
         conn.execute(sql_text("DELETE FROM mcp_access_tokens"))
         conn.execute(sql_text("DELETE FROM mcp_oauth_clients"))
-    # Also clear the in-memory auth-code / refresh-token stores.
-    from mcp_server.auth.oauth_routes import reset_stores_for_test
-
     reset_stores_for_test()
+    oauth_state.reset_for_test()
+    # reset_stores_for_test wiped the verifier; re-prime so the
+    # SSO callback path works in token-exchange tests.
+    bridge_verifier.set_jwk(bridge_keys.public_jwk())
     yield
     with engine.begin() as conn:
         conn.execute(sql_text("DELETE FROM mcp_access_tokens"))
         conn.execute(sql_text("DELETE FROM mcp_oauth_clients"))
     reset_stores_for_test()
+    oauth_state.reset_for_test()
 
 
 @pytest.fixture
-def mcp_client() -> TestClient:
-    """Build a TestClient against the MCP-server FastAPI app.
-
-    Note: this is a DIFFERENT app from ``vargate_telemetry.api.app``
-    used by the onboarding tests. The MCP server runs in its own
-    container (``mcp-server`` in docker-compose).
-    """
+def mcp_client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
+    """TestClient against the MCP-server FastAPI app, spike-mode off."""
+    monkeypatch.delenv("MCP_SPIKE_MODE", raising=False)
+    monkeypatch.setenv("MCP_SERVER_URL", "http://localhost:8002")
     from mcp_server.main import app
 
     return TestClient(app)
@@ -115,6 +136,68 @@ def _register_client(
     assert response.status_code == 200, response.text
     body = response.json()
     return body["client_id"], body["client_secret"]
+
+
+def _complete_authorize_via_sso(
+    mcp_client: TestClient,
+) -> tuple[str, str, str]:
+    """Run the full TM2 SSO-bridge flow to mint an auth code.
+
+    Steps (production-equivalent):
+
+      1. DCR registers a client.
+      2. /authorize stashes OAuth state in Redis + 302s to the bridge.
+        We don't actually call the bridge — we sign a JWT directly
+        using the conftest keypair (the same one the verifier reads).
+      3. /authorize/callback verifies the JWT, claims Redis state,
+        mints + returns an auth code.
+
+    Returns (client_id, code, verifier). Verifier is the PKCE
+    secret that matches the challenge sent into /authorize, so
+    /token exchange can verify cleanly.
+    """
+    from vargate_telemetry.auth import bridge_keys
+
+    client_id, _ = _register_client(mcp_client)
+    verifier, challenge = _pkce_pair()
+
+    # /authorize → 302 with mcp_state in the URL.
+    authorize_response = mcp_client.get(
+        "/authorize",
+        params={
+            "client_id": client_id,
+            "redirect_uri": "https://claude.ai/api/mcp/auth_callback",
+            "response_type": "code",
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "state": "claude-state-xyz",
+        },
+        follow_redirects=False,
+    )
+    assert authorize_response.status_code == 302, authorize_response.text
+    mcp_state = parse_qs(
+        urlparse(authorize_response.headers["location"]).query
+    )["state"][0]
+
+    # Sign a bridge JWT carrying that mcp_state + a test identity.
+    bridge_token = bridge_keys.sign_bridge_token(
+        tenant_id="tnt_us_token_test",
+        user_id="user-token-test",
+        user_email="token-test@example.com",
+        mcp_state=mcp_state,
+    )
+
+    # /authorize/callback → 302 to Claude with code + state.
+    callback_response = mcp_client.get(
+        "/authorize/callback",
+        params={"bridge_token": bridge_token},
+        follow_redirects=False,
+    )
+    assert callback_response.status_code == 302, callback_response.text
+    code = parse_qs(
+        urlparse(callback_response.headers["location"]).query
+    )["code"][0]
+    return client_id, code, verifier
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -203,8 +286,13 @@ def test_register_rejects_off_allowlist_redirect_uri(
 
 
 # ───────────────────────────────────────────────────────────────────────────
-# /authorize — spike-mode gate + happy path
+# /authorize — top-level contract change confirmation
 # ───────────────────────────────────────────────────────────────────────────
+#
+# Detailed coverage of the SSO bridge redirect (state persistence,
+# claude_state round-trip, env-driven URLs, validation-before-redirect)
+# lives in test_mcp_oauth_sso_bridge.py. This file keeps just the
+# one regression case at the top of the surface.
 
 
 def test_authorize_without_spike_mode_redirects_to_sso_bridge(
@@ -212,15 +300,7 @@ def test_authorize_without_spike_mode_redirects_to_sso_bridge(
     clean_mcp_oauth: None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """TM2 contract: production /authorize redirects to Ogma SSO bridge.
-
-    Renamed from `test_authorize_returns_501_without_spike_mode` —
-    the TM1 501 behavior was the spike-only contract. TM2 wires the
-    real SSO bridge, so spike-off becomes the happy production
-    path. Detailed coverage of the bridge-redirect shape lives in
-    test_mcp_oauth_sso_bridge.py; this test just confirms the
-    contract change at the top of the OAuth surface.
-    """
+    """TM2 contract: production /authorize redirects to Ogma SSO bridge."""
     monkeypatch.delenv("MCP_SPIKE_MODE", raising=False)
 
     client_id, _ = _register_client(mcp_client)
@@ -245,21 +325,28 @@ def test_authorize_without_spike_mode_redirects_to_sso_bridge(
     assert "return=" in location
 
 
-def test_authorize_happy_path_emits_warning_and_redirects(
+def test_spike_mode_authorize_emits_warning_log(
     mcp_client: TestClient,
     clean_mcp_oauth: None,
     spike_env: None,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """With MCP_SPIKE_MODE on, /authorize 302s back to claude.ai with a code,
-    and logs a prominent SPIKE-MODE WARNING (the contract from the founder)."""
+    """The spike-mode WARNING log is still emitted when the branch fires.
+
+    The spike branch is gated behind both MCP_SPIKE_MODE and the test
+    bypass env var, so it's unreachable in production. But the
+    WARNING ("SPIKE MODE: returning static test identity…") is the
+    loud-visible safety rail the founder asked for in TM1 — this test
+    is the regression catch if anyone ever deletes the log line.
+    """
     import logging
 
     client_id, _ = _register_client(mcp_client)
     verifier, challenge = _pkce_pair()
-    state = "claude-state-" + secrets.token_urlsafe(8)
 
-    with caplog.at_level(logging.WARNING, logger="mcp_server.auth.oauth_routes"):
+    with caplog.at_level(
+        logging.WARNING, logger="mcp_server.auth.oauth_routes"
+    ):
         response = mcp_client.get(
             "/authorize",
             params={
@@ -268,111 +355,34 @@ def test_authorize_happy_path_emits_warning_and_redirects(
                 "response_type": "code",
                 "code_challenge": challenge,
                 "code_challenge_method": "S256",
-                "state": state,
+                "state": "spike-warning-state",
             },
             follow_redirects=False,
         )
-    assert response.status_code == 302, response.text
-    location = response.headers["location"]
-    assert location.startswith("https://claude.ai/api/mcp/auth_callback?")
-    assert f"state={state}" in location
-    assert "code=" in location
-
-    # The SPIKE MODE warning MUST appear — that's the loud-visible
-    # safety rail the founder asked for ("Do not promote past TM1").
+    # 302 to Claude (spike branch mints code directly).
+    assert response.status_code == 302
+    assert "claude.ai/api/mcp/auth_callback" in response.headers["location"]
+    # The WARNING log line must appear.
     assert any(
         "SPIKE MODE" in record.getMessage() for record in caplog.records
     ), [r.getMessage() for r in caplog.records]
 
 
-def test_authorize_rejects_non_s256_pkce(
-    mcp_client: TestClient,
-    clean_mcp_oauth: None,
-    spike_env: None,
-) -> None:
-    """Plain PKCE (without S256) is not accepted — security-floor."""
-    client_id, _ = _register_client(mcp_client)
-    response = mcp_client.get(
-        "/authorize",
-        params={
-            "client_id": client_id,
-            "redirect_uri": "https://claude.ai/api/mcp/auth_callback",
-            "response_type": "code",
-            "code_challenge": "abc",
-            "code_challenge_method": "plain",
-        },
-        follow_redirects=False,
-    )
-    assert response.status_code == 400, response.text
-    assert response.json()["detail"]["error"] == "invalid_request"
-
-
-def test_authorize_rejects_unknown_client(
-    mcp_client: TestClient,
-    clean_mcp_oauth: None,
-    spike_env: None,
-) -> None:
-    """A bogus client_id is not minted out of thin air."""
-    _, challenge = _pkce_pair()
-    response = mcp_client.get(
-        "/authorize",
-        params={
-            "client_id": "not-a-real-client-id",
-            "redirect_uri": "https://claude.ai/api/mcp/auth_callback",
-            "response_type": "code",
-            "code_challenge": challenge,
-            "code_challenge_method": "S256",
-        },
-        follow_redirects=False,
-    )
-    assert response.status_code == 400, response.text
-    assert response.json()["detail"]["error"] == "invalid_client"
-
-
 # ───────────────────────────────────────────────────────────────────────────
-# /token — happy path + the negative cases
+# /token — exercised against the SSO-bridge minted code (not spike)
 # ───────────────────────────────────────────────────────────────────────────
-
-
-def _extract_code_from_redirect(location: str) -> str:
-    from urllib.parse import parse_qs, urlparse
-
-    return parse_qs(urlparse(location).query)["code"][0]
-
-
-def _complete_authorize(
-    mcp_client: TestClient,
-) -> tuple[str, str, str]:
-    """Register + authorize + return (client_id, code, verifier).
-
-    The cases that exercise /token reuse this so they don't have
-    to re-implement the dance.
-    """
-    client_id, _ = _register_client(mcp_client)
-    verifier, challenge = _pkce_pair()
-    response = mcp_client.get(
-        "/authorize",
-        params={
-            "client_id": client_id,
-            "redirect_uri": "https://claude.ai/api/mcp/auth_callback",
-            "response_type": "code",
-            "code_challenge": challenge,
-            "code_challenge_method": "S256",
-        },
-        follow_redirects=False,
-    )
-    assert response.status_code == 302
-    code = _extract_code_from_redirect(response.headers["location"])
-    return client_id, code, verifier
 
 
 def test_token_exchange_happy_path(
     mcp_client: TestClient,
     clean_mcp_oauth: None,
-    spike_env: None,
 ) -> None:
-    """A valid code + correct PKCE verifier → access + refresh tokens."""
-    client_id, code, verifier = _complete_authorize(mcp_client)
+    """Code + correct PKCE verifier → access + refresh tokens.
+
+    Code is minted via the TM2 SSO bridge flow (not spike), so this
+    exercises the full production code path top-to-bottom.
+    """
+    client_id, code, verifier = _complete_authorize_via_sso(mcp_client)
 
     response = mcp_client.post(
         "/token",
@@ -396,10 +406,9 @@ def test_token_exchange_happy_path(
 def test_token_exchange_rejects_pkce_mismatch(
     mcp_client: TestClient,
     clean_mcp_oauth: None,
-    spike_env: None,
 ) -> None:
     """A wrong verifier MUST NOT mint a token (PKCE replay defence)."""
-    client_id, code, _ = _complete_authorize(mcp_client)
+    client_id, code, _ = _complete_authorize_via_sso(mcp_client)
 
     response = mcp_client.post(
         "/token",
@@ -418,14 +427,9 @@ def test_token_exchange_rejects_pkce_mismatch(
 def test_token_exchange_rejects_reused_code(
     mcp_client: TestClient,
     clean_mcp_oauth: None,
-    spike_env: None,
 ) -> None:
-    """A code is one-shot — the second exchange MUST fail (replay defence).
-
-    The first exchange consumes the code from the in-memory store;
-    the second should miss and 400 with invalid_grant.
-    """
-    client_id, code, verifier = _complete_authorize(mcp_client)
+    """Code is one-shot: first exchange succeeds, second 400s."""
+    client_id, code, verifier = _complete_authorize_via_sso(mcp_client)
 
     first = mcp_client.post(
         "/token",
@@ -456,10 +460,9 @@ def test_token_exchange_rejects_reused_code(
 def test_token_refresh_returns_new_pair(
     mcp_client: TestClient,
     clean_mcp_oauth: None,
-    spike_env: None,
 ) -> None:
     """A refresh-token exchange returns a new access + refresh pair."""
-    client_id, code, verifier = _complete_authorize(mcp_client)
+    client_id, code, verifier = _complete_authorize_via_sso(mcp_client)
 
     initial = mcp_client.post(
         "/token",
@@ -489,7 +492,7 @@ def test_token_refresh_returns_new_pair(
 
 
 # ───────────────────────────────────────────────────────────────────────────
-# /_health probe (used by docker-compose + nginx)
+# /_health probe — used by docker-compose + nginx
 # ───────────────────────────────────────────────────────────────────────────
 
 
@@ -497,9 +500,20 @@ def test_health_endpoint_reports_spike_mode_flag(
     mcp_client: TestClient,
     spike_env: None,
 ) -> None:
-    """Ops observability — confirm spike-mode at a glance from /_health."""
+    """Ops observability — spike-mode is visible from /_health."""
     response = mcp_client.get("/_health")
     assert response.status_code == 200
     body = response.json()
     assert body["status"] == "ok"
     assert body["spike_mode"] is True
+
+
+def test_health_endpoint_reports_spike_mode_off_by_default(
+    mcp_client: TestClient,
+) -> None:
+    """The production posture — /_health reports spike_mode: false."""
+    response = mcp_client.get("/_health")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "ok"
+    assert body["spike_mode"] is False
