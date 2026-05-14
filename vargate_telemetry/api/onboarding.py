@@ -1098,3 +1098,96 @@ def get_backfill_status(
         payload["error"] = _format_failure(info)
 
     return BackfillStatusResponse(**payload)
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# TM2 Phase D1 — GET /onboarding/mcp-status
+# ───────────────────────────────────────────────────────────────────────────
+#
+# The onboarding SPA polls this endpoint after the user has clicked
+# "I've completed setup" on the MCP-Connector card. It reflects
+# whether any `mcp` row has landed for the signed-in user's tenant.
+# Same source of truth as the `mcp_connector` capability bool
+# (test_mcp_capability.py) — just exposed with timestamp + count
+# so the SPA can render "Connected — N interactions captured".
+
+
+class McpStatusResponse(BaseModel):
+    """Snapshot of MCP-connector ingest state for the caller's tenant.
+
+    All three fields update independently of the configured-at
+    timestamp on any DCR row — capability lights up by USAGE, not
+    by registration. See the `mcp_connector` capability detector
+    in this same module.
+    """
+
+    configured: bool = Field(
+        ...,
+        description=(
+            "True iff at least one telemetry_records row with "
+            "source_api='mcp' exists for this tenant in the last "
+            "90 days. Same condition as the capability bool."
+        ),
+    )
+    first_event_at: Optional[datetime] = Field(
+        default=None,
+        description=(
+            "ISO-8601 UTC timestamp of the earliest mcp record "
+            "for this tenant. Null if no events yet."
+        ),
+    )
+    events_count: int = Field(
+        ...,
+        description=(
+            "Total mcp records in the last 90 days. The SPA's poll "
+            "loop watches for this to transition from 0 → N."
+        ),
+    )
+
+
+@router.get(
+    "/onboarding/mcp-status",
+    response_model=McpStatusResponse,
+    operation_id="getMcpStatus",
+    tags=["onboarding"],
+    summary="MCP-connector ingest status for the caller's tenant",
+)
+def get_mcp_status(
+    user: AuthenticatedUser = Depends(current_user),
+) -> McpStatusResponse:
+    """Return the MCP-source ingest snapshot.
+
+    A pre-select-region caller (no bound tenant_id yet) gets the
+    not-configured shape — they can't have any MCP traffic by
+    construction.
+    """
+    if not user.tenant_id:
+        return McpStatusResponse(
+            configured=False, first_event_at=None, events_count=0
+        )
+
+    # Use the session-scope so RLS applies — the COUNT + MIN are
+    # cheap enough to run per poll without caching, especially with
+    # the (tenant_id, occurred_at) index that lands on
+    # telemetry_records via T2.1's ix_telemetry_records_tenant_occurred.
+    from vargate_telemetry.db import session_scope
+
+    with session_scope(user.tenant_id) as s:
+        row = s.execute(
+            sql_text(
+                "SELECT MIN(occurred_at) AS first_at, "
+                "       COUNT(*) AS n "
+                "FROM telemetry_records "
+                "WHERE tenant_id = :t "
+                "  AND source_api = 'mcp' "
+                "  AND ingested_at > now() - INTERVAL '90 days'"
+            ),
+            {"t": user.tenant_id},
+        ).one()
+
+    count = int(row.n or 0)
+    return McpStatusResponse(
+        configured=count > 0,
+        first_event_at=row.first_at if count > 0 else None,
+        events_count=count,
+    )
