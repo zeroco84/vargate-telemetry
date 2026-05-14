@@ -23,6 +23,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from mcp_server import config
+from mcp_server.auth import bridge_verifier
 from mcp_server.auth.oauth_routes import router as oauth_router
 from mcp_server.mcp.server import build_mcp_server
 
@@ -44,6 +45,22 @@ def _build_app() -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
+        # TM2 Phase C3: fetch the bridge JWK from Ogma's well-known
+        # endpoint and prime the verifier cache. Hard-fail if all
+        # retries exhaust — a degraded boot would silently 503 every
+        # /authorize/callback. Tests skip this because TestClient
+        # doesn't enter the lifespan unless wrapped in a `with` block;
+        # the primed_verifier fixture takes care of the cache there.
+        try:
+            bridge_verifier.fetch_and_cache_jwk()
+        except Exception:
+            _log.exception(
+                "TM2 Phase C3: failed to fetch bridge JWK from %s "
+                "after retries; refusing to start.",
+                config.ogma_public_key_url(),
+            )
+            raise
+
         async with mcp.session_manager.run():
             yield
 
