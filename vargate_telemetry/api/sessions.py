@@ -86,7 +86,30 @@ router = APIRouter()
 
 # Source APIs that contribute records to Sessions. Admin API usage
 # records are bucket-grain (no actor field), so they're excluded.
-_SESSION_SOURCE_APIS = ("code_analytics", "compliance_activities")
+#
+# TM2 Phase E1 adds 'mcp' — every MCP record carries a `subject_user_id`
+# and the `metadata.actor.type/user_id/email` triplet (see the persist
+# task's metadata builder), so it grains cleanly into the same
+# (date, actor) Session shape that the Compliance Activity stream uses.
+_SESSION_SOURCE_APIS = (
+    "code_analytics",
+    "compliance_activities",
+    "mcp",
+)
+
+# TM2 Phase E1: MCP rows have flat metadata (user_email,
+# subject_user_id, no `metadata.actor.*` envelope) because the
+# persist task in TM1 wrote them that way. Extend the COALESCE
+# chain to read those flat fields too — adding them at the END
+# of the priority list means existing actor-shaped streams
+# (Compliance Activities, Code Analytics) keep their current
+# extraction, and MCP rows that lack the nested envelope fall
+# through cleanly.
+#
+# Per-stream actor_type for MCP records is also flat — we synthesize
+# it as 'user_actor' since the MCP identity is always a real
+# Ogma-side user (no service-account variant exists yet).
+
 
 # SQL fragment that extracts the actor's natural identifier from
 # `metadata.actor`. COALESCE walks the candidate fields in priority
@@ -104,7 +127,22 @@ _ACTOR_KEY_SQL = (
     "  metadata->'actor'->>'api_key_name',"
     "  metadata->'actor'->>'user_id',"
     "  metadata->'actor'->>'api_key_id',"
-    "  metadata->'actor'->>'type'"
+    "  metadata->'actor'->>'type',"
+    # TM2: MCP-flat shape — fall through to top-level metadata
+    # fields if the nested actor envelope is absent.
+    "  metadata->>'user_email',"
+    "  metadata->>'subject_user_id'"
+    ")"
+)
+
+
+# Same idea for actor_type: MCP rows don't carry one in metadata,
+# so synthesize 'user_actor' for them. The SQL coalesces the nested
+# field first and falls back when source_api='mcp'.
+_ACTOR_TYPE_SQL = (
+    "COALESCE("
+    "  metadata->'actor'->>'type',"
+    "  CASE WHEN source_api = 'mcp' THEN 'user_actor' END"
     ")"
 )
 
@@ -130,6 +168,12 @@ class SessionSummary(BaseModel):
     actor: SessionActor
     source_apis: list[str]
     event_count: int
+    # TM2 Phase E1 — per-source breakdown of the session's event count.
+    # Keys are source_api values (the same set that appears in
+    # `source_apis`); values are how many events came from each.
+    # Sums to `event_count`. Frontend uses this to render the
+    # source-distribution badge on the Sessions row.
+    event_count_by_source: dict[str, int]
     first_seen: datetime
     last_seen: datetime
 
@@ -388,22 +432,41 @@ def list_sessions(
         params["cursor_actor_type"] = cursor_actor_type
         params["cursor_actor_key"] = cursor_actor_key
 
+    # Two-stage aggregation: first GROUP BY session + source_api so
+    # we can emit the per-source counts via jsonb_object_agg, then
+    # roll those up into one row per session. The cost is one
+    # extra CTE pass — but it's the same set of rows, and PG's
+    # planner folds the two aggregates into a single HashAggregate.
     sql = f"""
-        WITH aggregated AS (
+        WITH per_source AS (
             SELECT
                 DATE(occurred_at AT TIME ZONE 'UTC') AS session_date,
-                metadata->'actor'->>'type' AS actor_type,
+                {_ACTOR_TYPE_SQL} AS actor_type,
                 {_ACTOR_KEY_SQL} AS actor_key,
-                ARRAY_AGG(DISTINCT source_api ORDER BY source_api) AS source_apis,
-                COUNT(*) AS event_count,
-                MIN(occurred_at) AS first_seen,
-                MAX(occurred_at) AS last_seen
+                source_api,
+                COUNT(*) AS source_count,
+                MIN(occurred_at) AS source_first,
+                MAX(occurred_at) AS source_last
             FROM telemetry_records
             WHERE {where_sql}
+            GROUP BY 1, 2, 3, 4
+        ),
+        aggregated AS (
+            SELECT
+                session_date,
+                actor_type,
+                actor_key,
+                ARRAY_AGG(DISTINCT source_api ORDER BY source_api) AS source_apis,
+                jsonb_object_agg(source_api, source_count)
+                    AS event_count_by_source,
+                SUM(source_count)::bigint AS event_count,
+                MIN(source_first) AS first_seen,
+                MAX(source_last) AS last_seen
+            FROM per_source
             GROUP BY 1, 2, 3
         )
         SELECT session_date, actor_type, actor_key, source_apis,
-               event_count, first_seen, last_seen
+               event_count_by_source, event_count, first_seen, last_seen
         FROM aggregated
         {cursor_clause}
         ORDER BY last_seen DESC, actor_type, actor_key
@@ -442,6 +505,9 @@ def list_sessions(
             ),
             source_apis=list(r.source_apis),
             event_count=int(r.event_count),
+            event_count_by_source={
+                k: int(v) for k, v in (r.event_count_by_source or {}).items()
+            },
             first_seen=r.first_seen,
             last_seen=r.last_seen,
         )
@@ -515,7 +581,7 @@ def get_session_detail(
         FROM telemetry_records
         WHERE tenant_id = current_setting('app.tenant_id')
           AND DATE(occurred_at AT TIME ZONE 'UTC') = :session_date
-          AND metadata->'actor'->>'type' = :actor_type
+          AND {_ACTOR_TYPE_SQL} = :actor_type
           AND {_ACTOR_KEY_SQL} = :actor_key
           AND source_api = ANY(:source_api_filter)
         ORDER BY occurred_at, chain_seq
