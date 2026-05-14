@@ -506,13 +506,15 @@ components:
         - cache_creation_tokens
         - web_search_requests
       description: |
-        One (date, workspace_id, model) breakdown of Admin API token
-        usage. T5.5.6's connector requests `group_by=[model,
-        workspace_id]` so every new daily bucket produces one row
-        per (model, workspace) pair. Pre-T5.5.6 records (aggregate
-        rows) coexist; they show as one row per day with `model:
-        null`, `workspace_id: null`, and `estimated_cost_usd: null`
-        (unknown model = unrepresentable cost).
+        One (date, workspace_id, api_key_id, model) breakdown of
+        Admin API token usage. TM3 Phase A4 extended the connector's
+        default `group_by` to include `api_key_id`, so every new
+        daily bucket now produces one row per (model, workspace,
+        api_key) triple. Pre-TM3 records (T5.5.6 era) have a null
+        `api_key_id` / `api_key_name`; pre-T5.5.6 aggregate rows have
+        null `model` / `workspace_id` too. The view renders `—` for
+        every null on legacy rows; `estimated_cost_usd` is `null`
+        (unrepresentable) when `model` is null.
       properties:
         date:
           type: string
@@ -534,6 +536,25 @@ components:
             when the workspace hasn't been synced yet (the backfill
             pulls the workspaces list at start time; missing entries
             usually clear on the next steady-state pull).
+        api_key_id:
+          type: string
+          nullable: true
+          description: |
+            Anthropic API key identifier (e.g. `apikey_01HABC...`).
+            `null` for pre-TM3 records ingested before
+            `group_by=[api_key_id]` landed, or for buckets that
+            Anthropic did not attribute to a single key.
+        api_key_name:
+          type: string
+          nullable: true
+          description: |
+            Human-friendly name resolved from the `api_keys` side
+            table (TM3 Phase A4). The usage report does NOT include
+            the key name — a parallel fetch to
+            `/v1/organizations/api_keys` populates this table at
+            backfill + pull time. `null` when `api_key_id` is null
+            or when the key hasn't been synced yet; the UI falls
+            back to the raw ID in that case.
         model:
           type: string
           nullable: true
