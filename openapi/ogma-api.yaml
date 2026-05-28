@@ -47,6 +47,13 @@ tags:
       (daily | weekly | monthly). The evaluator runs every 15
       minutes and fires an alert at 70 / 85 / 100 % of the cap,
       dedup'd to at-most-once-per-period-per-threshold.
+  - name: users
+    description: |
+      Cross-surface user view — the unique-to-Ogma analytic. One
+      person shows up as disconnected identities across Anthropic's
+      surfaces (Code Analytics actor email, MCP chat user, API key);
+      Ogma stitches them via user_aliases and rolls activity up per
+      person. Includes manual alias mapping for unmatched identities.
 
 # ───────────────────────────────────────────────────────────────────────────
 # Security schemes
@@ -908,6 +915,191 @@ components:
           items:
             $ref: '#/components/schemas/BudgetAlertEvent'
 
+    # ───────────────────────────────────────────────────────────────────────
+    # Cross-surface users (TM3 Phase C)
+    # ───────────────────────────────────────────────────────────────────────
+
+    UserSurfaceStat:
+      type: object
+      required: [user_id, email, surfaces, events_7d]
+      properties:
+        user_id:
+          type: string
+          format: uuid
+        email:
+          type: string
+        surfaces:
+          type: array
+          items:
+            type: string
+          description: |
+            Distinct source_api values this user is active on
+            (code_analytics, mcp, compliance_activities). The
+            frontend maps these to surface labels (Claude Code,
+            Claude (chat), Admin event) via sourceLabels.
+        events_7d:
+          type: integer
+          format: int64
+          description: Events attributed to this user in the last 7 days.
+        spend_7d_usd:
+          type: string
+          nullable: true
+          description: |
+            Estimated 7-day spend (string Decimal). Derived ONLY
+            from MCP records (the sole per-user priceable source —
+            Admin usage is key-level, Code Analytics has no token
+            shape). `null` when the user has no priceable activity;
+            the UI renders `—`, never a faked $0.
+        last_active:
+          type: string
+          format: date-time
+          nullable: true
+
+    UnmappedAlias:
+      type: object
+      required: [source_api, source_identifier, event_count]
+      properties:
+        source_api:
+          type: string
+        source_identifier:
+          type: string
+          description: |
+            The actor identifier (api_key_name, or an email with no
+            matching Ogma user) that couldn't be auto-matched. The
+            admin maps it to a user via POST /users/{id}/aliases.
+        event_count:
+          type: integer
+          format: int64
+        last_seen:
+          type: string
+          format: date-time
+          nullable: true
+
+    UserListResponse:
+      type: object
+      required: [users, unmapped]
+      properties:
+        users:
+          type: array
+          items:
+            $ref: '#/components/schemas/UserSurfaceStat'
+        unmapped:
+          type: array
+          items:
+            $ref: '#/components/schemas/UnmappedAlias'
+
+    HeatmapCell:
+      type: object
+      required: [day, source_api, count]
+      properties:
+        day:
+          type: string
+          format: date
+        source_api:
+          type: string
+        count:
+          type: integer
+          format: int64
+
+    SpendTrendPoint:
+      type: object
+      required: [day, source_api, spend_usd]
+      properties:
+        day:
+          type: string
+          format: date
+        source_api:
+          type: string
+        spend_usd:
+          type: string
+          description: String Decimal — per-day MCP spend.
+
+    UserAlias:
+      type: object
+      required: [source_api, source_identifier, auto_matched]
+      properties:
+        source_api:
+          type: string
+        source_identifier:
+          type: string
+        auto_matched:
+          type: boolean
+          description: |
+            true = email-equality auto-match; false = admin manually
+            linked (protected from auto-match overwrite).
+
+    UserRecentRecord:
+      type: object
+      required: [record_id, source_api, occurred_at]
+      properties:
+        record_id:
+          type: string
+        source_api:
+          type: string
+        occurred_at:
+          type: string
+          format: date-time
+        kind:
+          type: string
+          nullable: true
+        summary:
+          type: string
+          nullable: true
+
+    UserDetailResponse:
+      type: object
+      required:
+        - user_id
+        - email
+        - joined_at
+        - surfaces
+        - aliases
+        - heatmap
+        - spend_trend
+        - recent
+      properties:
+        user_id:
+          type: string
+          format: uuid
+        email:
+          type: string
+        joined_at:
+          type: string
+          format: date-time
+        surfaces:
+          type: array
+          items:
+            type: string
+        aliases:
+          type: array
+          items:
+            $ref: '#/components/schemas/UserAlias'
+        heatmap:
+          type: array
+          items:
+            $ref: '#/components/schemas/HeatmapCell'
+        spend_trend:
+          type: array
+          items:
+            $ref: '#/components/schemas/SpendTrendPoint'
+        recent:
+          type: array
+          items:
+            $ref: '#/components/schemas/UserRecentRecord'
+
+    AliasMapRequest:
+      type: object
+      required: [source_api, source_identifier]
+      properties:
+        source_api:
+          type: string
+          minLength: 1
+          maxLength: 32
+        source_identifier:
+          type: string
+          minLength: 1
+          maxLength: 320
+
   # ─────────────────────────────────────────────────────────────────────────
   # Reusable response bodies — every 4xx / 5xx is an ErrorResponse.
   # ─────────────────────────────────────────────────────────────────────────
@@ -1583,6 +1775,81 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/BudgetAlertEvent'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Cross-surface users (TM3 Phase C)
+  # ─────────────────────────────────────────────────────────────────────────
+
+  /users:
+    get:
+      tags: [users]
+      summary: Cross-surface user roster + per-user rollup + unmapped activity
+      operationId: listUsers
+      responses:
+        '200':
+          description: User roster + unmapped aliases.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserListResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+
+  /users/{user_id}:
+    parameters:
+      - in: path
+        name: user_id
+        required: true
+        schema:
+          type: string
+          format: uuid
+    get:
+      tags: [users]
+      summary: One user's activity stitched across every surface
+      operationId: getUserDetail
+      responses:
+        '200':
+          description: User detail with heatmap, spend trend, recent activity.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserDetailResponse'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+
+  /users/{user_id}/aliases:
+    parameters:
+      - in: path
+        name: user_id
+        required: true
+        schema:
+          type: string
+          format: uuid
+    post:
+      tags: [users]
+      summary: Manually map an (source_api, identifier) alias to this user
+      operationId: mapUserAlias
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AliasMapRequest'
+      responses:
+        '201':
+          description: The mapped alias (auto_matched=false).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserAlias'
         '404':
           $ref: '#/components/responses/NotFound'
         '401':
