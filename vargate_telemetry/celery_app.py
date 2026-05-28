@@ -125,6 +125,19 @@ celery_app.conf.beat_schedule = {
         "schedule": 900.0,  # every 15 minutes
         "options": {"queue": "default"},
     },
+    # TM3 Phase C1: user-alias reconciliation. Scans telemetry for
+    # distinct actor identifiers, ensures a user_aliases row exists,
+    # and email-equality auto-matches against users. Same 15-minute
+    # cadence; the /api/users endpoint also reconciles lazily on read
+    # for activation-readiness.
+    "dispatch-reconcile-aliases": {
+        "task": (
+            "vargate_telemetry.tasks.reconcile_aliases."
+            "dispatch_reconcile_aliases"
+        ),
+        "schedule": 900.0,  # every 15 minutes
+        "options": {"queue": "default"},
+    },
 }
 
 # Alias so `celery -A vargate_telemetry.celery_app worker` (which looks up

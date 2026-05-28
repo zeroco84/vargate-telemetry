@@ -31,6 +31,7 @@ from vargate_telemetry.api import mcp_bridge as mcp_bridge_routes
 from vargate_telemetry.api import onboarding as onboarding_routes
 from vargate_telemetry.api import sessions as sessions_routes
 from vargate_telemetry.api import usage as usage_routes
+from vargate_telemetry.api import users as users_routes
 from vargate_telemetry.api import well_known as well_known_routes
 
 # Side-effect import: registers the T4.7 onboarding instruments against
@@ -81,6 +82,8 @@ def _build_app() -> FastAPI:
     app.include_router(usage_routes.router)
     # TM3 Phase B2: /api/budgets + /api/budget-alerts CRUD.
     app.include_router(budgets_routes.router)
+    # TM3 Phase C2: /api/users cross-surface roster + detail + aliases.
+    app.include_router(users_routes.router)
     # TM2 Phase B1: /.well-known/ogma-public-key.json — public JWK
     # the MCP server fetches at boot to verify bridge JWTs.
     app.include_router(well_known_routes.router)
