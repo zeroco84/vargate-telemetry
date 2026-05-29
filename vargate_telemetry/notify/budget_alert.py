@@ -74,9 +74,10 @@ def render_budget_alert(ctx: BudgetAlertContext) -> tuple[str, str, str]:
     template changes don't depend on AWS reachability.
     """
     pct = _ratio_percent(ctx.threshold_crossed)
-    subject = (
-        f"[Ogma] Budget alert — \"{ctx.budget_name}\" at {pct} of cap"
-    )
+    # No product prefix in the subject — the From (Vargate.ai) and the
+    # branded email template carry the identity. Keeping the subject
+    # clean reads better in the inbox list.
+    subject = f"Budget alert — \"{ctx.budget_name}\" at {pct} of cap"
 
     period_label = {
         "daily": "Today",

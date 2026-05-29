@@ -68,6 +68,9 @@ def test_subject_includes_budget_name_and_threshold_percent() -> None:
     subj, _, _ = render_budget_alert(_ctx(threshold=Decimal("0.70")))
     assert "Sera prod monthly" in subj
     assert "70%" in subj
+    # No product prefix — the From + branded template carry identity.
+    assert "[Ogma]" not in subj
+    assert subj.startswith("Budget alert")
 
 
 def test_subject_renders_100_percent_for_max_threshold() -> None:
