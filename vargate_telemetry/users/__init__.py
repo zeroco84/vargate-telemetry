@@ -12,12 +12,14 @@ across every surface.
 
 from vargate_telemetry.users.aliases import (
     ACTOR_KEY_SQL,
+    EFFECTIVE_SURFACE_SQL,
     SESSION_SOURCE_APIS,
     reconcile_aliases_for_tenant,
 )
 
 __all__ = [
     "ACTOR_KEY_SQL",
+    "EFFECTIVE_SURFACE_SQL",
     "SESSION_SOURCE_APIS",
     "reconcile_aliases_for_tenant",
 ]

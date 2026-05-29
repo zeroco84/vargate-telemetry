@@ -61,6 +61,31 @@ ACTOR_KEY_SQL = (
 )
 
 
+# TM4 #3 — "effective surface" for display + aggregation. The MCP path
+# captures a Claude-self-reported `surface` (claude_code / claude_web /
+# claude_desktop / other); there is no server-side signal because
+# Anthropic proxies Claude Code on the web identically to chat. For
+# records logged before the field existed, fall back to the
+# kind=tool_use heuristic (approximate — a tool-using chat turn also
+# reads as tool_use), else the generic 'mcp' token. Non-mcp sources
+# pass through unchanged so this is safe to apply to any source_api.
+#
+# `tr.`-qualified because `source_api` is ambiguous in queries that
+# JOIN telemetry_records against user_aliases (which also has a
+# source_api); every /users + /sessions query aliases the records
+# table as `tr`. The frontend `sourceLabels.ts` maps the resulting
+# tokens to display strings ("Claude Code" vs "Claude (chat)").
+EFFECTIVE_SURFACE_SQL = (
+    "CASE "
+    "WHEN tr.source_api = 'mcp' THEN CASE "
+    "WHEN NULLIF(tr.metadata->>'surface', '') IS NOT NULL "
+    "THEN tr.metadata->>'surface' "
+    "WHEN tr.metadata->>'kind' = 'tool_use' THEN 'claude_code' "
+    "ELSE 'mcp' END "
+    "ELSE tr.source_api END"
+)
+
+
 def reconcile_aliases_for_tenant(session: Session, tenant_id: str) -> dict:
     """Ensure a ``user_aliases`` row exists for every distinct actor.
 

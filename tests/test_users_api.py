@@ -124,9 +124,11 @@ def _seed_mcp(
     input_tokens: int = 1_000_000,
     output_tokens: int = 200_000,
     model: str = _SONNET,
+    kind: str = "chat",
+    surface: str | None = None,
 ) -> None:
     md = {
-        "kind": "chat",
+        "kind": kind,
         "summary": "Discussed the quarterly roadmap.",
         "model": model,
         "input_tokens_estimate": input_tokens,
@@ -134,6 +136,8 @@ def _seed_mcp(
         "user_email": email,
         "subject_user_id": user_id,
     }
+    if surface is not None:
+        md["surface"] = surface
     _insert(tenant_id, "mcp", md, occurred_at)
 
 
@@ -247,6 +251,91 @@ def test_list_users_surfaces_unmapped_activity(
     assert len(body["unmapped"]) == 1
     assert body["unmapped"][0]["source_identifier"] == "sera-production"
     assert body["unmapped"][0]["event_count"] == 1
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# TM4 #3 — Claude Code vs Claude (chat) surface delineation
+# ───────────────────────────────────────────────────────────────────────────
+
+
+def test_list_users_surface_self_reported_claude_code(
+    clean_state: None, client: TestClient
+) -> None:
+    """An MCP record self-reporting surface=claude_code surfaces as
+    'claude_code' (rendered 'Claude Code'), not the bare 'mcp'."""
+    tenant = "tnt_us_users_surface_code"
+    _provision_tenant(tenant)
+    uid = _provision_user(tenant, "coder@example.com")
+    _seed_mcp(
+        tenant, email="coder@example.com", user_id=uid, surface="claude_code"
+    )
+
+    r = client.get("/users", headers=_bearer(tenant))
+    row = r.json()["users"][0]
+    assert row["surfaces"] == ["claude_code"]
+
+
+def test_list_users_surface_kind_tool_use_fallback(
+    clean_state: None, client: TestClient
+) -> None:
+    """A pre-surface MCP record (no `surface` field) with kind=tool_use
+    is retro-labeled claude_code via the read-path heuristic — the
+    immediate win for data captured before the field shipped."""
+    tenant = "tnt_us_users_surface_kindfallback"
+    _provision_tenant(tenant)
+    uid = _provision_user(tenant, "legacy@example.com")
+    _seed_mcp(
+        tenant, email="legacy@example.com", user_id=uid, kind="tool_use"
+    )  # no surface
+
+    r = client.get("/users", headers=_bearer(tenant))
+    row = r.json()["users"][0]
+    assert row["surfaces"] == ["claude_code"]
+
+
+def test_list_users_surface_plain_chat_stays_mcp(
+    clean_state: None, client: TestClient
+) -> None:
+    """An MCP record with no surface and kind=chat stays 'mcp' (rendered
+    'Claude (chat)') — the heuristic must not over-claim Claude Code."""
+    tenant = "tnt_us_users_surface_chat"
+    _provision_tenant(tenant)
+    uid = _provision_user(tenant, "chatter@example.com")
+    _seed_mcp(tenant, email="chatter@example.com", user_id=uid)  # kind=chat
+
+    r = client.get("/users", headers=_bearer(tenant))
+    row = r.json()["users"][0]
+    assert row["surfaces"] == ["mcp"]
+
+
+def test_user_detail_surfaces_delineate_claude_code(
+    clean_state: None, client: TestClient
+) -> None:
+    """Detail header surfaces reflect the effective surface: a user with
+    one claude_code MCP turn + one chat MCP turn shows both badges."""
+    tenant = "tnt_us_users_surface_detail"
+    _provision_tenant(tenant)
+    uid = _provision_user(tenant, "mixed@example.com")
+    now = datetime.now(tz=timezone.utc)
+    _seed_mcp(
+        tenant,
+        email="mixed@example.com",
+        user_id=uid,
+        surface="claude_code",
+        occurred_at=now - timedelta(days=1),
+    )
+    _seed_mcp(
+        tenant,
+        email="mixed@example.com",
+        user_id=uid,
+        occurred_at=now - timedelta(days=2),
+    )  # plain chat
+    client.get("/users", headers=_bearer(tenant))  # lazy reconcile
+
+    body = client.get(f"/users/{uid}", headers=_bearer(tenant)).json()
+    assert set(body["surfaces"]) == {"claude_code", "mcp"}
+    # The newest record (claude_code) leads the recent list.
+    assert body["recent"][0]["source_api"] == "claude_code"
 
 
 def test_list_users_rls_isolated(

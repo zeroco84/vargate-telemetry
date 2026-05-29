@@ -51,6 +51,7 @@ from vargate_telemetry.db import session_scope
 from vargate_telemetry.pricing import compute_cost_usd
 from vargate_telemetry.users import (
     ACTOR_KEY_SQL,
+    EFFECTIVE_SURFACE_SQL,
     SESSION_SOURCE_APIS,
     reconcile_aliases_for_tenant,
 )
@@ -212,6 +213,7 @@ def list_users(
                 WITH actor_events AS (
                     SELECT
                         tr.source_api,
+                        ({EFFECTIVE_SURFACE_SQL}) AS surface,
                         {ACTOR_KEY_SQL} AS identifier,
                         tr.occurred_at
                     FROM telemetry_records tr
@@ -222,7 +224,7 @@ def list_users(
                 SELECT
                     u.id::text AS user_id,
                     u.email,
-                    array_agg(DISTINCT ae.source_api) AS surfaces,
+                    array_agg(DISTINCT ae.surface) AS surfaces,
                     count(*) FILTER (
                         WHERE ae.occurred_at >= :since_7d
                     ) AS events_7d,
@@ -288,6 +290,7 @@ def list_users(
                 WITH actor_events AS (
                     SELECT
                         tr.source_api,
+                        ({EFFECTIVE_SURFACE_SQL}) AS surface,
                         {ACTOR_KEY_SQL} AS identifier,
                         tr.occurred_at
                     FROM telemetry_records tr
@@ -399,7 +402,6 @@ def get_user_detail(
             )
             for a in alias_rows
         ]
-        surfaces = sorted({a.source_api for a in aliases})
 
         if not aliases:
             # Mapped user with no aliases yet — return an empty shell
@@ -423,6 +425,7 @@ def get_user_detail(
                 WITH actor_events AS (
                     SELECT
                         tr.source_api,
+                        ({EFFECTIVE_SURFACE_SQL}) AS surface,
                         {ACTOR_KEY_SQL} AS identifier,
                         tr.occurred_at
                     FROM telemetry_records tr
@@ -433,14 +436,14 @@ def get_user_detail(
                 )
                 SELECT
                     DATE(ae.occurred_at AT TIME ZONE 'UTC') AS day,
-                    ae.source_api,
+                    ae.surface AS source_api,
                     count(*) AS count
                 FROM actor_events ae
                 JOIN user_aliases ua
                    ON ua.source_api = ae.source_api
                   AND ua.source_identifier = ae.identifier
                 WHERE ua.user_id = :id
-                GROUP BY day, ae.source_api
+                GROUP BY day, ae.surface
                 ORDER BY day
                 """
             ),
@@ -456,6 +459,11 @@ def get_user_detail(
             )
             for h in heatmap_rows
         ]
+        # TM4 #3 — header surfaces reflect the EFFECTIVE surface
+        # ("Claude Code" vs "Claude (chat)") seen over the heatmap
+        # window, derived from the same rows the grid renders rather
+        # than the raw alias source_api (which is always 'mcp').
+        surfaces = sorted({c.source_api for c in heatmap})
 
         # Spend trend: per-day MCP cost (priceable source). Priced in
         # Python; grouped by day.
@@ -505,7 +513,7 @@ def get_user_detail(
                 f"""
                 SELECT
                     tr.id::text AS record_id,
-                    tr.source_api,
+                    ({EFFECTIVE_SURFACE_SQL}) AS source_api,
                     tr.occurred_at,
                     tr.metadata->>'kind' AS kind,
                     tr.metadata->>'summary' AS summary
