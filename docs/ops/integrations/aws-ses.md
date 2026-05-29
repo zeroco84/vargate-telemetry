@@ -9,15 +9,13 @@ same boto3 wrapper at `vargate_telemetry/notify/email.py`.
 
 | Setting | Value |
 |---|---|
-| Verified domain | `vargate.ai` (DKIM + SPF set; verified at the Twinlite organization level for the other Twinlite projects) |
-| From address | `alerts@vargate.ai` (verified email identity in the EU-West-1 region) |
-| Reply-to | `noreply@vargate.ai` — replies aren't monitored; surfaced in the email footer along with the dashboard link |
+| Verified domain | `ogma.vargate.ai` (verified in SES `eu-west-1`, 2026-05-29). A verified domain covers its **subdomains** for sending, so `*@mail.ogma.vargate.ai` sends under this identity without a separate verification. |
+| From address | `alerts@mail.ogma.vargate.ai` — a dedicated sending subdomain. |
+| Reply-to | not set; the email footer carries the dashboard link instead |
 
-If we ever need a subdomain sender (e.g. `alerts@ogma.vargate.ai`):
-verify it as a separate identity, add SPF + DKIM CNAMEs to the
-Cloudflare DNS for `ogma.vargate.ai`. **Do not** swap
-`OGMA_ALERT_FROM_ADDRESS` to the new identity until SES shows the
-identity as `Verification status: Verified`.
+**Why not `@vargate.ai`:** the `vargate.ai` apex is in use by **Microsoft 365 for staff email**. Verifying it in SES (and pointing SES SPF/DKIM at it) would collide with the M365 mail setup. A dedicated sending subdomain keeps SES's reputation + DNS records isolated from both the corporate apex and the `ogma.vargate.ai` app host. This is standard practice for transactional senders.
+
+**History / footgun:** the original version of this doc wrongly stated `alerts@vargate.ai` was a verified identity. It never was — the first prod send failed with `MessageRejected: Email address is not verified`. The verified identities in `eu-west-1` are `ogma.vargate.ai` (ours) plus sibling Twinlite projects (`twinlite.com`, `fairsign.io`, etc. — do NOT send Ogma mail from those). Always confirm the actual verified set with `sesv2 list-identities` / the SES console before assuming an identity exists.
 
 ## SES region
 
@@ -64,22 +62,27 @@ broaden the action list at that time — don't pre-grant.
 
 ## Sandbox status
 
-AWS accounts start SES in **sandbox mode**, which restricts:
+**Confirmed OUT of sandbox** (verified 2026-05-29 in `eu-west-1`:
+`sesv2 get_account` → `ProductionAccessEnabled: True`,
+`SendingEnabled: True`, `EnforcementStatus: HEALTHY`). The account
+can send to **arbitrary recipient addresses** — which budget alerts
+require, since recipients are whatever emails are on a budget's
+recipient list, not a pre-verified set.
 
-- Senders: must be verified
-- Recipients: must be verified
-- Volume: 200 emails/24h, 1/second
+Re-check any time with (the IAM key has list/get perms):
 
-Production access (no recipient restriction, 50K/day default
-quota) is requested via the SES console → "Request production
-access". Approval is usually within 24h. **Check sandbox status
-before assuming an alert email lands** — a `MessageRejected: Email
-address is not verified` in CloudWatch is the sandbox-restriction
-signal.
+```bash
+docker exec vargate-telemetry-celery-worker-1 python -c \
+  'import boto3; print(boto3.client("sesv2", region_name="eu-west-1").get_account())'
+```
 
-To check status: AWS Console → SES → Account dashboard → "Sending
-statistics". If sandbox: the box at the top reads "Your Amazon SES
-account is in the sandbox in EU (Ireland)".
+For reference, a *sandboxed* account restricts: senders must be
+verified, **recipients** must also be verified, and volume is capped
+at 200/24h. If `ProductionAccessEnabled` ever flips back to `False`
+(e.g. a new account/region), request production access via SES
+console → "Request production access" (≈24h approval). The
+sandbox-restriction signal is `MessageRejected: Email address is
+not verified` naming the *recipient*.
 
 ## Failure modes the wrapper handles
 
