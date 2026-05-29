@@ -44,10 +44,17 @@ from __future__ import annotations
 import logging
 import os
 import threading
+from email.utils import formataddr
 from typing import Any, Optional
 
 
 _log = logging.getLogger(__name__)
+
+# Display name on the From header. Recipients see "Vargate.ai" rather
+# than the bare sending address (which carries the `mail.` MAIL-FROM
+# subdomain for SPF alignment — see docs/ops/integrations/aws-ses.md).
+# formataddr() RFC-quotes the dot in the name automatically.
+_FROM_DISPLAY_NAME = "Vargate.ai"
 
 
 class EmailDeliveryError(RuntimeError):
@@ -146,10 +153,15 @@ def send_email(
             "(see docs/ops/integrations/aws-ses.md)."
         )
 
+    # Build the From with a display name so recipients see
+    # "Vargate.ai", not the raw mail.ogma.vargate.ai address.
+    # formataddr handles RFC 5322 quoting of the dotted name.
+    source = formataddr((_FROM_DISPLAY_NAME, sender))
+
     client = _client_singleton()
     try:
         response = client.send_email(
-            Source=sender,
+            Source=source,
             Destination={"ToAddresses": to},
             Message={
                 "Subject": {"Data": subject, "Charset": "UTF-8"},

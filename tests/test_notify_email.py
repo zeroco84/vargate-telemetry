@@ -62,9 +62,11 @@ def test_send_email_returns_message_id_on_success(
         text_body="hi",
     )
     assert msg_id == "ses-abc-123"
-    # Verify the wire shape the wrapper sends to SES.
+    # Verify the wire shape the wrapper sends to SES. Source carries
+    # the "Vargate.ai" display name (formataddr quotes the dotted
+    # name) wrapping the env sender address.
     args, kwargs = mock_client.send_email.call_args
-    assert kwargs["Source"] == "alerts@vargate.ai"
+    assert kwargs["Source"] == '"Vargate.ai" <alerts@vargate.ai>'
     assert kwargs["Destination"] == {"ToAddresses": ["rick@example.com"]}
     assert kwargs["Message"]["Subject"]["Data"] == "hi"
     assert kwargs["Message"]["Body"]["Html"]["Data"] == "<p>hi</p>"
