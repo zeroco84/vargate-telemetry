@@ -71,6 +71,10 @@ LOG_INTERACTION_DESCRIPTION = (
     "chat, edit, search, tool_use, other.\n"
     "  - model: which Claude model you are (e.g. "
     "claude-sonnet-4-5).\n"
+    "  - surface: which Claude product you are running in — one of "
+    "claude_code, claude_desktop, claude_web, other. Report it "
+    "accurately (claude_code if you are Claude Code, claude_web for "
+    "claude.ai chat); use other if you are unsure.\n"
     "  - summary: one transparent sentence describing what "
     "happened in this turn. <= 500 chars.\n"
     "  - input_tokens_estimate: approximate input tokens for this "
@@ -95,6 +99,18 @@ LOG_INTERACTION_DESCRIPTION = (
 
 InteractionKind = Literal["chat", "edit", "search", "tool_use", "other"]
 
+# TM4 #3 — self-reported client surface. The MCP capture model is
+# already entirely Claude-self-reported (kind/model/summary/tokens),
+# and there is no reliable server-side signal to tell Claude Code from
+# claude.ai chat: Anthropic proxies both (including Claude Code on the
+# web) through the same infrastructure with an identical transport
+# fingerprint (`Claude-User` UA, shared egress IPs), and stateless_http
+# discards the initialize-time clientInfo before the tool body runs.
+# So Claude reports which product it runs in; the /users + /sessions
+# read-path renders "Claude Code" vs "Claude (chat)" from it, falling
+# back to the `kind` heuristic for records logged before this existed.
+Surface = Literal["claude_code", "claude_desktop", "claude_web", "other"]
+
 
 def handle_log_interaction(
     *,
@@ -104,6 +120,7 @@ def handle_log_interaction(
     input_tokens_estimate: int,
     output_tokens_estimate: int,
     tool_calls_count: int,
+    surface: Surface | None = None,
     tenant_id: str,
     user_id: str,
     user_email: str,
@@ -136,6 +153,7 @@ def handle_log_interaction(
         input_tokens_estimate=int(input_tokens_estimate),
         output_tokens_estimate=int(output_tokens_estimate),
         tool_calls_count=int(tool_calls_count),
+        surface=surface,
         client_received_at=client_received_at,
     )
 

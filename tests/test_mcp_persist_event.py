@@ -57,6 +57,7 @@ def _persist(
     input_tokens_estimate: int = 1200,
     output_tokens_estimate: int = 400,
     tool_calls_count: int = 1,
+    surface: str | None = None,
     client_received_at: str = "",
 ) -> dict:
     """Invoke the task body directly (no broker).
@@ -84,6 +85,7 @@ def _persist(
         input_tokens_estimate=input_tokens_estimate,
         output_tokens_estimate=output_tokens_estimate,
         tool_calls_count=tool_calls_count,
+        surface=surface,
         client_received_at=client_received_at,
     )
 
@@ -205,3 +207,50 @@ def test_persist_event_requires_tenant_id(clean_records: None) -> None:
             ),
         ).scalar()
     assert count == 0
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# TM4 #3 — self-reported surface persists into metadata
+# ───────────────────────────────────────────────────────────────────────────
+
+
+def test_persist_event_stores_surface_in_metadata(
+    clean_records: None,
+) -> None:
+    """A reported surface lands verbatim in the record's metadata so the
+    read-path can render "Claude Code" vs "Claude (chat)"."""
+    from vargate_telemetry.db import engine
+
+    _persist(surface="claude_code")
+
+    with engine.connect() as conn:
+        metadata = conn.execute(
+            sql_text(
+                "SELECT metadata FROM telemetry_records "
+                "WHERE tenant_id = :t AND source_api = 'mcp'"
+            ),
+            {"t": "tnt_us_persist_test"},
+        ).scalar()
+    assert metadata["surface"] == "claude_code"
+
+
+def test_persist_event_surface_null_when_not_reported(
+    clean_records: None,
+) -> None:
+    """Omitting surface stores an explicit null (key always present) so a
+    pre-field client is indistinguishable from one that left it blank —
+    both defer to the read-path's kind heuristic."""
+    from vargate_telemetry.db import engine
+
+    _persist()  # no surface
+
+    with engine.connect() as conn:
+        metadata = conn.execute(
+            sql_text(
+                "SELECT metadata FROM telemetry_records "
+                "WHERE tenant_id = :t AND source_api = 'mcp'"
+            ),
+            {"t": "tnt_us_persist_test"},
+        ).scalar()
+    assert "surface" in metadata
+    assert metadata["surface"] is None

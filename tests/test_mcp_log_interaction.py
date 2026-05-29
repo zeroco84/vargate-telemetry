@@ -122,3 +122,22 @@ def test_handler_rejects_empty_summary(
     with pytest.raises(ValueError, match="summary required"):
         _call_handler(summary="")
     assert len(captured_delay) == 0  # nothing enqueued
+
+
+def test_handler_passes_surface_when_provided(
+    captured_delay: list[dict[str, Any]],
+) -> None:
+    """TM4 #3 — the self-reported surface threads into the persist payload."""
+    _call_handler(surface="claude_code")
+    assert len(captured_delay) == 1
+    assert captured_delay[0]["surface"] == "claude_code"
+
+
+def test_handler_defaults_surface_to_none(
+    captured_delay: list[dict[str, Any]],
+) -> None:
+    """Surface is optional — older/omitting clients enqueue None, and the
+    read-path falls back to the kind heuristic. The key is always present."""
+    _call_handler()  # no surface override
+    assert len(captured_delay) == 1
+    assert captured_delay[0]["surface"] is None

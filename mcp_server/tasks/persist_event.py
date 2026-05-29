@@ -55,6 +55,7 @@ def persist_event(
     input_tokens_estimate: int,
     output_tokens_estimate: int,
     tool_calls_count: int,
+    surface: str | None = None,
     client_received_at: str,
 ) -> dict[str, Any]:
     """Write one MCP interaction to telemetry_records.
@@ -78,6 +79,11 @@ def persist_event(
         "input_tokens_estimate": int(input_tokens_estimate),
         "output_tokens_estimate": int(output_tokens_estimate),
         "tool_calls_count": int(tool_calls_count),
+        # TM4 #3 — Claude-self-reported client surface (claude_code /
+        # claude_desktop / claude_web / other). None when the client
+        # predates the field or didn't report it; the read-path falls
+        # back to the `kind` heuristic in that case.
+        "surface": surface,
         "user_email": user_email,
         "subject_user_id": user_id,
         "event_id": event_id,

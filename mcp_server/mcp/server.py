@@ -37,6 +37,7 @@ from mcp_server.auth.token_verifier import (
 )
 from mcp_server.mcp.tools.log_interaction import (
     LOG_INTERACTION_DESCRIPTION,
+    Surface,
     handle_log_interaction,
 )
 
@@ -105,6 +106,7 @@ def build_mcp_server() -> FastMCP:
         input_tokens_estimate: int,
         output_tokens_estimate: int,
         tool_calls_count: int,
+        surface: Surface | None = None,
     ) -> dict:
         access = get_access_token()
         if access is None:
@@ -131,6 +133,7 @@ def build_mcp_server() -> FastMCP:
             input_tokens_estimate=input_tokens_estimate,
             output_tokens_estimate=output_tokens_estimate,
             tool_calls_count=tool_calls_count,
+            surface=surface,
             tenant_id=identity.tenant_id,
             user_id=identity.user_id,
             user_email=identity.user_email,
