@@ -284,6 +284,8 @@ def _seed_mcp_row(
     user_email: str,
     user_id: str,
     external_id: str | None = None,
+    kind: str = "chat",
+    surface: str | None = None,
 ) -> None:
     """Insert one MCP row with the FLAT metadata shape the persist task
     actually writes (no nested `actor` envelope). Exercises the
@@ -294,10 +296,12 @@ def _seed_mcp_row(
     md = {
         "user_email": user_email,
         "subject_user_id": user_id,
-        "kind": "chat",
+        "kind": kind,
         "model": "claude-opus-4-7",
         "summary": "test row",
     }
+    if surface is not None:
+        md["surface"] = surface
     eid = external_id or f"mcp:{tenant_id}:{user_id}:{occurred_at.isoformat()}"
     with engine.begin() as conn:
         conn.execute(
@@ -361,6 +365,45 @@ def test_list_sessions_surfaces_mcp_records_with_flat_metadata(
     assert s["source_apis"] == ["mcp"]
     assert s["event_count"] == 3
     assert s["event_count_by_source"] == {"mcp": 3}
+
+
+def test_list_sessions_delineates_claude_code_in_distribution(
+    clean_records: None, client: TestClient
+) -> None:
+    """TM4 #3 — within one MCP session, a self-reported claude_code turn
+    and a kind=tool_use turn (pre-field heuristic) both count as
+    claude_code, while a plain chat turn stays mcp. The per-source
+    distribution splits them so the Sessions row renders "Claude Code"
+    and "Claude (chat)" badges instead of one lumped "Claude (chat)"."""
+    tenant = "tnt_us_test_mcp_surface"
+    base = datetime(2026, 5, 13, 14, 0, tzinfo=timezone.utc)
+    _seed_mcp_row(
+        tenant,
+        occurred_at=base,
+        user_email="dev@example.com",
+        user_id="user-surface",
+        surface="claude_code",
+    )
+    _seed_mcp_row(
+        tenant,
+        occurred_at=base + timedelta(hours=1),
+        user_email="dev@example.com",
+        user_id="user-surface",
+        kind="tool_use",  # pre-field → claude_code via heuristic
+    )
+    _seed_mcp_row(
+        tenant,
+        occurred_at=base + timedelta(hours=2),
+        user_email="dev@example.com",
+        user_id="user-surface",
+    )  # plain chat → stays mcp
+
+    r = client.get("/sessions", headers=_bearer_for_tenant(tenant))
+    assert r.status_code == 200, r.text
+    s = r.json()["sessions"][0]
+    assert s["event_count"] == 3
+    assert s["event_count_by_source"] == {"claude_code": 2, "mcp": 1}
+    assert s["source_apis"] == ["claude_code", "mcp"]
 
 
 def test_list_sessions_aggregates_mcp_and_compliance_into_same_session(

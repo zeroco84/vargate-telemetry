@@ -147,6 +147,26 @@ _ACTOR_TYPE_SQL = (
 )
 
 
+# TM4 #3 — "effective surface" for the per-session source distribution.
+# MCP records self-report a `surface` (claude_code / claude_web /
+# claude_desktop / other); for records logged before the field shipped,
+# fall back to the kind=tool_use heuristic, else the generic 'mcp'
+# token. Non-mcp sources pass through unchanged. Bare column refs (no
+# table alias) — the Sessions aggregation is single-table, so
+# `source_api` and `metadata` are unambiguous. MIRRORS the users
+# package's EFFECTIVE_SURFACE_SQL (tr.-qualified there for its JOIN
+# contexts); KEEP IN SYNC, same duplication posture as _ACTOR_KEY_SQL.
+_EFFECTIVE_SURFACE_SQL = (
+    "CASE "
+    "WHEN source_api = 'mcp' THEN CASE "
+    "WHEN NULLIF(metadata->>'surface', '') IS NOT NULL "
+    "THEN metadata->>'surface' "
+    "WHEN metadata->>'kind' = 'tool_use' THEN 'claude_code' "
+    "ELSE 'mcp' END "
+    "ELSE source_api END"
+)
+
+
 # ───────────────────────────────────────────────────────────────────────────
 # Response shapes — match openapi/ogma-api.yaml
 # ───────────────────────────────────────────────────────────────────────────
@@ -443,7 +463,7 @@ def list_sessions(
                 DATE(occurred_at AT TIME ZONE 'UTC') AS session_date,
                 {_ACTOR_TYPE_SQL} AS actor_type,
                 {_ACTOR_KEY_SQL} AS actor_key,
-                source_api,
+                ({_EFFECTIVE_SURFACE_SQL}) AS source_api,
                 COUNT(*) AS source_count,
                 MIN(occurred_at) AS source_first,
                 MAX(occurred_at) AS source_last
