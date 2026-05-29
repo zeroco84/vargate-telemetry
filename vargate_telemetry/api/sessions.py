@@ -591,7 +591,7 @@ def get_session_detail(
     sql = f"""
         SELECT
             id::text AS record_id,
-            source_api,
+            ({_EFFECTIVE_SURFACE_SQL}) AS source_api,
             record_type,
             occurred_at,
             external_id,

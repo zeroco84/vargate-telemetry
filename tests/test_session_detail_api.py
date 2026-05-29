@@ -181,6 +181,45 @@ def test_session_detail_happy_path(
         assert rec["content"] is None
 
 
+def test_session_detail_delineates_claude_code_surface(
+    clean_records: None, client: TestClient
+) -> None:
+    """TM4 #3 — the per-record source in the detail reflects the
+    effective surface: an MCP tool_use turn renders as claude_code, a
+    chat turn stays mcp, so the detail agrees with the list's
+    distribution split (no more lumping Claude Code work as chat)."""
+    tenant = "tnt_us_detail_surface"
+    base = datetime(2026, 5, 13, 14, 0, tzinfo=timezone.utc)
+    _seed_record(
+        tenant,
+        occurred_at=base,
+        source_api="mcp",
+        actor_type="user_actor",
+        actor_key="dev@example.com",
+        external_id="mcp_toolu_1",
+        extra_metadata={"kind": "tool_use", "summary": "edited files"},
+    )
+    _seed_record(
+        tenant,
+        occurred_at=base.replace(minute=5),
+        source_api="mcp",
+        actor_type="user_actor",
+        actor_key="dev@example.com",
+        external_id="mcp_chat_1",
+        extra_metadata={"kind": "chat", "summary": "asked a question"},
+    )
+
+    sid = _encode_session_id("2026-05-13", "user_actor", "dev@example.com")
+    r = client.get(f"/sessions/{sid}", headers=_bearer_for_tenant(tenant))
+    assert r.status_code == 200, r.text
+    records = r.json()["records"]
+    assert len(records) == 2
+    # Ordered by occurred_at: the 14:00 tool_use turn → Claude Code,
+    # then the 14:05 chat turn → Claude (chat).
+    assert records[0]["source_api"] == "claude_code"
+    assert records[1]["source_api"] == "mcp"
+
+
 # ───────────────────────────────────────────────────────────────────────────
 # Decryption — content_ref + stubbed retriever returns plaintext
 # ───────────────────────────────────────────────────────────────────────────
