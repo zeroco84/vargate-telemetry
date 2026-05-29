@@ -187,6 +187,20 @@ services:
       MINIO_TENANT_CONTENT_BUCKET: ${MINIO_TENANT_CONTENT_BUCKET:-tenant-content}
       MINIO_ROOT_USER: ${MINIO_ROOT_USER}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      # TM3 Phase B4: AWS SES for budget-alert email. The
+      # evaluate_budgets task runs in THIS worker and calls
+      # notify.send_email; the gateway/beat never send, so the SES
+      # vars live only here. OGMA_ALERT_FROM_ADDRESS unset → the
+      # email module raises SesNotConfigured, the evaluator catches
+      # + logs, the alert still records (dashboard is source of
+      # truth). boto3 reads AWS_ACCESS_KEY_ID/SECRET from its default
+      # credential chain — they must be in the env for it to find
+      # them. See docs/ops/integrations/aws-ses.md.
+      OGMA_ALERT_FROM_ADDRESS: ${OGMA_ALERT_FROM_ADDRESS:-}
+      AWS_SES_REGION: ${AWS_SES_REGION:-eu-west-1}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      OGMA_DASHBOARD_URL: ${OGMA_DASHBOARD_URL:-https://ogma.vargate.ai}
     volumes:
       - vargate-hsm-tokens:/var/lib/softhsm/tokens
       - vargate-prom-multiproc:/tmp/prometheus_multiproc
