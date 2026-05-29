@@ -123,6 +123,13 @@ class UserRecentRecord(BaseModel):
     summary: Optional[str] = None
 
 
+class TopicCount(BaseModel):
+    """One taxonomy topic + how many of the user's interactions hit it."""
+
+    topic: str
+    count: int
+
+
 class UserDetailResponse(BaseModel):
     user_id: str
     email: str
@@ -132,6 +139,13 @@ class UserDetailResponse(BaseModel):
     heatmap: list[HeatmapCell]
     spend_trend: list[SpendTrendPoint]
     recent: list[UserRecentRecord]
+    # TM4 Track D — topics inferred from this user's MCP summaries.
+    # top_topics is ranked desc; topics_classified / topics_total power
+    # the honest "N of M classified" framing (classification is async +
+    # best-effort, so total >= classified).
+    top_topics: list[TopicCount]
+    topics_classified: int
+    topics_total: int
 
 
 class AliasMapRequest(BaseModel):
@@ -416,6 +430,9 @@ def get_user_detail(
                 heatmap=[],
                 spend_trend=[],
                 recent=[],
+                top_topics=[],
+                topics_classified=0,
+                topics_total=0,
             )
 
         # Heatmap: per (day, source) event count over the window.
@@ -540,6 +557,55 @@ def get_user_detail(
             for r in recent_rows
         ]
 
+        # TM4 Track D — top topics inferred from this user's MCP
+        # summaries (only MCP records carry topic classifications). The
+        # join walks interaction_topics -> the record -> the user's
+        # alias. Ranked desc; ties broken by topic name for stability.
+        topic_rows = s.execute(
+            sql_text(
+                f"""
+                SELECT it.topic AS topic, count(*) AS n
+                FROM interaction_topics it
+                JOIN telemetry_records tr ON tr.id = it.record_id
+                JOIN user_aliases ua
+                   ON ua.source_api = tr.source_api
+                  AND ua.source_identifier = {ACTOR_KEY_SQL}
+                WHERE it.tenant_id = current_setting('app.tenant_id')
+                  AND tr.source_api = 'mcp'
+                  AND ua.user_id = :id
+                GROUP BY it.topic
+                ORDER BY n DESC, it.topic
+                """
+            ),
+            {"id": str(user_id)},
+        ).all()
+        top_topics = [
+            TopicCount(topic=r.topic, count=int(r.n)) for r in topic_rows
+        ]
+        topics_classified = sum(int(r.n) for r in topic_rows)
+        # The classifiable universe: the user's MCP records that carry a
+        # summary. total >= classified (classification is async + capped
+        # per tick), so the UI can honestly show "N of M classified".
+        topics_total = (
+            s.execute(
+                sql_text(
+                    f"""
+                    SELECT count(*) AS n
+                    FROM telemetry_records tr
+                    JOIN user_aliases ua
+                       ON ua.source_api = tr.source_api
+                      AND ua.source_identifier = {ACTOR_KEY_SQL}
+                    WHERE tr.tenant_id = current_setting('app.tenant_id')
+                      AND tr.source_api = 'mcp'
+                      AND ua.user_id = :id
+                      AND COALESCE(tr.metadata->>'summary', '') <> ''
+                    """
+                ),
+                {"id": str(user_id)},
+            ).scalar()
+            or 0
+        )
+
     return UserDetailResponse(
         user_id=urow.id,
         email=urow.email,
@@ -549,6 +615,9 @@ def get_user_detail(
         heatmap=heatmap,
         spend_trend=spend_trend,
         recent=recent,
+        top_topics=top_topics,
+        topics_classified=topics_classified,
+        topics_total=int(topics_total),
     )
 
 

@@ -338,6 +338,83 @@ def test_user_detail_surfaces_delineate_claude_code(
     assert body["recent"][0]["source_api"] == "claude_code"
 
 
+# ───────────────────────────────────────────────────────────────────────────
+# TM4 Track D — Top topics on the user-detail view
+# ───────────────────────────────────────────────────────────────────────────
+
+
+def _seed_topics(tenant_id: str, assignments: list[tuple[str, int]]) -> None:
+    """Stand in for the async classifier: assign topics to this tenant's
+    MCP records (round-robin over their ids). ``assignments`` is a list
+    of ``(topic, count)``."""
+    from vargate_telemetry.db import engine
+
+    with engine.begin() as conn:
+        ids = [
+            r.id
+            for r in conn.execute(
+                sql_text(
+                    "SELECT id::text AS id FROM telemetry_records "
+                    "WHERE tenant_id = :t AND source_api = 'mcp' "
+                    "ORDER BY id"
+                ),
+                {"t": tenant_id},
+            ).all()
+        ]
+        i = 0
+        for topic, count in assignments:
+            for _ in range(count):
+                conn.execute(
+                    sql_text(
+                        "INSERT INTO interaction_topics (tenant_id, "
+                        "record_id, topic, taxonomy_version, model) "
+                        "VALUES (:t, :rid, :topic, 'v1', 'test')"
+                    ),
+                    {"t": tenant_id, "rid": ids[i], "topic": topic},
+                )
+                i += 1
+
+
+def test_user_detail_top_topics(
+    clean_state: None, client: TestClient
+) -> None:
+    """/users/{id} returns ranked Top topics + classified/total counts."""
+    tenant = "tnt_us_users_topics"
+    _provision_tenant(tenant)
+    uid = _provision_user(tenant, "topics@example.com")
+    for _ in range(3):
+        _seed_mcp(tenant, email="topics@example.com", user_id=uid)
+    client.get("/users", headers=_bearer(tenant))  # reconcile the alias
+    _seed_topics(tenant, [("Coding", 2), ("Research", 1)])
+
+    body = client.get(f"/users/{uid}", headers=_bearer(tenant)).json()
+    # Ranked by count desc, ties by topic name.
+    assert body["top_topics"] == [
+        {"topic": "Coding", "count": 2},
+        {"topic": "Research", "count": 1},
+    ]
+    assert body["topics_classified"] == 3
+    assert body["topics_total"] == 3  # 3 MCP records, all with summaries
+
+
+def test_user_detail_top_topics_empty_when_unclassified(
+    clean_state: None, client: TestClient
+) -> None:
+    """No classifications yet → empty top_topics + classified 0, but
+    topics_total still reflects the classifiable (summarized) MCP
+    records, so the UI can show 'N of M classified'."""
+    tenant = "tnt_us_users_topics_empty"
+    _provision_tenant(tenant)
+    uid = _provision_user(tenant, "pending@example.com")
+    _seed_mcp(tenant, email="pending@example.com", user_id=uid)
+    client.get("/users", headers=_bearer(tenant))
+
+    body = client.get(f"/users/{uid}", headers=_bearer(tenant)).json()
+    assert body["top_topics"] == []
+    assert body["topics_classified"] == 0
+    assert body["topics_total"] == 1
+
+
 def test_list_users_rls_isolated(
     clean_state: None, client: TestClient
 ) -> None:

@@ -1046,6 +1046,15 @@ components:
           type: string
           nullable: true
 
+    TopicCount:
+      type: object
+      required: [topic, count]
+      properties:
+        topic:
+          type: string
+        count:
+          type: integer
+
     UserDetailResponse:
       type: object
       required:
@@ -1057,6 +1066,9 @@ components:
         - heatmap
         - spend_trend
         - recent
+        - top_topics
+        - topics_classified
+        - topics_total
       properties:
         user_id:
           type: string
@@ -1086,6 +1098,14 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/UserRecentRecord'
+        top_topics:
+          type: array
+          items:
+            $ref: '#/components/schemas/TopicCount'
+        topics_classified:
+          type: integer
+        topics_total:
+          type: integer
 
     AliasMapRequest:
       type: object
