@@ -164,6 +164,16 @@ services:
       STRIPE_API_KEY_TEST: ${STRIPE_API_KEY_TEST:-}
       VARGATE_REGION: ${VARGATE_REGION:-us}
       ANTHROPIC_ADMIN_KEY_TEST: ${ANTHROPIC_ADMIN_KEY_TEST:-}
+      # TM4 Track D: Messages-API key for the Haiku topic classifier
+      # (anthropic SDK). Distinct from ANTHROPIC_ADMIN_KEY_TEST above,
+      # which is the custom httpx Admin-API client. Worker-only — the
+      # classifier task runs here; beat just .delay()s, gateway only reads.
+      # Sourced from OGMA_ANTHROPIC_API_KEY (namespaced) rather than the bare
+      # ANTHROPIC_API_KEY: an ambient ANTHROPIC_API_KEY in the deploy shell
+      # always wins compose interpolation and would shadow the .env value
+      # (it silently deployed empty once). The container still gets the
+      # SDK-standard ANTHROPIC_API_KEY name that anthropic reads by default.
+      ANTHROPIC_API_KEY: ${OGMA_ANTHROPIC_API_KEY:-}
       JWT_SIGNING_KEY: ${JWT_SIGNING_KEY:-}
       GOOGLE_OAUTH_CLIENT_ID: ${GOOGLE_OAUTH_CLIENT_ID:-}
       GOOGLE_OAUTH_CLIENT_SECRET: ${GOOGLE_OAUTH_CLIENT_SECRET:-}
