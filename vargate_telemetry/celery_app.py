@@ -138,6 +138,19 @@ celery_app.conf.beat_schedule = {
         "schedule": 900.0,  # every 15 minutes
         "options": {"queue": "default"},
     },
+    # TM4 Track D: activity categorization. Every 15 minutes, classify
+    # MCP interaction summaries that lack a topic label into the fixed
+    # taxonomy via Claude Haiku (backfill + forward, capped per tenant
+    # per tick). Same VARGATE_REGION default caveat as the other
+    # dispatchers — see ogma_dispatch_region_gap.
+    "dispatch-classify-topics": {
+        "task": (
+            "vargate_telemetry.tasks.classify_topics."
+            "dispatch_classify_topics"
+        ),
+        "schedule": 900.0,  # every 15 minutes
+        "options": {"queue": "default"},
+    },
 }
 
 # Alias so `celery -A vargate_telemetry.celery_app worker` (which looks up

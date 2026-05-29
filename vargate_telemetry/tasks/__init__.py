@@ -7,6 +7,7 @@
 # at import time, so the worker only needs to load `vargate_telemetry.tasks`
 # (which it does via celery_app's `include=[...]`) to discover them all.
 from vargate_telemetry.tasks import (  # noqa: F401
+    classify_topics,
     diagnostics,
     evaluate_budgets,
     metering,

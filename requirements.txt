@@ -29,6 +29,13 @@ stripe>=8,<9
 # tests can inject a zero-wait policy without monkey-patching.
 tenacity>=8,<10
 
+# TM4 Track D: Anthropic SDK for topic classification (Haiku) over MCP
+# summaries. Distinct from the custom httpx Admin-API client above — this
+# is the official SDK, used only by topics/classifier.py for inference
+# (structured output via output_config.format). Pinned tight: pre-1.0 SDK
+# with frequent minor releases that can shift the request surface.
+anthropic>=0.105.2,<0.106
+
 # T4.0: OpenAPI 3.1 contract validation. `openapi/ogma-api.yaml` is
 # the contract source of truth; this validator is used by the
 # `scripts/validate_openapi.py` CI check and by the
