@@ -247,3 +247,42 @@ def apply_migrations() -> None:
 
     alembic_cfg = Config(cfg_path)
     command.upgrade(alembic_cfg, "head")
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _clean_database_baseline(apply_migrations: None) -> None:
+    """Truncate every data table once at session start.
+
+    The ``_test`` DB is shared + persistent across pytest invocations, so
+    rows a prior run left behind — users/tenants that no per-test fixture
+    clears, a leftover aggregation cursor in ``pull_state``, accumulated
+    ``usage_records`` — would otherwise pile up and make order-sensitive
+    tests flaky (the "44 accumulated users" / "326 of 1000" failures).
+    Per-test fixtures still own intra-run isolation; this just guarantees
+    a clean BASELINE so one run never inherits the last one's residue.
+
+    ``_test``-only: the DATABASE_URL substitution + fail-fast guard above
+    ensure we can never point at prod.
+    """
+    from sqlalchemy import text as _text
+
+    from vargate_telemetry.db import engine
+
+    with engine.begin() as conn:
+        tables = list(
+            conn.execute(
+                _text(
+                    "SELECT tablename FROM pg_tables "
+                    "WHERE schemaname = 'public' "
+                    "AND tablename <> 'alembic_version'"
+                )
+            ).scalars()
+        )
+        if tables:
+            conn.execute(
+                _text(
+                    "TRUNCATE TABLE "
+                    + ", ".join(f'"{t}"' for t in tables)
+                    + " RESTART IDENTITY CASCADE"
+                )
+            )

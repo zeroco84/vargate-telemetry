@@ -55,6 +55,10 @@ class StubDispatcher:
 _T2_TABLES = (
     "telemetry_records",
     "usage_records",
+    # pull_state holds the per-tenant aggregation cursor; without
+    # resetting it the T2 pipeline resumes mid-stream and only re-counts
+    # records after the leftover cursor (the "326 of 1000" flake).
+    "pull_state",
     "tenant_billing",
     "billing_retry",
     "encrypted_secrets",
