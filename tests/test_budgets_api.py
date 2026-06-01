@@ -269,6 +269,37 @@ def test_member_cannot_create_budget(
     assert r.json()["detail"]["code"] == "admin_required"
 
 
+def test_list_rows_carry_current_spend_and_ratio(
+    clean_budgets: None, client: TestClient
+) -> None:
+    """TM4 polish: the roster rows now include current-period spend +
+    ratio (detail-shaped) so the UI can render a progress bar."""
+    tenant = "tnt_us_budget_list_spend"
+    _provision_tenant(tenant)
+    client.post(
+        "/budgets",
+        json={
+            "name": "list spend cap",
+            "scope_kind": "tenant",
+            "scope_value": None,
+            "period": "monthly",
+            "threshold_usd": "100.00",
+            "alert_recipients": [],
+        },
+        headers=_bearer(tenant),
+    )
+    rows = client.get("/budgets", headers=_bearer(tenant)).json()["rows"]
+    assert len(rows) == 1
+    row = rows[0]
+    # The progress-bar fields are present; with no usage seeded the
+    # spend + ratio are zero (the computation itself is covered by the
+    # detail tests).
+    assert Decimal(row["current_spend_usd"]) == Decimal("0")
+    assert Decimal(row["current_ratio"]) == Decimal("0")
+    assert "current_period_start" in row
+    assert row["current_threshold_crossed"] is None
+
+
 def test_create_workspace_scoped_budget(
     clean_budgets: None, client: TestClient
 ) -> None:

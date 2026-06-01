@@ -168,7 +168,9 @@ class BudgetDetail(BudgetOut):
 
 
 class BudgetListResponse(BaseModel):
-    rows: list[BudgetOut]
+    # Detail-shaped rows: each carries current-period spend + ratio so
+    # the roster renders a live progress bar, not just static config.
+    rows: list[BudgetDetail]
 
 
 class BudgetAlertEventOut(BaseModel):
@@ -242,6 +244,35 @@ def _most_recent_threshold_crossed(
     return max(crossed) if crossed else None
 
 
+def _budget_detail_from_row(s: Any, row: Any) -> BudgetDetail:
+    """Config + current-period spend / ratio / crossed-threshold for a
+    budgets row. Shared by the list + detail endpoints so the roster
+    shows live progress, not just static config. Must run inside an open
+    ``session_scope`` (the spend query uses ``s``)."""
+    window = current_period_window(row.period)
+    spend = compute_spend_in_window(
+        s,
+        start=window.start,
+        end=window.end,
+        scope_kind=row.scope_kind,
+        scope_value=row.scope_value,
+    )
+    threshold: Decimal = row.threshold_usd
+    if threshold > 0:
+        ratio = (spend / threshold).quantize(Decimal("0.0001"))
+    else:  # pragma: no cover — guarded by ck_budgets_threshold_positive
+        ratio = Decimal("0.0000")
+    base = _row_to_budget_out(row)
+    return BudgetDetail(
+        **base.model_dump(),
+        current_period_start=window.start.date(),
+        current_period_end=window.end.date(),
+        current_spend_usd=spend,
+        current_ratio=ratio,
+        current_threshold_crossed=_most_recent_threshold_crossed(ratio),
+    )
+
+
 # ───────────────────────────────────────────────────────────────────────────
 # Routes
 # ───────────────────────────────────────────────────────────────────────────
@@ -272,7 +303,7 @@ def list_budgets(
                 """
             )
         )
-        rows = [_row_to_budget_out(r) for r in result]
+        rows = [_budget_detail_from_row(s, r) for r in result]
 
     return BudgetListResponse(rows=rows)
 
@@ -370,30 +401,7 @@ def get_budget_detail(
                 },
             )
 
-        window = current_period_window(result.period)
-        spend = compute_spend_in_window(
-            s,
-            start=window.start,
-            end=window.end,
-            scope_kind=result.scope_kind,
-            scope_value=result.scope_value,
-        )
-
-    threshold: Decimal = result.threshold_usd
-    if threshold > 0:
-        ratio = (spend / threshold).quantize(Decimal("0.0001"))
-    else:  # pragma: no cover — guarded by ck_budgets_threshold_positive
-        ratio = Decimal("0.0000")
-
-    base = _row_to_budget_out(result)
-    return BudgetDetail(
-        **base.model_dump(),
-        current_period_start=window.start.date(),
-        current_period_end=window.end.date(),
-        current_spend_usd=spend,
-        current_ratio=ratio,
-        current_threshold_crossed=_most_recent_threshold_crossed(ratio),
-    )
+        return _budget_detail_from_row(s, result)
 
 
 @router.patch(

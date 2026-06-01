@@ -868,8 +868,12 @@ components:
       properties:
         rows:
           type: array
+          description: |
+            Detail-shaped rows — each carries current-period spend +
+            ratio + crossed threshold so the roster renders a live
+            progress bar, not just static config.
           items:
-            $ref: '#/components/schemas/Budget'
+            $ref: '#/components/schemas/BudgetDetail'
 
     BudgetAlertEvent:
       type: object
