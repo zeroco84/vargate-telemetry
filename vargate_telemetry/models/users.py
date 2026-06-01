@@ -80,6 +80,16 @@ class User(Base):
     sso_sign_in_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True),
     )
+    # TM4: lightweight tenant role gate. 'admin' may write budgets, map
+    # identities to users, and change other users' roles; 'member' is
+    # read + self-service only. Default 'member'; the tenant's first
+    # user (provisioner) is promoted to 'admin' at select-region, and
+    # migration 0022 backfilled the earliest user per existing tenant.
+    role: Mapped[str] = mapped_column(
+        String(16),
+        nullable=False,
+        server_default="member",
+    )
 
     __table_args__ = (
         UniqueConstraint(

@@ -34,7 +34,7 @@ from vargate_telemetry.auth.sso import (
     SsoCallbackError,
     handle_sso_callback,
 )
-from vargate_telemetry.db import scheduler_session_scope
+from vargate_telemetry.db import scheduler_session_scope, session_scope
 from vargate_telemetry.auth.jwt import (
     SESSION_COOKIE_NAME,
     SESSION_TOKEN_TTL_SECONDS,
@@ -73,6 +73,10 @@ class MeResponse(BaseModel):
     name: Optional[str] = None
     sso_provider: str
     tenants: list[TenantSummary] = Field(default_factory=list)
+    # TM4: the caller's role in their bound tenant ('admin' | 'member'),
+    # or None when not yet bound. The dashboard uses this to show/hide
+    # admin-only controls (it's advisory UX only — the backend enforces).
+    role: Optional[str] = None
 
 
 def _redirect_uri(provider: str) -> str:
@@ -207,6 +211,7 @@ def sso_microsoft_callback(
 )
 def get_me(user: AuthenticatedUser = Depends(current_user)) -> MeResponse:
     tenants: list[TenantSummary] = []
+    role: Optional[str] = None
     if user.tenant_id:
         # T5.5.8: look the real region up from the tenants table.
         # Pre-T5.5.8 this was hardcoded "us" — a T4.2 placeholder
@@ -225,6 +230,19 @@ def get_me(user: AuthenticatedUser = Depends(current_user)) -> MeResponse:
             ).first()
             if row is not None and row.region in ("us", "eu"):
                 region = row.region
+        # TM4 role gate: looked up under vargate_app (session_scope) —
+        # the scheduler role has no SELECT on `users`. users has no RLS,
+        # so scope by tenant_id explicitly.
+        with session_scope(user.tenant_id) as s:
+            role_row = s.execute(
+                sql_text(
+                    "SELECT role FROM users "
+                    "WHERE id::text = :uid AND tenant_id = :t"
+                ),
+                {"uid": user.user_id, "t": user.tenant_id},
+            ).first()
+            if role_row is not None:
+                role = role_row.role
         tenants.append(
             TenantSummary(tenant_id=user.tenant_id, region=region)
         )
@@ -233,6 +251,7 @@ def get_me(user: AuthenticatedUser = Depends(current_user)) -> MeResponse:
         email=user.email,
         sso_provider=user.sso_provider,
         tenants=tenants,
+        role=role,
     )
 
 

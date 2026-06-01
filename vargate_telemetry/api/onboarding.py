@@ -633,9 +633,15 @@ def _select_region_impl(
             {"tenant_id": tenant_id, "region": region, "now": now},
         )
 
-        # ───── 5. UPDATE users.tenant_id (bootstrap role) ────────────────
+        # ───── 5. UPDATE users.tenant_id + role (bootstrap role) ─────────
+        # The user provisioning the tenant owns it → admin (TM4 role
+        # gate). Additional members default to 'member' and can be
+        # promoted later by an admin.
         s.execute(
-            sql_text("UPDATE users SET tenant_id = :t WHERE id = :uid"),
+            sql_text(
+                "UPDATE users SET tenant_id = :t, role = 'admin' "
+                "WHERE id = :uid"
+            ),
             {"t": tenant_id, "uid": str(user_uuid)},
         )
 

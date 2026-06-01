@@ -97,12 +97,16 @@ def _provision_tenant(tenant_id: str, region: str = "us") -> None:
         )
 
 
-def _provision_user(tenant_id: str) -> str:
+def _provision_user(tenant_id: str, role: str = "admin") -> str:
     """Create a real users row + return its UUID for use in the JWT.
 
     Budgets have a FK on ``created_by_user_id`` — without a matching
     users row, INSERT fails. Production flow always has the row
     (onboarding creates it); tests need to mirror that.
+
+    TM4: budget create/update/delete are admin-gated, so the default
+    auto-provisioned caller is an **admin** (every write test here
+    assumes a writer). Pass ``role="member"`` to exercise the 403 gate.
     """
     user_uuid = str(uuid.uuid4())
     from vargate_telemetry.db import engine
@@ -112,8 +116,8 @@ def _provision_user(tenant_id: str) -> str:
             sql_text(
                 """
                 INSERT INTO users
-                    (id, email, sso_provider, sso_subject_id, tenant_id)
-                VALUES (:id, :email, 'google', :sub, :t)
+                    (id, email, sso_provider, sso_subject_id, tenant_id, role)
+                VALUES (:id, :email, 'google', :sub, :t, :role)
                 """
             ),
             {
@@ -121,6 +125,7 @@ def _provision_user(tenant_id: str) -> str:
                 "email": f"probe-{user_uuid[:8]}@example.com",
                 "sub": f"sub-{user_uuid}",
                 "t": tenant_id,
+                "role": role,
             },
         )
     return user_uuid
@@ -242,6 +247,26 @@ def test_create_tenant_scoped_budget_happy_path(
     assert Decimal(out["threshold_usd"]) == Decimal("500.00")
     assert out["alert_recipients"] == ["rick@vargate.ai", "ops@vargate.ai"]
     assert out["created_at"] is not None
+
+
+def test_member_cannot_create_budget(
+    clean_budgets: None, client: TestClient
+) -> None:
+    """TM4: budget writes are admin-gated. A member caller gets 403."""
+    tenant = "tnt_us_budget_member_403"
+    _provision_tenant(tenant)
+    member = _provision_user(tenant, role="member")
+    body = {
+        "name": "should be rejected",
+        "scope_kind": "tenant",
+        "scope_value": None,
+        "period": "monthly",
+        "threshold_usd": "10.00",
+        "alert_recipients": [],
+    }
+    r = client.post("/budgets", json=body, headers=_bearer(tenant, member))
+    assert r.status_code == 403, r.text
+    assert r.json()["detail"]["code"] == "admin_required"
 
 
 def test_create_workspace_scoped_budget(
@@ -786,8 +811,8 @@ def test_acknowledge_alert_happy_path(
             sql_text(
                 """
                 INSERT INTO users
-                    (id, email, sso_provider, sso_subject_id, tenant_id)
-                VALUES (:id, :email, 'google', :sub, :t)
+                    (id, email, sso_provider, sso_subject_id, tenant_id, role)
+                VALUES (:id, :email, 'google', :sub, :t, 'admin')
                 """
             ),
             {

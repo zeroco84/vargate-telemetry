@@ -47,6 +47,12 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import text as sql_text
 
 from vargate_telemetry.auth.middleware import AuthenticatedUser, current_user
+from vargate_telemetry.auth.roles import (
+    ROLE_ADMIN,
+    VALID_ROLES,
+    count_admins,
+    require_admin,
+)
 from vargate_telemetry.db import session_scope
 from vargate_telemetry.pricing import compute_cost_usd
 from vargate_telemetry.users import (
@@ -76,6 +82,9 @@ _RECENT_LIMIT = 25
 class UserSurfaceStat(BaseModel):
     user_id: str
     email: str
+    # TM4: 'admin' | 'member' — drives the role chip + promote/demote
+    # control in the roster.
+    role: str
     surfaces: list[str]
     events_7d: int
     # Decimal string; None when the user has no priceable (MCP)
@@ -151,6 +160,17 @@ class UserDetailResponse(BaseModel):
 class AliasMapRequest(BaseModel):
     source_api: str = Field(..., min_length=1, max_length=32)
     source_identifier: str = Field(..., min_length=1, max_length=320)
+
+
+class RoleUpdateRequest(BaseModel):
+    # Validated against VALID_ROLES in the handler so the error envelope
+    # matches our {code, message} shape rather than FastAPI's default.
+    role: str = Field(..., min_length=1, max_length=16)
+
+
+class RoleUpdateResponse(BaseModel):
+    user_id: str
+    role: str
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -238,6 +258,7 @@ def list_users(
                 SELECT
                     u.id::text AS user_id,
                     u.email,
+                    u.role AS role,
                     array_agg(DISTINCT ae.surface) AS surfaces,
                     count(*) FILTER (
                         WHERE ae.occurred_at >= :since_7d
@@ -249,7 +270,7 @@ def list_users(
                    ON ae.source_api = ua.source_api
                   AND ae.identifier = ua.source_identifier
                 WHERE ua.user_id IS NOT NULL
-                GROUP BY u.id, u.email
+                GROUP BY u.id, u.email, u.role
                 ORDER BY last_active DESC NULLS LAST
                 """
             ),
@@ -333,6 +354,7 @@ def list_users(
         UserSurfaceStat(
             user_id=r.user_id,
             email=r.email,
+            role=r.role,
             surfaces=sorted(r.surfaces or []),
             events_7d=int(r.events_7d or 0),
             spend_7d_usd=(
@@ -637,7 +659,7 @@ def get_user_detail(
 def map_user_alias(
     body: AliasMapRequest,
     user_id: UUID = Path(...),
-    user: AuthenticatedUser = Depends(current_user),
+    user: AuthenticatedUser = Depends(require_admin),
 ) -> UserAliasOut:
     tenant_id = _require_tenant(user)
 
@@ -692,6 +714,79 @@ def map_user_alias(
         source_identifier=row.source_identifier,
         auto_matched=row.auto_matched,
     )
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# POST /api/users/{id}/role — admin-only role change (TM4)
+# ───────────────────────────────────────────────────────────────────────────
+
+
+@router.post(
+    "/users/{user_id}/role",
+    response_model=RoleUpdateResponse,
+    operation_id="setUserRole",
+    tags=["users"],
+    summary="Set a tenant member's role ('admin' | 'member') — admin only",
+)
+def set_user_role(
+    body: RoleUpdateRequest,
+    user_id: UUID = Path(...),
+    admin: AuthenticatedUser = Depends(require_admin),
+) -> RoleUpdateResponse:
+    new_role = body.role.strip().lower()
+    if new_role not in VALID_ROLES:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "code": "invalid_role",
+                "message": "role must be 'admin' or 'member'.",
+            },
+        )
+
+    tenant_id = admin.tenant_id  # require_admin guarantees a bound tenant
+    target_id = str(user_id)
+
+    with session_scope(tenant_id) as s:
+        target = s.execute(
+            sql_text(
+                "SELECT role FROM users WHERE id = :id AND tenant_id = :t"
+            ),
+            {"id": target_id, "t": tenant_id},
+        ).first()
+        if target is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={
+                    "code": "user_not_found",
+                    "message": f"No user {user_id} in this tenant.",
+                },
+            )
+
+        # Last-admin guard: refuse to remove the tenant's final admin —
+        # that would lock everyone out of budget + identity writes.
+        # Self-demotion is allowed as long as another admin remains.
+        if target.role == ROLE_ADMIN and new_role != ROLE_ADMIN:
+            if count_admins(s, tenant_id) <= 1:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail={
+                        "code": "last_admin",
+                        "message": (
+                            "Can't remove the only admin — promote "
+                            "another user to admin first."
+                        ),
+                    },
+                )
+
+        s.execute(
+            sql_text(
+                "UPDATE users SET role = :r "
+                "WHERE id = :id AND tenant_id = :t"
+            ),
+            {"r": new_role, "id": target_id, "t": tenant_id},
+        )
+
+    return RoleUpdateResponse(user_id=target_id, role=new_role)
 
 
 __all__ = ["router"]

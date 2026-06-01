@@ -75,7 +75,9 @@ def _provision_tenant(tenant_id: str) -> None:
         )
 
 
-def _provision_user(tenant_id: str, email: str) -> str:
+def _provision_user(
+    tenant_id: str, email: str, role: str = "member"
+) -> str:
     uid = str(uuid.uuid4())
     from vargate_telemetry.db import engine
 
@@ -84,17 +86,35 @@ def _provision_user(tenant_id: str, email: str) -> str:
             sql_text(
                 """
                 INSERT INTO users
-                    (id, email, sso_provider, sso_subject_id, tenant_id)
-                VALUES (:id, :email, 'google', :sub, :t)
+                    (id, email, sso_provider, sso_subject_id, tenant_id, role)
+                VALUES (:id, :email, 'google', :sub, :t, :role)
                 """
             ),
-            {"id": uid, "email": email, "sub": f"sub-{uid}", "t": tenant_id},
+            {
+                "id": uid,
+                "email": email,
+                "sub": f"sub-{uid}",
+                "t": tenant_id,
+                "role": role,
+            },
         )
     return uid
 
 
 def _bearer(tenant_id: str | None, user_id: str | None = None) -> dict:
     from vargate_telemetry.auth.jwt import issue_session_jwt
+
+    # TM4: alias mapping is admin-gated and require_admin looks the
+    # caller's role up in the DB. When a test doesn't pin an identity,
+    # auto-provision a real admin caller so the default authenticated
+    # client can perform admin actions (mirrors test_budgets_api). Tests
+    # that need a member caller pass an explicit member user_id.
+    if user_id is None and tenant_id is not None:
+        user_id = _provision_user(
+            tenant_id,
+            f"caller-{uuid.uuid4().hex[:8]}@example.com",
+            role="admin",
+        )
 
     token = issue_session_jwt(
         user_id=user_id or str(uuid.uuid4()),
@@ -565,3 +585,166 @@ def test_manual_alias_map_survives_reconcile(
     assert len(body["users"]) == 1
     assert body["users"][0]["email"] == "persist@example.com"
     assert body["unmapped"] == []
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# TM4 — lightweight admin/member role gate + role management
+#
+# clean_state does NOT truncate users/tenants, so each test uses a
+# globally-unique tenant_id; count_admins() then reflects only what the
+# test provisions (the last-admin guard would be flaky otherwise).
+# ───────────────────────────────────────────────────────────────────────────
+
+
+def _uniq_tenant() -> str:
+    return f"tnt_us_role_{uuid.uuid4().hex[:10]}"
+
+
+def _role_in_db(tenant_id: str, user_id: str) -> str | None:
+    from vargate_telemetry.db import engine
+
+    with engine.begin() as conn:
+        return conn.execute(
+            sql_text(
+                "SELECT role FROM users WHERE id = :id AND tenant_id = :t"
+            ),
+            {"id": user_id, "t": tenant_id},
+        ).scalar()
+
+
+def test_me_reports_role(clean_state: None, client: TestClient) -> None:
+    tenant = _uniq_tenant()
+    _provision_tenant(tenant)
+    admin = _provision_user(tenant, "admin@example.com", role="admin")
+    member = _provision_user(tenant, "member@example.com", role="member")
+    assert client.get("/me", headers=_bearer(tenant, admin)).json()["role"] == "admin"
+    assert (
+        client.get("/me", headers=_bearer(tenant, member)).json()["role"]
+        == "member"
+    )
+
+
+def test_member_cannot_map_alias(clean_state: None, client: TestClient) -> None:
+    tenant = _uniq_tenant()
+    _provision_tenant(tenant)
+    member = _provision_user(tenant, "member@example.com", role="member")
+    target = _provision_user(tenant, "target@example.com", role="member")
+    r = client.post(
+        f"/users/{target}/aliases",
+        json={"source_api": "mcp", "source_identifier": "x@example.com"},
+        headers=_bearer(tenant, member),
+    )
+    assert r.status_code == 403, r.text
+    assert r.json()["detail"]["code"] == "admin_required"
+
+
+def test_member_cannot_set_role(clean_state: None, client: TestClient) -> None:
+    tenant = _uniq_tenant()
+    _provision_tenant(tenant)
+    member = _provision_user(tenant, "member@example.com", role="member")
+    other = _provision_user(tenant, "other@example.com", role="member")
+    r = client.post(
+        f"/users/{other}/role",
+        json={"role": "admin"},
+        headers=_bearer(tenant, member),
+    )
+    assert r.status_code == 403, r.text
+    assert r.json()["detail"]["code"] == "admin_required"
+    assert _role_in_db(tenant, other) == "member"  # unchanged
+
+
+def test_admin_promotes_then_demotes_member(
+    clean_state: None, client: TestClient
+) -> None:
+    tenant = _uniq_tenant()
+    _provision_tenant(tenant)
+    admin = _provision_user(tenant, "admin@example.com", role="admin")
+    member = _provision_user(tenant, "member@example.com", role="member")
+
+    # Promote.
+    r = client.post(
+        f"/users/{member}/role",
+        json={"role": "admin"},
+        headers=_bearer(tenant, admin),
+    )
+    assert r.status_code == 200, r.text
+    assert r.json() == {"user_id": member, "role": "admin"}
+    assert _role_in_db(tenant, member) == "admin"
+
+    # The newly-promoted user can now perform an admin write.
+    r2 = client.post(
+        f"/users/{member}/aliases",
+        json={"source_api": "mcp", "source_identifier": "y@example.com"},
+        headers=_bearer(tenant, member),
+    )
+    assert r2.status_code == 201, r2.text
+
+    # Demote back — allowed because `admin` is still an admin.
+    r3 = client.post(
+        f"/users/{member}/role",
+        json={"role": "member"},
+        headers=_bearer(tenant, admin),
+    )
+    assert r3.status_code == 200, r3.text
+    assert _role_in_db(tenant, member) == "member"
+
+
+def test_cannot_demote_last_admin(
+    clean_state: None, client: TestClient
+) -> None:
+    tenant = _uniq_tenant()
+    _provision_tenant(tenant)
+    admin = _provision_user(tenant, "solo-admin@example.com", role="admin")
+    # The sole admin tries to demote themselves → blocked.
+    r = client.post(
+        f"/users/{admin}/role",
+        json={"role": "member"},
+        headers=_bearer(tenant, admin),
+    )
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["code"] == "last_admin"
+    assert _role_in_db(tenant, admin) == "admin"  # unchanged
+
+
+def test_set_role_invalid_value(
+    clean_state: None, client: TestClient
+) -> None:
+    tenant = _uniq_tenant()
+    _provision_tenant(tenant)
+    admin = _provision_user(tenant, "admin@example.com", role="admin")
+    target = _provision_user(tenant, "t@example.com", role="member")
+    r = client.post(
+        f"/users/{target}/role",
+        json={"role": "superuser"},
+        headers=_bearer(tenant, admin),
+    )
+    assert r.status_code == 422, r.text
+    assert r.json()["detail"]["code"] == "invalid_role"
+
+
+def test_set_role_unknown_user_404(
+    clean_state: None, client: TestClient
+) -> None:
+    tenant = _uniq_tenant()
+    _provision_tenant(tenant)
+    admin = _provision_user(tenant, "admin@example.com", role="admin")
+    r = client.post(
+        f"/users/{uuid.uuid4()}/role",
+        json={"role": "admin"},
+        headers=_bearer(tenant, admin),
+    )
+    assert r.status_code == 404, r.text
+
+
+def test_roster_includes_role(
+    clean_state: None, client: TestClient
+) -> None:
+    tenant = _uniq_tenant()
+    _provision_tenant(tenant)
+    _provision_user(tenant, "rick@example.com", role="admin")
+    # Email-matched activity auto-links on the reconcile that /users runs.
+    _seed_code_analytics(tenant, email="rick@example.com")
+    body = client.get("/users", headers=_bearer(tenant)).json()
+    rick = [u for u in body["users"] if u["email"] == "rick@example.com"]
+    assert len(rick) == 1, body["users"]
+    assert rick[0]["role"] == "admin"

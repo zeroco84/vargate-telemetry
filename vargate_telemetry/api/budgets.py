@@ -61,6 +61,7 @@ from vargate_telemetry.auth.middleware import (
     AuthenticatedUser,
     current_user,
 )
+from vargate_telemetry.auth.roles import require_admin
 from vargate_telemetry.budgets import (
     ALERT_THRESHOLDS,
     compute_spend_in_window,
@@ -286,7 +287,7 @@ def list_budgets(
 )
 def create_budget(
     body: BudgetCreate,
-    user: AuthenticatedUser = Depends(current_user),
+    user: AuthenticatedUser = Depends(require_admin),
 ) -> BudgetOut:
     tenant_id = _require_tenant(user)
 
@@ -405,7 +406,7 @@ def get_budget_detail(
 def update_budget(
     body: BudgetUpdate,
     budget_id: UUID = Path(...),
-    user: AuthenticatedUser = Depends(current_user),
+    user: AuthenticatedUser = Depends(require_admin),
 ) -> BudgetOut:
     tenant_id = _require_tenant(user)
 
@@ -469,7 +470,7 @@ def update_budget(
 )
 def delete_budget(
     budget_id: UUID = Path(...),
-    user: AuthenticatedUser = Depends(current_user),
+    user: AuthenticatedUser = Depends(require_admin),
 ) -> None:
     tenant_id = _require_tenant(user)
     with session_scope(tenant_id) as s:

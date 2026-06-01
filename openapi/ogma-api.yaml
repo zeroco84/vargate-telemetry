@@ -357,6 +357,16 @@ components:
             (between SSO callback and `/onboarding/select-region`).
           items:
             $ref: '#/components/schemas/Tenant'
+        role:
+          type: string
+          enum: [admin, member]
+          nullable: true
+          description: |
+            TM4: the caller's role in their bound tenant ('admin' or
+            'member'), or null when not yet bound. Admins may write
+            budgets, map identities to users, and change roles; members
+            are read + self-service. Advisory for UI gating only — the
+            backend enforces the gate independently.
 
     # ─────────────────────────────────────────────────────────────────────
     # Sessions (T5.5) — first dashboard view of ingested content.
@@ -921,13 +931,19 @@ components:
 
     UserSurfaceStat:
       type: object
-      required: [user_id, email, surfaces, events_7d]
+      required: [user_id, email, role, surfaces, events_7d]
       properties:
         user_id:
           type: string
           format: uuid
         email:
           type: string
+        role:
+          type: string
+          enum: [admin, member]
+          description: |
+            TM4: this user's role in the tenant. Drives the role chip
+            and the admin-only promote/demote control in the roster.
         surfaces:
           type: array
           items:
@@ -1119,6 +1135,26 @@ components:
           type: string
           minLength: 1
           maxLength: 320
+
+    RoleUpdateRequest:
+      type: object
+      required: [role]
+      properties:
+        role:
+          type: string
+          enum: [admin, member]
+          description: TM4 — the role to assign to the target user.
+
+    RoleUpdateResponse:
+      type: object
+      required: [user_id, role]
+      properties:
+        user_id:
+          type: string
+          format: uuid
+        role:
+          type: string
+          enum: [admin, member]
 
   # ─────────────────────────────────────────────────────────────────────────
   # Reusable response bodies — every 4xx / 5xx is an ErrorResponse.
@@ -1691,6 +1727,8 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
 
   /budgets/{budget_id}:
     parameters:
@@ -1738,6 +1776,8 @@ paths:
           $ref: '#/components/responses/NotFound'
         '401':
           $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
     delete:
       tags: [budgets]
       summary: Soft-delete a budget (sets deleted_at; row stays in the table)
@@ -1749,6 +1789,8 @@ paths:
           $ref: '#/components/responses/NotFound'
         '401':
           $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
 
   /budget-alerts:
     get:
@@ -1870,7 +1912,55 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/UserAlias'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
         '401':
           $ref: '#/components/responses/Unauthenticated'
+
+  /users/{user_id}/role:
+    parameters:
+      - in: path
+        name: user_id
+        required: true
+        schema:
+          type: string
+          format: uuid
+    post:
+      tags: [users]
+      summary: Set a tenant member's role ('admin' | 'member') — admin only
+      operationId: setUserRole
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RoleUpdateRequest'
+      responses:
+        '200':
+          description: The target user's new role.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RoleUpdateResponse'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: |
+            Refused — would remove the tenant's only admin (code
+            `last_admin`). Promote another user to admin first.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '422':
+          description: Invalid role value (code `invalid_role`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
