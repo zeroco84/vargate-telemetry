@@ -308,7 +308,7 @@ components:
     ChatSummary:
       type: object
       required:
-        [chat_id, message_count, first_message_at, last_message_at, deleted]
+        [chat_id, message_count, first_message_at, last_message_at, deleted, purged]
       description: |
         One captured chat (TM5 T5.3), aggregated from its per-message
         `compliance_content` records. Metadata only — message text is
@@ -338,6 +338,13 @@ components:
           description: |
             True if the chat was soft-deleted in claude.ai (still
             captured, with the flag). Hard-deleted chats never appear.
+        purged:
+          type: boolean
+          description: |
+            True if the chat's content was purged via Ogma (TM6 T6.1 —
+            per-chat delete / per-user DSR that covers all its messages /
+            tenant crypto-shred). Distinct from `deleted` (claude.ai's own
+            soft-delete). The chain records remain; the blobs are gone.
 
     ChatListResponse:
       type: object
@@ -355,7 +362,7 @@ components:
 
     ContentMessage:
       type: object
-      required: [record_id, message_id, role, occurred_at]
+      required: [record_id, message_id, role, occurred_at, purged]
       properties:
         record_id:
           type: string
@@ -377,10 +384,15 @@ components:
         content_size_bytes:
           type: integer
           nullable: true
+        purged:
+          type: boolean
+          description: |
+            True if this message's content was purged via Ogma; `content`
+            is null because the blob is gone (the chain record remains).
 
     ChatDetailResponse:
       type: object
-      required: [chat_id, deleted, messages]
+      required: [chat_id, deleted, purged, messages]
       properties:
         chat_id:
           type: string
@@ -395,10 +407,73 @@ components:
           nullable: true
         deleted:
           type: boolean
+        purged:
+          type: boolean
+          description: |
+            Whole-chat purge tombstone — true when every message was
+            deleted or the tenant was crypto-shredded.
+        purge_reason:
+          type: string
+          nullable: true
+          description: Reason from the most recent covering deletion event.
+        purged_at:
+          type: string
+          format: date-time
+          nullable: true
         messages:
           type: array
           items:
             $ref: '#/components/schemas/ContentMessage'
+
+    DeletionRequest:
+      type: object
+      required: [reason]
+      description: |
+        TM6 T6.1 — a mandatory reason for a content deletion (recorded in
+        the `content_deletion` chain event for the audit trail).
+      properties:
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 500
+
+    DeletionResult:
+      type: object
+      required: [scope, deleted, already_deleted]
+      properties:
+        scope:
+          type: string
+          description: "`chat` or `user`."
+        deleted:
+          type: integer
+          description: Records whose deletion event was newly appended.
+        already_deleted:
+          type: integer
+          description: Records already deleted on a prior call (idempotent).
+
+    TenantShredRequest:
+      type: object
+      required: [reason, confirm_tenant_id]
+      description: |
+        TM6 T6.1 — terminal per-tenant crypto-shred (offboarding).
+        `confirm_tenant_id` must equal the caller's own tenant_id.
+      properties:
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 500
+        confirm_tenant_id:
+          type: string
+          minLength: 1
+
+    TenantShredResult:
+      type: object
+      required: [dek_destroyed, event_appended]
+      properties:
+        dek_destroyed:
+          type: boolean
+        event_appended:
+          type: boolean
 
     Region:
       type: string
@@ -1910,6 +1985,116 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    delete:
+      tags: [content]
+      summary: Delete one captured chat's content (admin)
+      description: |
+        TM6 T6.1 — admin only. Deletes the chat's message blobs and
+        appends one `content_deletion` chain event per message. The chain
+        records themselves are never mutated or removed (the hash chain
+        stays verifiable); only the content is gone. Idempotent —
+        re-deleting reports `already_deleted`.
+      operationId: deleteContentChat
+      parameters:
+        - name: chat_id
+          in: path
+          required: true
+          schema:
+            type: string
+            minLength: 1
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DeletionRequest'
+      responses:
+        '200':
+          description: Deletion result (counts).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeletionResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /content/users/{subject_user_id}:
+    delete:
+      tags: [content]
+      summary: Delete all of one user's captured content — DSR (admin)
+      description: |
+        TM6 T6.1 — admin only. Right-to-be-forgotten for one data
+        subject: deletes every content blob of theirs across all chats +
+        appends a `content_deletion` event per message. Chain-safe +
+        idempotent (same posture as the per-chat delete).
+      operationId: deleteUserContent
+      parameters:
+        - name: subject_user_id
+          in: path
+          required: true
+          schema:
+            type: string
+            minLength: 1
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DeletionRequest'
+      responses:
+        '200':
+          description: Deletion result (counts).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeletionResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /content/tenant/shred:
+    post:
+      tags: [content]
+      summary: Crypto-shred ALL tenant content — terminal offboarding (admin)
+      description: |
+        TM6 T6.1 — admin only, TERMINAL + irreversible. Destroys the
+        tenant DEK: every content blob AND sealed secret becomes
+        permanently undecryptable at once. Appends one tenant-scoped
+        `content_deletion` event. `confirm_tenant_id` must equal the
+        caller's own tenant_id (typed confirmation) or the call 400s.
+      operationId: cryptoShredTenant
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TenantShredRequest'
+      responses:
+        '200':
+          description: Shred result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TenantShredResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '500':
           $ref: '#/components/responses/InternalError'
 

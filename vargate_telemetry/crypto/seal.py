@@ -94,6 +94,36 @@ def get_tenant_dek(tenant_id: str) -> bytes:
         return unwrap_dek(bytes(td.wrapped_dek))
 
 
+def destroy_tenant_dek(tenant_id: str) -> bool:
+    """Crypto-shred the tenant: delete its wrapped-DEK row.
+
+    After this, EVERY blob encrypted under that DEK is forever
+    inaccessible — all tenant content in MinIO **and** the tenant's
+    sealed secrets in ``encrypted_secrets`` (admin / compliance keys).
+    The bytes may remain in MinIO, but without the DEK they cannot be
+    decrypted. This is the security boundary for per-tenant deletion /
+    account offboarding (the "destructive right to be forgotten").
+
+    The audit chain is UNAFFECTED: ``telemetry_records.content_hash`` is
+    SHA-256 of the *plaintext* (stored in clear), so every record stays
+    verifiable — you can still prove what content existed, you just can't
+    read it. Callers append a ``content_deletion`` chain event alongside
+    this so the shred itself is tamper-evidently recorded.
+
+    TERMINAL + irreversible. Returns True if a DEK row was deleted,
+    False if none existed (idempotent — re-shredding is a no-op).
+    """
+    if not tenant_id:
+        raise ValueError("tenant_id required")
+
+    with session_scope(tenant_id) as s:
+        td = s.get(TenantDek, tenant_id)
+        if td is None:
+            return False
+        s.delete(td)
+        return True
+
+
 def seal_secret(tenant_id: str, name: str, plaintext: bytes) -> None:
     """Encrypt plaintext under the tenant DEK and UPSERT into encrypted_secrets."""
     if not tenant_id:
