@@ -213,6 +213,49 @@ components:
             Has Claude Code Analytics access. T5.4 will land the real
             probe; today this is always `false`.
 
+    MeCapabilities:
+      type: object
+      required:
+        [admin_api, activity_feed, content_capture, code_analytics, mcp_connector]
+      description: |
+        The tenant's current capability snapshot (`GET /me/capabilities`).
+        Same 5-bool shape as `KeyCapabilities`, but reflects what data the
+        tenant HAS now (telemetry-row / sealed-key presence) rather than
+        what a freshly-probed admin key COULD unlock. `content_capture`
+        (TM5 T5.1) is true once a Compliance Access Key is sealed.
+      properties:
+        admin_api:
+          type: boolean
+        activity_feed:
+          type: boolean
+        content_capture:
+          type: boolean
+        code_analytics:
+          type: boolean
+        mcp_connector:
+          type: boolean
+
+    McpStatus:
+      type: object
+      required: [configured, events_count]
+      description: |
+        MCP-connector ingest state for the tenant
+        (`GET /onboarding/mcp-status`). Capability lights up by USAGE,
+        not registration — `configured` is true once an `mcp` telemetry
+        row exists in the last 90 days.
+      properties:
+        configured:
+          type: boolean
+          description: True iff ≥1 `source_api='mcp'` record in the last 90 days.
+        first_event_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: Earliest mcp record timestamp; null if none yet.
+        events_count:
+          type: integer
+          description: Total mcp records in the last 90 days.
+
     ValidateKeyResponse:
       type: object
       required: [org_name, capabilities]
@@ -1716,6 +1759,30 @@ paths:
         '500':
           $ref: '#/components/responses/InternalError'
 
+  /onboarding/mcp-status:
+    get:
+      tags: [onboarding]
+      summary: MCP-connector ingest state for the tenant
+      description: |
+        Poll-friendly snapshot the onboarding / settings cards use to
+        flip the MCP connector to "connected" once the first `mcp`
+        telemetry row lands. Capability is driven by USAGE, not
+        registration.
+      operationId: getMcpStatus
+      responses:
+        '200':
+          description: MCP ingest state.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/McpStatus'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
   /me:
     get:
       tags: [me]
@@ -1732,6 +1799,29 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Me'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /me/capabilities:
+    get:
+      tags: [me]
+      summary: The tenant's current capability snapshot (5 bools)
+      description: |
+        Drives the onboarding / settings capability cards + empty-state
+        copy. Reflects what data the tenant HAS now (telemetry rows per
+        source_api in the last 90 days; sealed Compliance Access Key for
+        `content_capture`), not what an admin key could probe. Pre-tenant
+        users get all-false.
+      operationId: getMeCapabilities
+      responses:
+        '200':
+          description: The 5-bool capability snapshot.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MeCapabilities'
         '401':
           $ref: '#/components/responses/Unauthenticated'
         '500':
