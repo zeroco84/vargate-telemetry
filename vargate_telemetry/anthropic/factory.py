@@ -30,6 +30,13 @@ from vargate_telemetry.crypto.seal import unseal_secret
 # Stable secret name for the tenant's admin API key.
 ANTHROPIC_ADMIN_KEY_SECRET = "anthropic_admin_key"
 
+# Stable secret name for the tenant's Compliance Access Key
+# (``sk-ant-api01-...``, a separate key type from the admin key, sealed
+# by the TM5 T5.1 onboarding flow). Distinct name so a tenant can hold
+# both keys simultaneously: the admin key drives usage/activity ingest,
+# the compliance key drives content capture (chats + message text).
+ANTHROPIC_COMPLIANCE_KEY_SECRET = "anthropic_compliance_access_key"
+
 
 def admin_client_for_tenant(
     tenant_id: str,

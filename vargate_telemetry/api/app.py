@@ -27,6 +27,7 @@ from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 from vargate_telemetry.api import auth as auth_routes
 from vargate_telemetry.api import budgets as budgets_routes
+from vargate_telemetry.api import compliance_key as compliance_key_routes
 from vargate_telemetry.api import mcp_bridge as mcp_bridge_routes
 from vargate_telemetry.api import onboarding as onboarding_routes
 from vargate_telemetry.api import sessions as sessions_routes
@@ -78,6 +79,9 @@ def _build_app() -> FastAPI:
 
     app.include_router(auth_routes.router)
     app.include_router(onboarding_routes.router)
+    # TM5 T5.1: POST /onboarding/compliance-key — validate + seal a
+    # Compliance Access Key, enabling content capture (admin-gated).
+    app.include_router(compliance_key_routes.router)
     app.include_router(sessions_routes.router)
     app.include_router(usage_routes.router)
     # TM3 Phase B2: /api/budgets + /api/budget-alerts CRUD.

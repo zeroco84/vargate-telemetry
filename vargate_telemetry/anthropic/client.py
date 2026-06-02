@@ -49,6 +49,8 @@ from vargate_telemetry.anthropic.types import (
     ChatWithMessages,
     CodeAnalyticsRecord,
     Member,
+    Organization,
+    OrgUser,
     UsageBucket,
     Workspace,
 )
@@ -487,6 +489,62 @@ class AnthropicAdminClient:
             raise ValueError("chat_id required")
         raw = self._get(f"/v1/compliance/apps/chats/{chat_id}/messages")
         return ChatWithMessages.model_validate(raw)
+
+    # ───────────────────────────────────────────────────────────────────
+    # Compliance API — organization directory (TM5 T5.1)
+    #
+    # The head of the content-capture enumeration chain: list orgs →
+    # list each org's users → list each user's chats. The chats endpoint
+    # requires ``user_ids[]`` (from the users endpoint), whose
+    # ``{org_uuid}`` path param comes from the orgs endpoint. So a key
+    # used for content capture needs BOTH ``read:compliance_org_data``
+    # (orgs) and ``read:compliance_user_data`` (users + chats); the T5.1
+    # onboarding probe walks orgs→users to confirm both before sealing.
+    # ───────────────────────────────────────────────────────────────────
+
+    def list_organizations(self) -> Iterator[Organization]:
+        """Yield every organization under the parent the key is bound to.
+
+        Endpoint: ``GET /v1/compliance/organizations``. The response is
+        a single ``data`` array (NOT cursor-paginated — up to 1,000 orgs
+        in one call; a larger tree returns 500). Requires
+        ``read:compliance_org_data``; an Admin API key (or a Compliance
+        Access Key without the scope) raises ``InsufficientScope`` (403).
+
+        ``Organization.uuid`` is the ``{org_uuid}`` path param for
+        ``list_organization_users``.
+        """
+        envelope = self._get("/v1/compliance/organizations")
+        for raw in envelope.get("data", []):
+            yield Organization.model_validate(raw)
+
+    def list_organization_users(
+        self,
+        org_uuid: str,
+        *,
+        limit: Optional[int] = None,
+    ) -> Iterator[OrgUser]:
+        """Yield the user records for one organization.
+
+        Endpoint: ``GET /v1/compliance/organizations/{org_uuid}/users``.
+        Paginated with a ``next_page`` token round-tripped as the
+        ``page`` query param — exactly the scheme ``paginate()``
+        implements, so it's reused unchanged (NOT the Activity Feed's
+        ``after_id`` cursor). Requires ``read:compliance_user_data``; a
+        key without it raises ``InsufficientScope`` (403).
+
+        Each ``OrgUser.id`` is the ``user_...`` identifier the content
+        pull (T5.2) feeds into ``list_chats(user_ids=[...])``.
+        """
+        if not org_uuid:
+            raise ValueError("org_uuid required")
+        params: dict[str, Any] = {}
+        if limit is not None:
+            params["limit"] = str(limit)
+        for raw in self.paginate(
+            f"/v1/compliance/organizations/{org_uuid}/users", params
+        ):
+            yield OrgUser.model_validate(raw)
 
     # ───────────────────────────────────────────────────────────────────
     # Claude Code Analytics (T5.4) — daily per-user usage metrics

@@ -227,6 +227,41 @@ components:
         capabilities:
           $ref: '#/components/schemas/KeyCapabilities'
 
+    ComplianceKeyRequest:
+      type: object
+      required: [compliance_key]
+      properties:
+        compliance_key:
+          type: string
+          description: |
+            Anthropic Compliance Access Key (begins `sk-ant-api01-`),
+            created in claude.ai by an Enterprise owner. Distinct from
+            the Admin API key (`sk-ant-admin01-`). Must carry BOTH
+            `read:compliance_org_data` and `read:compliance_user_data`
+            scopes — content capture enumerates organizations → users →
+            chats, which spans both scopes (TM5 T5.1).
+          minLength: 20
+          examples: ["sk-ant-api01-..."]
+
+    ComplianceKeyResponse:
+      type: object
+      required: [content_capture]
+      properties:
+        content_capture:
+          type: boolean
+          description: |
+            True once the key is validated + sealed. Mirrors the
+            `content_capture` bool in `GET /me/capabilities`, which
+            flips True for the tenant the moment the key is sealed.
+        org_name:
+          type: string
+          nullable: true
+          description: |
+            Name of the first organization the key sees, echoed back as
+            a confirmation. Null if the key authenticates but the org
+            tree is empty.
+          examples: ["Acme Enterprise"]
+
     Region:
       type: string
       enum: [us, eu]
@@ -1342,6 +1377,75 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
         '401':
           $ref: '#/components/responses/Unauthenticated'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /onboarding/compliance-key:
+    post:
+      tags: [onboarding]
+      summary: Validate + seal a Compliance Access Key (enables content capture)
+      description: |
+        Collects a tenant's **Compliance Access Key** (`sk-ant-api01-`),
+        a separate key type from the Admin API key sealed at first
+        onboarding. Validates it against the live Compliance API by
+        walking the head of the content-capture enumeration chain —
+        `GET /v1/compliance/organizations` then
+        `GET /v1/compliance/organizations/{org_uuid}/users` — to confirm
+        the key carries BOTH `read:compliance_org_data` and
+        `read:compliance_user_data` (content capture spans both scopes).
+        On success the key is sealed into `encrypted_secrets` (UPSERT —
+        re-submitting rotates it) and `content_capture` flips True in
+        `GET /me/capabilities`.
+
+        Admin-gated (`require_admin`). A bad / half-scoped key is
+        rejected with a `code`-tagged 400 and nothing is sealed, so
+        there is no partial state.
+
+        TM5 T5.1. Built blind against the documented contract; the live
+        probe is verified once a sandbox Compliance Access Key lands.
+      operationId: submitComplianceKey
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ComplianceKeyRequest'
+      responses:
+        '200':
+          description: Key validated + sealed; content capture enabled.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ComplianceKeyResponse'
+        '400':
+          description: |
+            The key is malformed, the wrong key type
+            (`code: wrong_key_type` — an Admin key was pasted),
+            rejected by Anthropic (`code: invalid_compliance_key`), or
+            missing a required compliance scope
+            (`code: insufficient_scope`). The UI branches on `code`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          description: |
+            `code: admin_required` — the caller is not an admin of their
+            tenant. Sealing tenant credentials is an admin action.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: |
+            `code: anthropic_rate_limited` — Anthropic rate-limited the
+            validation probe. Safe to retry after the indicated delay.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         '500':
           $ref: '#/components/responses/InternalError'
 

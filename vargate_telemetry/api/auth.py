@@ -282,11 +282,18 @@ def get_me(user: AuthenticatedUser = Depends(current_user)) -> MeResponse:
 def get_me_capabilities(
     user: AuthenticatedUser = Depends(current_user),
 ) -> dict:
-    """Return the 5-bool capability shape from telemetry_records state.
+    """Return the 5-bool capability snapshot for the tenant.
 
-    Each bool answers: "does the tenant have at least one row with
-    the matching ``source_api`` in the last 90 days?" Same uniform
-    semantics as the ``mcp_connector`` detector in onboarding.py.
+    Four bools (``admin_api``, ``activity_feed``, ``code_analytics``,
+    ``mcp_connector``) answer "does the tenant have at least one
+    ``telemetry_records`` row with the matching ``source_api`` in the
+    last 90 days?" — same uniform semantics as the ``mcp_connector``
+    detector in onboarding.py.
+
+    ``content_capture`` (TM5 T5.1) is the exception: it answers "is a
+    Compliance Access Key sealed for this tenant?" (a row in
+    ``encrypted_secrets``), because the capability is unlocked by
+    *holding the key*, not by content having been pulled yet.
 
     Pre-tenant users (no tenant_id) get all False.
     """
@@ -299,13 +306,19 @@ def get_me_capabilities(
             "mcp_connector": False,
         }
 
+    from vargate_telemetry.anthropic.factory import (
+        ANTHROPIC_COMPLIANCE_KEY_SECRET,
+    )
     from vargate_telemetry.db import session_scope
 
     with session_scope(user.tenant_id) as s:
-        # One round-trip — five EXISTS subqueries. Each one is
-        # cheap (single-row probe against
-        # ix_telemetry_records_tenant_occurred). content_capture
-        # stays a hard False per the T5.3 invariant.
+        # One round-trip — five EXISTS subqueries. The first four are
+        # cheap single-row probes against
+        # ix_telemetry_records_tenant_occurred. content_capture (TM5
+        # T5.1) is different in kind: it reflects whether a Compliance
+        # Access Key is *sealed* (the capability), not whether content
+        # has been *pulled* yet (the result, T5.2/T5.3) — so it probes
+        # encrypted_secrets, not telemetry_records.
         row = s.execute(
             sql_text(
                 """
@@ -333,18 +346,27 @@ def get_me_capabilities(
                     WHERE tenant_id = :t
                       AND source_api = 'mcp'
                       AND ingested_at > now() - INTERVAL '90 days'
-                  ) AS mcp_connector
+                  ) AS mcp_connector,
+                  EXISTS (
+                    SELECT 1 FROM encrypted_secrets
+                    WHERE tenant_id = :t
+                      AND secret_name = :compliance_secret
+                  ) AS content_capture
                 """
             ),
-            {"t": user.tenant_id},
+            {
+                "t": user.tenant_id,
+                "compliance_secret": ANTHROPIC_COMPLIANCE_KEY_SECRET,
+            },
         ).one()
 
     return {
         "admin_api": bool(row.admin_api),
         "activity_feed": bool(row.activity_feed),
-        # T5.3 invariant: content_capture is always False until the
-        # Compliance Access Key onboarding step lands.
-        "content_capture": False,
+        # TM5 T5.1: True once a Compliance Access Key is sealed for this
+        # tenant (via POST /onboarding/compliance-key) — the capability,
+        # independent of whether any content has been pulled yet.
+        "content_capture": bool(row.content_capture),
         "code_analytics": bool(row.code_analytics),
         "mcp_connector": bool(row.mcp_connector),
     }

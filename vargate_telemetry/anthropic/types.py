@@ -467,3 +467,67 @@ class CodeAnalyticsRecord(BaseModel):
     # `extra="allow"`. T5.4 ingest stores the full record JSON in
     # `telemetry_records.record_metadata`; T5.5 dashboards read the
     # nested structure from there.
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Compliance API — organization directory (TM5 T5.1)
+#
+# **Best-guess scaffolding** — refine against a real cassette at the
+# deferred live-verify step (no Compliance Access Key yet; built blind
+# against the documented contract at
+# https://platform.claude.com/docs/en/manage-claude/compliance-org-data
+# reconned 2026-06-02). `extra="allow"` absorbs unmodeled fields.
+#
+# These two endpoints are the head of the content-capture enumeration
+# chain: List organizations → List organization users → Retrieve chats
+# (the chats endpoint requires `user_ids[]`, which come from the users
+# endpoint, whose `{org_uuid}` path param comes from the orgs endpoint).
+# A Compliance Access Key used for content capture therefore needs BOTH
+# `read:compliance_org_data` (list orgs) AND `read:compliance_user_data`
+# (list users + chats). The T5.1 onboarding probe walks orgs→users to
+# confirm both scopes before sealing.
+# ───────────────────────────────────────────────────────────────────────────
+
+
+class Organization(BaseModel):
+    """One organization under the parent the Compliance Access Key is bound to.
+
+    Endpoint: ``GET /v1/compliance/organizations``. Returns a single
+    ``data`` array (NOT paginated; up to 1,000 orgs, else a 500). Sorted
+    by ``created_at`` ascending. Requires ``read:compliance_org_data``.
+
+    ``uuid`` is the canonical identifier — it's the ``{org_uuid}`` path
+    param on the per-org endpoints (users, roles) and joins to the
+    ``organization_uuid`` field on Activity Feed / chat / project records.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    uuid: str
+    name: Optional[str] = None
+    created_at: Optional[datetime] = None
+
+
+class OrgUser(BaseModel):
+    """One user record within a single organization.
+
+    Endpoint: ``GET /v1/compliance/organizations/{org_uuid}/users``.
+    Paginated with a ``next_page`` token round-tripped as the ``page``
+    query param (same scheme as ``client.paginate()``). Sorted by
+    organization join date ascending. Requires ``read:compliance_user_data``.
+
+    ``id`` is the ``user_...`` identifier accepted by the Activity Feed
+    ``actor_ids[]`` filter and the chats list's ``user_ids[]`` filter —
+    i.e. the enumeration key the content pull (T5.2) feeds into
+    ``list_chats(user_ids=[...])``. ``organization_role`` is the built-in
+    membership level (``admin``, ``owner``, ``developer``, ``user``, …) —
+    an open string so new roles absorb without a model bump.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    id: str
+    full_name: Optional[str] = None
+    email: Optional[str] = None
+    organization_role: Optional[str] = None
+    created_at: Optional[datetime] = None

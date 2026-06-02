@@ -11,6 +11,7 @@ from vargate_telemetry.anthropic.exceptions import (
 )
 from vargate_telemetry.anthropic.factory import (
     ANTHROPIC_ADMIN_KEY_SECRET,
+    ANTHROPIC_COMPLIANCE_KEY_SECRET,
     admin_client_for_tenant,
 )
 from vargate_telemetry.anthropic.types import (
@@ -26,6 +27,8 @@ from vargate_telemetry.anthropic.types import (
     MessageContentBlock,
     MessageFile,
     MessageGeneratedFile,
+    Organization,
+    OrgUser,
     UsageBreakdown,
     UsageBucket,
     Workspace,
@@ -33,6 +36,7 @@ from vargate_telemetry.anthropic.types import (
 
 __all__ = [
     "ANTHROPIC_ADMIN_KEY_SECRET",
+    "ANTHROPIC_COMPLIANCE_KEY_SECRET",
     "Activity",
     "Actor",
     "AnthropicAPIError",
@@ -48,6 +52,8 @@ __all__ = [
     "MessageContentBlock",
     "MessageFile",
     "MessageGeneratedFile",
+    "Organization",
+    "OrgUser",
     "RateLimited",
     "UsageBreakdown",
     "UsageBucket",

@@ -41,6 +41,8 @@ from vargate_telemetry.anthropic import (
     Chat,
     ChatWithMessages,
     InsufficientScope,
+    Organization,
+    OrgUser,
 )
 
 
@@ -507,3 +509,143 @@ def test_compliance_endpoint_raises_insufficient_scope_on_403() -> None:
     # Carries the 403 status code and the response body for triage.
     assert exc_info.value.status_code == 403
     assert "permission_error" in exc_info.value.body
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# 7. Organization directory (TM5 T5.1) — the head of the content-capture
+#    enumeration chain + the onboarding-probe targets.
+# ───────────────────────────────────────────────────────────────────────────
+
+
+# Payloads lifted verbatim from the public docs (reconned 2026-06-02):
+# https://platform.claude.com/docs/en/manage-claude/compliance-org-data
+_ORGS_RESPONSE = {
+    "data": [
+        {
+            "uuid": "91012d09-e48b-438e-a489-1bebfd8fa6f9",
+            "name": "Acme Engineering",
+            "created_at": "2025-06-01T10:00:00Z",
+        },
+        {
+            "uuid": "5a1b2c3d-4e5f-6789-abcd-ef0123456789",
+            "name": "Acme Legal",
+            "created_at": "2025-07-15T14:30:00Z",
+        },
+    ]
+}
+
+_ORG_USERS_PAGE_1 = {
+    "data": [
+        {
+            "id": "user_01XyDMpzjS89pFZXqSFUBDr6",
+            "full_name": "Priya Sharma",
+            "email": "priya@example.com",
+            "organization_role": "admin",
+            "created_at": "2025-06-01T10:00:00Z",
+        }
+    ],
+    "has_more": True,
+    "next_page": "page_8aW5kZXgicG9zaXRpb25fdG9rZW5fOTE0",
+}
+
+_ORG_USERS_PAGE_2 = {
+    "data": [
+        {
+            "id": "user_02AbCdEfGhJkLmNpQrStUvWx",
+            "full_name": "Sam Okafor",
+            "email": "sam@example.com",
+            "organization_role": "developer",
+            "created_at": "2025-08-20T11:00:00Z",
+        }
+    ],
+    "has_more": False,
+    "next_page": None,
+}
+
+
+def test_list_organizations_returns_typed_results_unpaginated() -> None:
+    """`GET /v1/compliance/organizations` is a single `data` array (no
+    cursor). Parse into Organization rows; exactly one HTTP request."""
+    received: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        received.append(request)
+        return httpx.Response(
+            200,
+            content=json.dumps(_ORGS_RESPONSE).encode(),
+            headers={"content-type": "application/json"},
+        )
+
+    client = _zero_wait_client(handler)
+    try:
+        orgs = list(client.list_organizations())
+    finally:
+        client.close()
+
+    assert [o.uuid for o in orgs] == [
+        "91012d09-e48b-438e-a489-1bebfd8fa6f9",
+        "5a1b2c3d-4e5f-6789-abcd-ef0123456789",
+    ]
+    assert all(isinstance(o, Organization) for o in orgs)
+    assert orgs[0].name == "Acme Engineering"
+    # Single un-paginated request to the documented path.
+    assert len(received) == 1
+    assert received[0].url.path == "/v1/compliance/organizations"
+
+
+def test_list_organization_users_paginates_via_next_page() -> None:
+    """`GET /v1/compliance/organizations/{org_uuid}/users` paginates with
+    a `next_page` token round-tripped as the `page` query param. Iterate
+    across two pages; the second request must carry `page=<next_page>`."""
+    received: list[httpx.Request] = []
+    pages = [_ORG_USERS_PAGE_1, _ORG_USERS_PAGE_2]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        received.append(request)
+        payload = pages[len(received) - 1]
+        return httpx.Response(
+            200,
+            content=json.dumps(payload).encode(),
+            headers={"content-type": "application/json"},
+        )
+
+    org_uuid = "91012d09-e48b-438e-a489-1bebfd8fa6f9"
+    client = _zero_wait_client(handler)
+    try:
+        users = list(client.list_organization_users(org_uuid, limit=500))
+    finally:
+        client.close()
+
+    assert [u.id for u in users] == [
+        "user_01XyDMpzjS89pFZXqSFUBDr6",
+        "user_02AbCdEfGhJkLmNpQrStUvWx",
+    ]
+    assert all(isinstance(u, OrgUser) for u in users)
+    assert users[0].organization_role == "admin"
+    assert users[0].full_name == "Priya Sharma"
+
+    # Two requests; the path carries the org_uuid; the second carries the
+    # next_page cursor as `page` (NOT after_id — directory pagination).
+    assert len(received) == 2
+    assert received[0].url.path == (
+        f"/v1/compliance/organizations/{org_uuid}/users"
+    )
+    assert received[0].url.params.get("limit") == "500"
+    assert received[0].url.params.get("page") is None
+    assert (
+        received[1].url.params.get("page")
+        == "page_8aW5kZXgicG9zaXRpb25fdG9rZW5fOTE0"
+    )
+
+
+def test_list_organization_users_rejects_empty_org_uuid() -> None:
+    """A missing org_uuid is a programming error — fail fast client-side
+    rather than build a malformed `/organizations//users` path."""
+    client = _zero_wait_client(
+        lambda req: httpx.Response(500, content=b"unreachable")
+    )
+    try:
+        with pytest.raises(ValueError, match="org_uuid required"):
+            list(client.list_organization_users(""))
+    finally:
+        client.close()
