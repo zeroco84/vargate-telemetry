@@ -2167,7 +2167,7 @@ paths:
   /content/export:
     get:
       tags: [content]
-      summary: Export captured content as an eDiscovery bundle (admin)
+      summary: Export captured content — JSON bundle, PDF, or both (admin)
       description: |
         TM6 T6.2 — admin only. Returns a downloadable ZIP bundle:
         `manifest.json` (metadata + chain-verification summary),
@@ -2180,6 +2180,18 @@ paths:
         messages appear in the proof but without content.
       operationId: exportContent
       parameters:
+        - name: format
+          in: query
+          required: false
+          description: |
+            `zip` (JSON bundle — manifest + chats + chain_proof + README;
+            default), `pdf` (legal production — Bates-numbered transcript +
+            proof appendix), or `both` (one zip with the JSON bundle + the
+            PDF). zip / both → application/zip; pdf → application/pdf.
+          schema:
+            type: string
+            enum: [zip, pdf, both]
+            default: zip
         - name: subject_user_id
           in: query
           required: false
@@ -2210,9 +2222,15 @@ paths:
             default: false
       responses:
         '200':
-          description: A ZIP bundle (manifest + chats + chain proof).
+          description: |
+            The export. application/zip for `zip` (JSON bundle) and `both`
+            (zip with JSON bundle + export.pdf); application/pdf for `pdf`.
           content:
             application/zip:
+              schema:
+                type: string
+                format: binary
+            application/pdf:
               schema:
                 type: string
                 format: binary

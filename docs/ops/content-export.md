@@ -6,6 +6,27 @@ differentiator over a plain dump is a **chain-verification proof**: an
 auditor can independently confirm the exported content is exactly what
 was recorded, and that the underlying audit chain is intact.
 
+## Formats
+
+`?format=` selects the output:
+
+| `format` | Content-Type | What |
+|----------|--------------|------|
+| `zip` (default) | application/zip | the machine-readable JSON bundle (below) |
+| `pdf` | application/pdf | a human / courtroom-readable production |
+| `both` | application/zip | one zip with the JSON bundle **and** `export.pdf` |
+
+The **PDF** is the legal-facing rendering of the same data: a cover page
+with the integrity attestation + chain verdict + a document digest, the
+chats as a **Bates-numbered** transcript (`VARGATE-000001…`, purged
+messages tombstoned, PII masked unless `reveal=true`), and an
+**Appendix A** chain-proof table (per record: Bates · chain_seq ·
+external_id · content_hash) plus the verification recipe. Page
+headers/footers carry the tenant, "page X of Y", and the doc digest. The
+PDF is a *rendering*; the chain remains the authoritative integrity
+record (a future PAdES signature would add byte-level PDF tamper-evidence
+— deferred).
+
 ## The bundle
 
 ```
@@ -64,9 +85,10 @@ export with every message purged + the chain still verifying.
 
 ## From the dashboard
 
-**Content** → **Export bundle (zip)** (admins only) downloads the bundle
-for the whole tenant. Per-subject / date-scoped exports are issued via
-the API today.
+**Content** → the **Export** control (admins only): pick a **Format**
+(JSON bundle / PDF / Both) and optionally **Include full PII (logged)**,
+then download — for the whole tenant. Per-subject / date-scoped exports
+are issued via the API today.
 
 ## Notes / limits
 

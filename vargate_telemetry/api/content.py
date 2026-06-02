@@ -572,20 +572,31 @@ def crypto_shred_tenant_endpoint(
 # ───────────────────────────────────────────────────────────────────────────
 
 
+_EXPORT_FORMATS = ("zip", "pdf", "both")
+
+
 @router.get(
     "/content/export",
     operation_id="exportContent",
     tags=["content"],
-    summary="Export captured content as an eDiscovery bundle (admin)",
+    summary="Export captured content — JSON bundle, PDF, or both (admin)",
     response_class=Response,
     responses={
         200: {
-            "description": "A ZIP bundle (manifest + chats + chain proof).",
-            "content": {"application/zip": {}},
+            "description": (
+                "The export. application/zip for `zip` (JSON bundle) and "
+                "`both` (zip with JSON + PDF); application/pdf for `pdf`."
+            ),
+            "content": {"application/zip": {}, "application/pdf": {}},
         }
     },
 )
 def export_content(
+    format: str = Query(
+        default="zip",
+        description="`zip` (JSON bundle, default) | `pdf` (legal production) "
+        "| `both` (one zip with the JSON bundle + the PDF).",
+    ),
     subject_user_id: Optional[str] = Query(default=None, min_length=1),
     start: Optional[datetime] = Query(default=None),
     end: Optional[datetime] = Query(default=None),
@@ -595,15 +606,25 @@ def export_content(
     ),
     user: AuthenticatedUser = Depends(require_admin),
 ) -> Response:
-    """Build a downloadable ZIP: a manifest + the decrypted chats + a
+    """Build a downloadable export: a manifest + the decrypted chats + a
     hash-chain verification proof (so an auditor can independently confirm
-    the export wasn't altered — see the bundle's README). Scoped by tenant
-    (always, via RLS) + optional ``subject_user_id`` / ``start`` / ``end``.
-    Purged messages appear in the proof but carry no content.
+    the export wasn't altered). ``format`` selects JSON bundle (`zip`), a
+    human/courtroom-readable `pdf` (Bates-numbered transcript + proof
+    appendix), or `both`. Scoped by tenant (always, via RLS) + optional
+    ``subject_user_id`` / ``start`` / ``end``. Purged messages appear in
+    the proof but carry no content.
 
     PII is masked by default (T6.3). ``reveal=true`` exports full content
     and appends an audit-logged ``content_reveal`` event first."""
     tenant_id = _require_tenant(user)
+    if format not in _EXPORT_FORMATS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "invalid_format",
+                "message": f"format must be one of {list(_EXPORT_FORMATS)}.",
+            },
+        )
     if reveal:
         content_deletion.log_content_reveal(
             tenant_id,
@@ -611,8 +632,9 @@ def export_content(
             revealed_by=user.user_id,
             subject_user_id=subject_user_id,
         )
-    filename, payload = content_export.build_export_bundle(
+    filename, payload, media_type = content_export.build_export(
         tenant_id,
+        fmt=format,
         generated_at=datetime.now(timezone.utc),
         subject_user_id=subject_user_id,
         start=start,
@@ -621,6 +643,6 @@ def export_content(
     )
     return Response(
         content=payload,
-        media_type="application/zip",
+        media_type=media_type,
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
