@@ -54,6 +54,7 @@ from vargate_telemetry import content_deletion, content_export
 from vargate_telemetry.auth.middleware import AuthenticatedUser, current_user
 from vargate_telemetry.auth.roles import require_admin
 from vargate_telemetry.db import session_scope
+from vargate_telemetry.pii_detector import detect_and_redact
 
 _log = logging.getLogger(__name__)
 
@@ -100,18 +101,31 @@ class ChatListResponse(BaseModel):
     truncated: bool = False
 
 
+class RedactionFinding(BaseModel):
+    """What PII a message contains — counts only, never the values."""
+
+    type: str
+    count: int
+
+
 class ContentMessage(BaseModel):
     record_id: str
     message_id: str
     role: str
     occurred_at: datetime
-    # The decrypted message text. Null if the blob couldn't be decrypted
-    # (tamper / missing / transport error) — the message still renders.
+    # The message text. PII is masked by default (T6.3); the privileged
+    # reveal endpoint returns it unmasked. Null if the blob couldn't be
+    # decrypted (tamper / missing / transport) or the message was purged.
     content: Optional[str] = None
     content_size_bytes: Optional[int] = None
     # True if this message's content was purged via Ogma; `content` is
     # null because the blob is gone (the chain record itself remains).
     purged: bool = False
+    # True if `content` is currently masked (PII present + not revealed).
+    redacted: bool = False
+    # The PII types + counts detected in this message (shown regardless of
+    # whether content is masked, so an operator knows what's in it).
+    redactions: list[RedactionFinding] = []
 
 
 class ChatDetailResponse(BaseModel):
@@ -126,6 +140,9 @@ class ChatDetailResponse(BaseModel):
     purged: bool = False
     purge_reason: Optional[str] = None
     purged_at: Optional[datetime] = None
+    # True when this response carries UNMASKED content (the reveal
+    # endpoint logged a content_reveal event to produce it).
+    revealed: bool = False
     messages: list[ContentMessage]
 
 
@@ -303,14 +320,24 @@ def list_content_chats(
     response_model=ChatDetailResponse,
     operation_id="getContentChatDetail",
     tags=["content"],
-    summary="Get one captured chat with its messages decrypted on read",
+    summary="Get one captured chat (PII masked) with messages decrypted on read",
 )
 def get_content_chat_detail(
     chat_id: str = Path(..., min_length=1),
     user: AuthenticatedUser = Depends(current_user),
 ) -> ChatDetailResponse:
+    """Returns the chat with message text decrypted on read and **PII
+    masked** (T6.3). Use the reveal endpoint for unmasked content."""
     tenant_id = _require_tenant(user)
+    return _build_chat_detail(tenant_id, chat_id, reveal=False)
 
+
+def _build_chat_detail(
+    tenant_id: str, chat_id: str, *, reveal: bool
+) -> ChatDetailResponse:
+    """Shared detail builder. ``reveal=False`` masks PII (the default GET);
+    ``reveal=True`` returns unmasked content (the reveal endpoint, which
+    logs a content_reveal event before calling this)."""
     sql = """
         SELECT
             id::text          AS record_id,
@@ -392,15 +419,25 @@ def get_content_chat_detail(
                     r.content_ref,
                 )
                 content_plaintext = None
+
+        # T6.3: mask PII by default; the reveal path returns the original.
+        # `redactions` reports what PII was found either way (counts only).
+        findings: list[dict[str, Any]] = []
+        out_content: Optional[str] = None
+        if content_plaintext is not None:
+            redacted_text, findings = detect_and_redact(content_plaintext)
+            out_content = content_plaintext if reveal else redacted_text
         messages.append(
             ContentMessage(
                 record_id=r.record_id,
                 message_id=r.message_id,
                 role=md.get("role") or "unknown",
                 occurred_at=r.occurred_at,
-                content=content_plaintext,
+                content=out_content,
                 content_size_bytes=r.content_size_bytes,
                 purged=msg_purged,
+                redacted=(not reveal) and bool(findings),
+                redactions=[RedactionFinding(**f) for f in findings],
             )
         )
 
@@ -416,8 +453,32 @@ def get_content_chat_detail(
         purged=chat_purged,
         purge_reason=purge.purge_reason if chat_purged else None,
         purged_at=purge.purged_at if chat_purged else None,
+        revealed=reveal,
         messages=messages,
     )
+
+
+@router.post(
+    "/content/chats/{chat_id}/reveal",
+    response_model=ChatDetailResponse,
+    operation_id="revealContentChat",
+    tags=["content"],
+    summary="Reveal one chat's content with PII unmasked (admin, audit-logged)",
+)
+def reveal_content_chat(
+    chat_id: str = Path(..., min_length=1),
+    user: AuthenticatedUser = Depends(require_admin),
+) -> ChatDetailResponse:
+    """Return the chat with PII **unmasked**. Privileged (admin) + audited:
+    appends a tamper-evident ``content_reveal`` chain event recording who
+    revealed it and when. Builds first so an unknown / cross-tenant chat
+    404s *before* anything is logged or exposed."""
+    tenant_id = _require_tenant(user)
+    detail = _build_chat_detail(tenant_id, chat_id, reveal=True)
+    content_deletion.log_content_reveal(
+        tenant_id, scope="chat", revealed_by=user.user_id, chat_id=chat_id
+    )
+    return detail
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -528,20 +589,35 @@ def export_content(
     subject_user_id: Optional[str] = Query(default=None, min_length=1),
     start: Optional[datetime] = Query(default=None),
     end: Optional[datetime] = Query(default=None),
+    reveal: bool = Query(
+        default=False,
+        description="Include full (unredacted) PII content — audit-logged.",
+    ),
     user: AuthenticatedUser = Depends(require_admin),
 ) -> Response:
     """Build a downloadable ZIP: a manifest + the decrypted chats + a
     hash-chain verification proof (so an auditor can independently confirm
     the export wasn't altered — see the bundle's README). Scoped by tenant
     (always, via RLS) + optional ``subject_user_id`` / ``start`` / ``end``.
-    Purged messages appear in the proof but carry no content."""
+    Purged messages appear in the proof but carry no content.
+
+    PII is masked by default (T6.3). ``reveal=true`` exports full content
+    and appends an audit-logged ``content_reveal`` event first."""
     tenant_id = _require_tenant(user)
+    if reveal:
+        content_deletion.log_content_reveal(
+            tenant_id,
+            scope="export",
+            revealed_by=user.user_id,
+            subject_user_id=subject_user_id,
+        )
     filename, payload = content_export.build_export_bundle(
         tenant_id,
         generated_at=datetime.now(timezone.utc),
         subject_user_id=subject_user_id,
         start=start,
         end=end,
+        redact=not reveal,
     )
     return Response(
         content=payload,

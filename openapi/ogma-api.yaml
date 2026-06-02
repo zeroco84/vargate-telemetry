@@ -360,6 +360,19 @@ components:
             True when the tenant has more chats than the capped list
             returned (no silent truncation — the UI says "most recent N").
 
+    RedactionFinding:
+      type: object
+      required: [type, count]
+      description: |
+        What PII a message contains (TM6 T6.3) — counts only, never the
+        matched values.
+      properties:
+        type:
+          type: string
+          description: "PII type: email / phone / ssn / credit_card / api_key / ip_address."
+        count:
+          type: integer
+
     ContentMessage:
       type: object
       required: [record_id, message_id, role, occurred_at, purged]
@@ -378,9 +391,10 @@ components:
           type: string
           nullable: true
           description: |
-            The decrypted message text. Null if the blob couldn't be
-            decrypted (tamper / missing / transport) — the message still
-            renders.
+            The message text. PII is masked by default (T6.3); the reveal
+            endpoint returns it unmasked. Null if the blob couldn't be
+            decrypted (tamper / missing / transport) or the message was
+            purged.
         content_size_bytes:
           type: integer
           nullable: true
@@ -389,6 +403,14 @@ components:
           description: |
             True if this message's content was purged via Ogma; `content`
             is null because the blob is gone (the chain record remains).
+        redacted:
+          type: boolean
+          description: True if `content` is currently masked (PII present, not revealed).
+        redactions:
+          type: array
+          description: PII types + counts detected in the message.
+          items:
+            $ref: '#/components/schemas/RedactionFinding'
 
     ChatDetailResponse:
       type: object
@@ -420,6 +442,11 @@ components:
           type: string
           format: date-time
           nullable: true
+        revealed:
+          type: boolean
+          description: |
+            True when this response carries UNMASKED content (the reveal
+            endpoint logged a content_reveal event to produce it).
         messages:
           type: array
           items:
@@ -2098,6 +2125,45 @@ paths:
         '500':
           $ref: '#/components/responses/InternalError'
 
+  /content/chats/{chat_id}/reveal:
+    post:
+      tags: [content]
+      summary: Reveal one chat's content with PII unmasked (admin, audit-logged)
+      description: |
+        TM6 T6.3 — admin only. Returns the chat with PII UNMASKED and
+        appends a tamper-evident content_reveal chain event (who revealed
+        it + when). Builds first, so an unknown / cross-tenant chat 404s
+        before anything is logged or exposed.
+      operationId: revealContentChat
+      parameters:
+        - name: chat_id
+          in: path
+          required: true
+          schema:
+            type: string
+            minLength: 1
+      responses:
+        '200':
+          description: "The chat with messages unmasked (revealed=true)."
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChatDetailResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: "`code: chat_not_found` — no such chat for your tenant."
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
   /content/export:
     get:
       tags: [content]
@@ -2132,6 +2198,16 @@ paths:
           schema:
             type: string
             format: date-time
+        - name: reveal
+          in: query
+          required: false
+          description: |
+            TM6 T6.3 — include full (unredacted) PII content. Default
+            false (PII masked). A true value appends an audit-logged
+            content_reveal event.
+          schema:
+            type: boolean
+            default: false
       responses:
         '200':
           description: A ZIP bundle (manifest + chats + chain proof).

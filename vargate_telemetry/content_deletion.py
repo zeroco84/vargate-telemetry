@@ -38,6 +38,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -52,6 +53,7 @@ from vargate_telemetry.storage import content as content_store
 _log = logging.getLogger(__name__)
 
 RECORD_TYPE_DELETION = "content_deletion"
+RECORD_TYPE_REVEAL = "content_reveal"
 SOURCE_API_CONTENT = "compliance_content"
 _RECORD_TYPE_MESSAGE = "chat_message"
 
@@ -260,3 +262,49 @@ def crypto_shred_tenant(
         requested_by,
     )
     return {"dek_destroyed": destroyed, "event_appended": appended}
+
+
+def log_content_reveal(
+    tenant_id: str,
+    *,
+    scope: str,
+    revealed_by: str,
+    chat_id: Optional[str] = None,
+    subject_user_id: Optional[str] = None,
+) -> None:
+    """Append an audit-logged ``content_reveal`` event (TM6 T6.3).
+
+    A reveal is a privileged un-masking of PII (content view or full-
+    content export). Each reveal is its OWN tamper-evident chain event
+    (unique ``external_id`` — never deduped), so the audit trail records
+    every time masked content was exposed, by whom, and when. Inert to
+    the content view + export queries (they filter ``record_type``).
+    """
+    now = _now()
+    metadata: dict[str, Any] = {
+        "scope": scope,  # 'chat' | 'export'
+        "revealed_by": revealed_by,
+        "revealed_at": now.isoformat(),
+    }
+    if chat_id is not None:
+        metadata["chat_id"] = chat_id
+    if subject_user_id is not None:
+        metadata["subject_user_id"] = subject_user_id
+    append_telemetry_record(
+        tenant_id,
+        record_type=RECORD_TYPE_REVEAL,
+        source_api=SOURCE_API_CONTENT,
+        external_id=f"reveal:{uuid.uuid4().hex}",
+        occurred_at=now,
+        content_hash=_deletion_content_hash(metadata),
+        record_metadata=metadata,
+        subject_user_id=subject_user_id,
+    )
+    _log.info(
+        "content_reveal: tenant %s scope=%s chat=%s subject=%s by=%s",
+        tenant_id,
+        scope,
+        chat_id,
+        subject_user_id,
+        revealed_by,
+    )

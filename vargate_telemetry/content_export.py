@@ -38,6 +38,7 @@ from sqlalchemy import text as sql_text
 
 from vargate_telemetry.chain import verify_telemetry_chain
 from vargate_telemetry.db import session_scope
+from vargate_telemetry.pii_detector import detect_and_redact
 from vargate_telemetry.storage.content import retrieve_content
 
 _log = logging.getLogger(__name__)
@@ -131,6 +132,11 @@ How to verify an exported message was not altered
    "content_hash" (hex). A match proves the exported text is exactly the
    content that was recorded in the chain.
 
+   NOTE: this per-message check only applies to a FULL export
+   (manifest.json -> "redacted": false). In a redacted export the text is
+   masked, so it will not match the plaintext content_hash — the chain
+   verification (step 1) and record existence still hold.
+
 Purged messages
 ---------------
 A message marked "purged": true had its content deleted (data-subject
@@ -147,9 +153,16 @@ def build_export_bundle(
     subject_user_id: Optional[str] = None,
     start: Optional[datetime] = None,
     end: Optional[datetime] = None,
+    redact: bool = True,
     retriever: Retriever = retrieve_content,
 ) -> tuple[str, bytes]:
-    """Build the eDiscovery ZIP. Returns ``(filename, zip_bytes)``."""
+    """Build the eDiscovery ZIP. Returns ``(filename, zip_bytes)``.
+
+    ``redact=True`` (default) masks PII in the exported text — safe to
+    share. ``redact=False`` exports full content (a privileged, logged
+    option); only a full export supports the per-message content_hash
+    check (the masked text won't match the plaintext hash).
+    """
     if not tenant_id:
         raise ValueError("tenant_id required")
 
@@ -170,11 +183,17 @@ def build_export_bundle(
         md = r.metadata or {}
         purged = tenant_shred or r.external_id in purged_eids
         content: Optional[str] = None
+        msg_redacted = False
         if r.content_ref and not purged:
             try:
-                content = retriever(tenant_id, r.content_ref).decode(
+                plaintext = retriever(tenant_id, r.content_ref).decode(
                     "utf-8", errors="replace"
                 )
+                if redact:
+                    content, findings = detect_and_redact(plaintext)
+                    msg_redacted = bool(findings)
+                else:
+                    content = plaintext
             except Exception:  # noqa: BLE001 — one bad blob can't fail the export
                 _log.exception(
                     "content_export: decrypt failed %s/%s",
@@ -203,6 +222,7 @@ def build_export_bundle(
                 "content": content,
                 "content_size_bytes": r.content_size_bytes,
                 "purged": purged,
+                "redacted": msg_redacted,
             }
         )
         proof_records.append(
@@ -230,6 +250,10 @@ def build_export_bundle(
             "start": start.isoformat() if start else None,
             "end": end.isoformat() if end else None,
         },
+        # When true, PII in the text is masked. The per-message
+        # content_hash check (README) only applies to a FULL export
+        # (redacted=false) — masked text won't match the plaintext hash.
+        "redacted": redact,
         "counts": {
             "chats": len(chats),
             "messages": len(proof_records),
