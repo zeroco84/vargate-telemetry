@@ -262,6 +262,101 @@ components:
             tree is empty.
           examples: ["Acme Enterprise"]
 
+    ChatSummary:
+      type: object
+      required:
+        [chat_id, message_count, first_message_at, last_message_at, deleted]
+      description: |
+        One captured chat (TM5 T5.3), aggregated from its per-message
+        `compliance_content` records. Metadata only — message text is
+        fetched + decrypted by the per-chat detail endpoint.
+      properties:
+        chat_id:
+          type: string
+        chat_name:
+          type: string
+          nullable: true
+        model:
+          type: string
+          nullable: true
+        user_email:
+          type: string
+          nullable: true
+        message_count:
+          type: integer
+        first_message_at:
+          type: string
+          format: date-time
+        last_message_at:
+          type: string
+          format: date-time
+        deleted:
+          type: boolean
+          description: |
+            True if the chat was soft-deleted in claude.ai (still
+            captured, with the flag). Hard-deleted chats never appear.
+
+    ChatListResponse:
+      type: object
+      required: [chats, truncated]
+      properties:
+        chats:
+          type: array
+          items:
+            $ref: '#/components/schemas/ChatSummary'
+        truncated:
+          type: boolean
+          description: |
+            True when the tenant has more chats than the capped list
+            returned (no silent truncation — the UI says "most recent N").
+
+    ContentMessage:
+      type: object
+      required: [record_id, message_id, role, occurred_at]
+      properties:
+        record_id:
+          type: string
+        message_id:
+          type: string
+        role:
+          type: string
+          description: "`user` or `assistant`."
+        occurred_at:
+          type: string
+          format: date-time
+        content:
+          type: string
+          nullable: true
+          description: |
+            The decrypted message text. Null if the blob couldn't be
+            decrypted (tamper / missing / transport) — the message still
+            renders.
+        content_size_bytes:
+          type: integer
+          nullable: true
+
+    ChatDetailResponse:
+      type: object
+      required: [chat_id, deleted, messages]
+      properties:
+        chat_id:
+          type: string
+        chat_name:
+          type: string
+          nullable: true
+        model:
+          type: string
+          nullable: true
+        user_email:
+          type: string
+          nullable: true
+        deleted:
+          type: boolean
+        messages:
+          type: array
+          items:
+            $ref: '#/components/schemas/ContentMessage'
+
     Region:
       type: string
       enum: [us, eu]
@@ -1604,6 +1699,71 @@ paths:
           description: |
             Session cleared. Body is empty; the cookie-clearing
             `Set-Cookie` header is the only meaningful response shape.
+
+  /content/chats:
+    get:
+      tags: [content]
+      summary: List captured compliance-content chats for the tenant
+      description: |
+        Read-only list (TM5 T5.3) of chats captured by the content pull
+        (T5.2), aggregated by `chat_id` from the per-message records —
+        metadata only, no decryption here. The UI gates this on the
+        `content_capture` capability; a tenant with no Compliance Access
+        Key simply has an empty list. Newest activity first.
+      operationId: listContentChats
+      responses:
+        '200':
+          description: The tenant's captured chats.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChatListResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /content/chats/{chat_id}:
+    get:
+      tags: [content]
+      summary: Get one captured chat with its messages decrypted on read
+      description: |
+        Returns the chat's messages with text decrypted at request time
+        (AES-GCM under the tenant DEK; plaintext is never persisted in
+        the clear). RLS-scoped — a cross-tenant `chat_id` guess 404s. A
+        message whose blob can't be decrypted has `content: null` and
+        still renders (the request doesn't fail).
+      operationId: getContentChatDetail
+      parameters:
+        - name: chat_id
+          in: path
+          required: true
+          schema:
+            type: string
+            minLength: 1
+      responses:
+        '200':
+          description: The chat + its decrypted messages.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChatDetailResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          description: |
+            `code: chat_not_found` — no captured chat with that id for
+            your tenant.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/InternalError'
 
   /sessions:
     get:

@@ -97,4 +97,9 @@ T5 read-first scope.
   factory `compliance_client_for_tenant`.
 - Storage: `vargate_telemetry/storage/content.py` (`store_content`,
   `retrieve_content`); chain `vargate_telemetry/chain.py`.
-- View (next): T5.3 dashboard "Compliance" content view (read-only).
+- View (T5.3, built): read-only content view — `GET /content/chats`
+  (list, metadata only) + `GET /content/chats/{chat_id}` (decrypt-on-read
+  message view; `api/content.py`) and the dashboard **Content** page
+  (`pages/dashboard/Content.tsx` + `ContentDetail.tsx`: list → message
+  transcript → client-side JSON export). RLS-scoped; gated in the UI on
+  `content_capture`. No delete, no redaction (read-only first pass).
