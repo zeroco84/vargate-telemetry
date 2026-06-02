@@ -831,6 +831,50 @@ components:
             Opaque cursor for the next page. `null` when no more.
             Pass back as the `cursor` query param.
 
+    CacheModelStat:
+      type: object
+      required: [model, severity, recommendation]
+      description: Per-model cache-efficiency stats over the window (TM5 T5.5).
+      properties:
+        model:
+          type: string
+        uncached_input_tokens:
+          type: integer
+        cache_read_tokens:
+          type: integer
+        cache_creation_tokens:
+          type: integer
+        output_tokens:
+          type: integer
+        cache_hit_rate:
+          type: number
+          nullable: true
+          description: "`cache_read / (cache_read + cache_creation)`; null if no cache activity."
+        severity:
+          type: string
+          enum: [ok, info, warn]
+        recommendation:
+          type: string
+
+    CacheRecommendationsResponse:
+      type: object
+      required: [since, until, models]
+      properties:
+        since:
+          type: string
+          format: date
+        until:
+          type: string
+          format: date
+        overall_hit_rate:
+          type: number
+          nullable: true
+          description: Tenant-wide `read / (read + creation)`; null if no cache activity.
+        models:
+          type: array
+          items:
+            $ref: '#/components/schemas/CacheModelStat'
+
     # ───────────────────────────────────────────────────────────────────────
     # Budgets (TM3 Phase B)
     # ───────────────────────────────────────────────────────────────────────
@@ -1970,6 +2014,45 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/UsageListResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /usage/cache-recommendations:
+    get:
+      tags: [usage]
+      summary: Per-model cache hit-rate + prompt-caching recommendations
+      description: |
+        Pure analysis (TM5 T5.5) over the captured Admin-API usage
+        records — no new ingest. Per model over the window: cache
+        hit-rate (`cache_read / (cache_read + cache_creation)`) + a
+        severity-tagged recommendation (low reuse → stabilize the cached
+        prefix / raise TTL; no caching on high input → enable prompt
+        caching). Sorted most-actionable first.
+      operationId: getCacheRecommendations
+      parameters:
+        - in: query
+          name: since
+          schema:
+            type: string
+            format: date
+          description: Inclusive start date (UTC). Defaults to 30 days before `until`.
+        - in: query
+          name: until
+          schema:
+            type: string
+            format: date
+          description: Inclusive end date (UTC). Defaults to today.
+      responses:
+        '200':
+          description: Per-model cache stats + recommendations.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CacheRecommendationsResponse'
         '400':
           $ref: '#/components/responses/BadRequest'
         '401':

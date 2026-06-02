@@ -593,4 +593,234 @@ def list_usage(
     return UsageListResponse(rows=rows, totals=totals, next_cursor=next_cursor)
 
 
+# ───────────────────────────────────────────────────────────────────────────
+# Cache-efficiency recommendations (TM5 T5.5)
+#
+# Pure analysis over the already-captured Admin-API usage records — no
+# ingest, no schema. A model's input splits into uncached
+# (`input_tokens`), cache-read (reused), and cache-creation (written);
+# hit_rate = read / (read + creation) is how much of the cache we paid to
+# WRITE actually gets REUSED. Below this input-token floor over the
+# window, caching impact is negligible, so we don't nag.
+# ───────────────────────────────────────────────────────────────────────────
+
+_CACHE_VOLUME_FLOOR = 100_000
+
+
+class CacheModelStat(BaseModel):
+    model: str
+    uncached_input_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_creation_tokens: int = 0
+    output_tokens: int = 0
+    # read / (read + creation); null when the model has no cache activity.
+    cache_hit_rate: Optional[float] = None
+    severity: str  # "ok" | "info" | "warn"
+    recommendation: str
+
+
+class CacheRecommendationsResponse(BaseModel):
+    since: date
+    until: date
+    # Tenant-wide read / (read + creation) across all models; null if no
+    # cache activity in the window.
+    overall_hit_rate: Optional[float] = None
+    models: list[CacheModelStat]
+
+
+def _pct(x: float) -> str:
+    return f"{round(x * 100)}%"
+
+
+def _cache_recommendation(
+    uncached_input: int, cache_read: int, cache_creation: int
+) -> tuple[str, Optional[float], str]:
+    """Pure cache-efficiency verdict for one model over the window.
+
+    Returns ``(severity, hit_rate, recommendation)`` — severity in
+    ``{ok, info, warn}``; hit_rate is ``read / (read + creation)`` or
+    ``None`` when there's no cache activity. Tested directly so the tiers
+    don't depend on DB reachability.
+    """
+    cache_total = cache_read + cache_creation
+    total_input = uncached_input + cache_total
+    hit_rate = (cache_read / cache_total) if cache_total > 0 else None
+
+    if total_input < _CACHE_VOLUME_FLOOR:
+        return (
+            "ok",
+            hit_rate,
+            "Low input volume — prompt caching has little impact at this "
+            "scale yet.",
+        )
+    if cache_total == 0:
+        return (
+            "warn",
+            None,
+            f"No prompt caching detected on {total_input:,} input tokens. "
+            "Caching the stable prompt prefix could cut input cost "
+            "substantially.",
+        )
+    assert hit_rate is not None  # cache_total > 0 here
+    if hit_rate < 0.5:
+        return (
+            "warn",
+            hit_rate,
+            f"Low cache reuse ({_pct(hit_rate)}). Cache is written but "
+            "rarely read back — stabilize the cached prefix or raise the "
+            "cache TTL so writes are reused before they expire.",
+        )
+    if hit_rate < 0.8:
+        return (
+            "info",
+            hit_rate,
+            f"Moderate cache reuse ({_pct(hit_rate)}). Room to improve — "
+            "more of the prompt prefix could be cached and reused.",
+        )
+    return ("ok", hit_rate, f"Healthy cache reuse ({_pct(hit_rate)}).")
+
+
+@router.get(
+    "/usage/cache-recommendations",
+    response_model=CacheRecommendationsResponse,
+    operation_id="getCacheRecommendations",
+    tags=["usage"],
+    summary="Per-model cache hit-rate + prompt-caching recommendations",
+)
+def get_cache_recommendations(
+    since: Optional[date] = Query(None),
+    until: Optional[date] = Query(None),
+    user: AuthenticatedUser = Depends(current_user),
+) -> CacheRecommendationsResponse:
+    """Per-model cache hit-rate + a recommendation, computed from the
+    captured Admin-API usage records (no new ingest)."""
+    if user.tenant_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "no_tenant_bound",
+                "message": "Your session is not bound to a tenant yet.",
+            },
+        )
+
+    today_utc = datetime.now(tz=None).date()
+    if until is None:
+        until = today_utc
+    if since is None:
+        since = until - timedelta(days=_DEFAULT_LOOKBACK_DAYS - 1)
+    if since > until:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "invalid_date_range",
+                "message": f"since ({since}) must be <= until ({until}).",
+            },
+        )
+
+    params: dict[str, Any] = {
+        "since_ts": datetime.combine(since, datetime.min.time()),
+        "until_ts": datetime.combine(
+            until + timedelta(days=1), datetime.min.time()
+        ),
+    }
+
+    # Same source + supersession filter as /usage (hide legacy aggregate
+    # rows on dates that also have per-model breakdown, so tokens aren't
+    # double-counted), then SUM per model.
+    sql = """
+        WITH expanded AS (
+            SELECT tr.occurred_at, r.result
+            FROM telemetry_records tr,
+                 jsonb_array_elements(tr.metadata->'results')
+                     WITH ORDINALITY AS r(result, ordinality)
+            WHERE tr.tenant_id = current_setting('app.tenant_id')
+              AND tr.record_type = 'usage'
+              AND tr.source_api = 'admin'
+              AND tr.occurred_at >= :since_ts
+              AND tr.occurred_at < :until_ts
+              AND NOT (
+                (r.result->>'model') IS NULL
+                AND EXISTS (
+                    SELECT 1
+                    FROM telemetry_records tr2,
+                         jsonb_array_elements(tr2.metadata->'results')
+                             AS r2(result)
+                    WHERE tr2.tenant_id = current_setting('app.tenant_id')
+                      AND tr2.record_type = 'usage'
+                      AND tr2.source_api = 'admin'
+                      AND DATE(tr2.occurred_at AT TIME ZONE 'UTC')
+                          = DATE(tr.occurred_at AT TIME ZONE 'UTC')
+                      AND (r2.result->>'model') IS NOT NULL
+                )
+              )
+        )
+        SELECT
+            COALESCE(result->>'model', '(unspecified)') AS model,
+            COALESCE(SUM((result->>'input_tokens')::bigint), 0)
+                AS uncached_input,
+            COALESCE(SUM((result->>'output_tokens')::bigint), 0)
+                AS output_tokens,
+            COALESCE(SUM((result->>'cache_read_input_tokens')::bigint), 0)
+                AS cache_read,
+            COALESCE(SUM(COALESCE(
+                NULLIF((result->>'cache_creation_input_tokens')::bigint, 0),
+                ((result->'cache_creation')->>'ephemeral_5m_input_tokens')::bigint
+                + ((result->'cache_creation')->>'ephemeral_1h_input_tokens')::bigint,
+                0
+            )), 0) AS cache_creation
+        FROM expanded
+        GROUP BY 1
+    """
+
+    with session_scope(user.tenant_id) as s:
+        rows = s.execute(sql_text(sql), params).all()
+
+    models: list[CacheModelStat] = []
+    total_read = 0
+    total_creation = 0
+    for r in rows:
+        uncached = int(r.uncached_input)
+        read = int(r.cache_read)
+        creation = int(r.cache_creation)
+        total_read += read
+        total_creation += creation
+        severity, hit_rate, text = _cache_recommendation(
+            uncached, read, creation
+        )
+        models.append(
+            CacheModelStat(
+                model=r.model,
+                uncached_input_tokens=uncached,
+                cache_read_tokens=read,
+                cache_creation_tokens=creation,
+                output_tokens=int(r.output_tokens),
+                cache_hit_rate=(
+                    round(hit_rate, 4) if hit_rate is not None else None
+                ),
+                severity=severity,
+                recommendation=text,
+            )
+        )
+
+    # Most actionable first: warnings, then by input volume desc.
+    _sev = {"warn": 0, "info": 1, "ok": 2}
+    models.sort(
+        key=lambda m: (
+            _sev.get(m.severity, 3),
+            -(
+                m.uncached_input_tokens
+                + m.cache_read_tokens
+                + m.cache_creation_tokens
+            ),
+        )
+    )
+
+    cache_total = total_read + total_creation
+    overall = round(total_read / cache_total, 4) if cache_total > 0 else None
+
+    return CacheRecommendationsResponse(
+        since=since, until=until, overall_hit_rate=overall, models=models
+    )
+
+
 __all__ = ["router"]

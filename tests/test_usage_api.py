@@ -1167,3 +1167,88 @@ def test_list_usage_limit_1001_rejected(
         headers=_bearer_for_tenant("tnt_us_test_limit_cap"),
     )
     assert r.status_code == 422, r.text
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Cache-efficiency recommendations (TM5 T5.5)
+# ───────────────────────────────────────────────────────────────────────────
+
+
+def test_cache_recommendation_tiers() -> None:
+    """The pure verdict function, tier by tier (no DB)."""
+    from vargate_telemetry.api.usage import _cache_recommendation
+
+    # Below the volume floor → ok, no nag.
+    sev, _hit, _ = _cache_recommendation(1_000, 0, 0)
+    assert sev == "ok"
+
+    # High volume, no caching at all → warn, hit_rate None.
+    sev, hit, text = _cache_recommendation(500_000, 0, 0)
+    assert sev == "warn" and hit is None
+    assert "No prompt caching" in text
+
+    # Low reuse (<0.5) → warn.
+    sev, hit, _ = _cache_recommendation(0, 100_000, 400_000)
+    assert sev == "warn" and abs(hit - 0.2) < 1e-9
+
+    # Moderate (0.5–0.8) → info.
+    sev, hit, _ = _cache_recommendation(0, 600_000, 400_000)
+    assert sev == "info" and abs(hit - 0.6) < 1e-9
+
+    # Healthy (≥0.8) → ok.
+    sev, hit, _ = _cache_recommendation(0, 900_000, 100_000)
+    assert sev == "ok" and abs(hit - 0.9) < 1e-9
+
+
+def test_cache_recommendations_endpoint(
+    clean_records: None, client: TestClient
+) -> None:
+    tenant = "tnt_us_cache_recs"
+    _seed_usage_record(
+        tenant,
+        bucket_date=date(2026, 5, 20),
+        results=[
+            _result_group(
+                model="claude-opus-4-7",
+                cache_read=900_000,
+                cache_creation=100_000,
+            ),
+            _result_group(model="claude-haiku-4-5", input_tokens=500_000),
+        ],
+    )
+    r = client.get(
+        "/usage/cache-recommendations", headers=_bearer_for_tenant(tenant)
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    by_model = {m["model"]: m for m in body["models"]}
+
+    assert by_model["claude-opus-4-7"]["severity"] == "ok"
+    assert abs(by_model["claude-opus-4-7"]["cache_hit_rate"] - 0.9) < 1e-9
+    assert by_model["claude-haiku-4-5"]["severity"] == "warn"
+    assert by_model["claude-haiku-4-5"]["cache_hit_rate"] is None
+    # Warnings sort first (most actionable).
+    assert body["models"][0]["severity"] == "warn"
+    # Overall = read / (read + creation) = 900k / 1000k.
+    assert abs(body["overall_hit_rate"] - 0.9) < 1e-9
+
+
+def test_cache_recommendations_empty_window(
+    clean_records: None, client: TestClient
+) -> None:
+    r = client.get(
+        "/usage/cache-recommendations",
+        headers=_bearer_for_tenant("tnt_us_cache_empty"),
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["models"] == []
+    assert body["overall_hit_rate"] is None
+
+
+def test_cache_recommendations_no_tenant_400(client: TestClient) -> None:
+    r = client.get(
+        "/usage/cache-recommendations", headers=_bearer_for_tenant(None)
+    )
+    assert r.status_code == 400, r.text
+    assert r.json()["detail"]["code"] == "no_tenant_bound"
