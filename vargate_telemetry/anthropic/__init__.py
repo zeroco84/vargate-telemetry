@@ -13,6 +13,7 @@ from vargate_telemetry.anthropic.factory import (
     ANTHROPIC_ADMIN_KEY_SECRET,
     ANTHROPIC_COMPLIANCE_KEY_SECRET,
     admin_client_for_tenant,
+    compliance_client_for_tenant,
 )
 from vargate_telemetry.anthropic.types import (
     Activity,
@@ -59,4 +60,5 @@ __all__ = [
     "UsageBucket",
     "Workspace",
     "admin_client_for_tenant",
+    "compliance_client_for_tenant",
 ]

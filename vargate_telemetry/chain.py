@@ -116,6 +116,7 @@ def append_telemetry_record(
     record_metadata: dict[str, Any] | None = None,
     subject_user_id: str | None = None,
     content_ref: str | None = None,
+    content_size_bytes: int | None = None,
 ) -> TelemetryRecord:
     """Append a record to the tenant's chain; returns the persisted row.
 
@@ -125,6 +126,12 @@ def append_telemetry_record(
       2. Build canonical bytes from the record fields.
       3. Compute `chain_self_hash` via the shared primitive.
       4. INSERT with `chain_seq`, `chain_prev_hash`, `chain_self_hash`.
+
+    `content_size_bytes` (TM5 T5.2) is a column-only operational metric:
+    stored on the row but deliberately NOT part of the canonical bytes,
+    so it never affects the chain hash. Integrity is bound by
+    `content_hash` (the SHA-256 of the plaintext); size is metadata about
+    storage, not the integrity-bound content.
 
     Concurrency: the UNIQUE (tenant_id, chain_seq) constraint serializes
     parallel appends. If two transactions race, one commits and the
@@ -181,6 +188,7 @@ def append_telemetry_record(
             occurred_at=occurred_at,
             content_ref=content_ref,
             content_hash=content_hash,
+            content_size_bytes=content_size_bytes,
             record_metadata=metadata,
             chain_seq=chain_seq,
             chain_prev_hash=chain_prev_bytes,

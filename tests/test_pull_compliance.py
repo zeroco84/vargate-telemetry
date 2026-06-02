@@ -39,15 +39,17 @@ sequences — same pattern as ``test_anthropic_compliance.py`` and
 
 from __future__ import annotations
 
+import hashlib
 import json
+import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Callable, Iterator
+from typing import Callable, Iterator, Optional
 
 import httpx
 import pytest
 from sqlalchemy import text as sql_text
 
-from vargate_telemetry.anthropic import AnthropicAdminClient
+from vargate_telemetry.anthropic import AnthropicAdminClient, InsufficientScope
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -417,43 +419,34 @@ def test_dispatch_compliance_content_default_dispatches_all_regions(
     dispatch_tenants: dict,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """TM5 T5.0: the content dispatcher with NO region attempts every
-    active tenant across regions; explicit region filters. Also covers
-    the NotConfigured skip path — no tenant has a Compliance Access Key,
-    so each per-tenant call raises NotConfigured and the dispatcher
-    counts the attempt without crashing. We capture the attempted ids by
-    monkeypatching `_pull_content_for_tenant` (it's called directly, not
-    via .delay) to record + raise NotConfigured."""
+    """TM5 T5.0 + T5.2: the content dispatcher with NO region queues every
+    active tenant across regions via ``pull_content_for_tenant.delay``;
+    explicit region filters. (A no-key tenant soft-skips INSIDE the
+    per-tenant task now — see ``test_pull_content_soft_skips_when_no_key``
+    — not in the dispatcher, so the dispatcher just fans out to all.)"""
     from vargate_telemetry.tasks import pull_compliance
 
-    attempted: list[str] = []
-
-    def _capture(tenant_id: str) -> None:
-        attempted.append(tenant_id)
-        raise pull_compliance.NotConfigured("no compliance key (test)")
-
+    dispatched: list[str] = []
     monkeypatch.setattr(
-        pull_compliance, "_pull_content_for_tenant", _capture
+        pull_compliance.pull_content_for_tenant,
+        "delay",
+        lambda tenant_id: dispatched.append(tenant_id),
     )
 
-    # Default (no region): all active tenants attempted; NotConfigured
-    # handled (returns the attempted count, doesn't crash).
-    result = pull_compliance.dispatch_compliance_content_pulls()
-    assert isinstance(result, int)
-    a = set(attempted)
+    pull_compliance.dispatch_compliance_content_pulls()
+    d = set(dispatched)
     assert {
         dispatch_tenants["us_1"],
         dispatch_tenants["us_2"],
         dispatch_tenants["eu_1"],
-    } <= a
-    assert dispatch_tenants["eu_inactive"] not in a
+    } <= d
+    assert dispatch_tenants["eu_inactive"] not in d
 
-    # Explicit region filters to that region's active tenants.
-    attempted.clear()
+    dispatched.clear()
     pull_compliance.dispatch_compliance_content_pulls(region="eu")
-    a = set(attempted)
-    assert dispatch_tenants["eu_1"] in a
-    assert dispatch_tenants["us_1"] not in a
+    d = set(dispatched)
+    assert dispatch_tenants["eu_1"] in d
+    assert dispatch_tenants["us_1"] not in d
 
 
 def test_dispatch_compliance_activity_default_dispatches_all_regions(
@@ -678,3 +671,421 @@ def test_validate_key_returns_five_bool_capability_shape() -> None:
         assert body["capabilities"]["mcp_connector"] is False
     finally:
         onboarding_routes.set_client_factory_for_test(None)
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Content stream ingestion tests (T5.2)
+#
+# Build-blind: the live Compliance API is stubbed (StubContentClient) and
+# MinIO storage is mocked (a fake store_fn) for the orchestration tests;
+# one integration test uses the REAL store_content + retrieve_content
+# round-trip (MinIO is in the test stack). Residue-immune: each test uses
+# a unique tenant + scoped DELETE teardown — never a global truncate.
+# ───────────────────────────────────────────────────────────────────────────
+
+from vargate_telemetry.anthropic import (  # noqa: E402
+    Chat,
+    ChatWithMessages,
+    Organization,
+    OrgUser,
+)
+
+_ORG_UUID = "91012d09-e48b-438e-a489-1bebfd8fa6f9"
+
+
+def _org_obj(uuid_: str = _ORG_UUID, name: str = "Acme Enterprise") -> Organization:
+    return Organization.model_validate(
+        {"uuid": uuid_, "name": name, "created_at": "2025-06-01T10:00:00Z"}
+    )
+
+
+def _orguser_obj(id_: str) -> OrgUser:
+    return OrgUser.model_validate(
+        {
+            "id": id_,
+            "full_name": "Test User",
+            "email": "user@example.com",
+            "organization_role": "user",
+            "created_at": "2025-06-01T10:00:00Z",
+        }
+    )
+
+
+def _chat_obj(
+    id_: str,
+    user_id: str,
+    *,
+    updated_at: str,
+    deleted_at: Optional[str] = None,
+) -> Chat:
+    return Chat.model_validate(
+        {
+            "id": id_,
+            "name": "Requirements chat",
+            "created_at": "2026-05-01T00:00:00Z",
+            "updated_at": updated_at,
+            "deleted_at": deleted_at,
+            "model": "claude-opus-4-7",
+            "organization_uuid": _ORG_UUID,
+            "project_id": None,
+            "user": {"id": user_id, "email_address": "user@example.com"},
+        }
+    )
+
+
+def _chat_messages_obj(
+    chat_id: str, user_id: str, messages: list[dict]
+) -> ChatWithMessages:
+    return ChatWithMessages.model_validate(
+        {
+            "id": chat_id,
+            "created_at": "2026-05-01T00:00:00Z",
+            "user": {"id": user_id, "email_address": "user@example.com"},
+            "chat_messages": messages,
+        }
+    )
+
+
+def _msg_dict(
+    id_: str,
+    role: str,
+    text: Optional[str],
+    created_at: str = "2026-05-01T00:00:01Z",
+) -> dict:
+    content = [] if text is None else [{"type": "text", "text": text}]
+    return {
+        "id": id_,
+        "role": role,
+        "created_at": created_at,
+        "content": content,
+    }
+
+
+class StubContentClient:
+    """Stands in for a compliance-keyed AnthropicAdminClient — drives the
+    orgs → users → chats → messages walk from in-memory fixtures."""
+
+    def __init__(
+        self,
+        *,
+        orgs: list[Organization],
+        users_by_org: dict[str, list[OrgUser]],
+        chats: list[Chat],
+        messages_by_chat: dict[str, ChatWithMessages],
+        orgs_raises: Optional[BaseException] = None,
+    ) -> None:
+        self._orgs = orgs
+        self._users_by_org = users_by_org
+        self._chats = chats
+        self._messages_by_chat = messages_by_chat
+        self._orgs_raises = orgs_raises
+        self.closed = False
+
+    def list_organizations(self) -> Iterator[Organization]:
+        if self._orgs_raises is not None:
+            raise self._orgs_raises
+        return iter(self._orgs)
+
+    def list_organization_users(
+        self, org_uuid: str, *, limit: Optional[int] = None
+    ) -> Iterator[OrgUser]:
+        return iter(self._users_by_org.get(org_uuid, []))
+
+    def list_chats(self, *, user_ids, updated_at_gte=None, **_kw):
+        wanted = set(user_ids)
+        return iter([c for c in self._chats if c.user.id in wanted])
+
+    def get_chat_messages(self, chat_id: str) -> ChatWithMessages:
+        return self._messages_by_chat[chat_id]
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _single_chat_stub(
+    *,
+    messages: list[dict],
+    chat_id: str = "claude_chat_T1",
+    user_id: str = "user_T1",
+    updated_at: str = "2026-05-20T10:00:00Z",
+    deleted_at: Optional[str] = None,
+) -> StubContentClient:
+    chat = _chat_obj(
+        chat_id, user_id, updated_at=updated_at, deleted_at=deleted_at
+    )
+    return StubContentClient(
+        orgs=[_org_obj()],
+        users_by_org={_ORG_UUID: [_orguser_obj(user_id)]},
+        chats=[chat],
+        messages_by_chat={
+            chat_id: _chat_messages_obj(chat_id, user_id, messages)
+        },
+    )
+
+
+def _fake_store(tenant_id: str, plaintext: bytes) -> tuple[str, bytes, int]:
+    """Mock store_content: real 32-byte SHA-256 (append validates len),
+    deterministic ref, no MinIO."""
+    h = hashlib.sha256(plaintext).digest()
+    return f"2026/05/20/{h.hex()[:24]}.enc", h, len(plaintext)
+
+
+@pytest.fixture
+def content_tenant() -> Iterator[str]:
+    """Unique tenant + DEK for content tests; scoped DELETE teardown.
+    Never a global truncate (residue-immune, per memory)."""
+    from vargate_telemetry.crypto.seal import provision_tenant_dek
+    from vargate_telemetry.db import engine
+
+    tid = f"tnt_eu_cc_{uuid.uuid4().hex[:12]}"
+    with engine.begin() as conn:
+        conn.execute(
+            sql_text(
+                "INSERT INTO tenants (tenant_id, region, active, "
+                "billing_status) VALUES (:t, 'eu', true, 'paying')"
+            ),
+            {"t": tid},
+        )
+    provision_tenant_dek(tid)
+    yield tid
+    with engine.begin() as conn:
+        for tbl in (
+            "telemetry_records",
+            "pull_state",
+            "encrypted_secrets",
+            "tenant_deks",
+            "tenants",
+        ):
+            conn.execute(
+                sql_text(f"DELETE FROM {tbl} WHERE tenant_id = :t"),
+                {"t": tid},
+            )
+
+
+def _content_rows(tenant_id: str) -> list:
+    from vargate_telemetry.db import session_scope
+
+    with session_scope(tenant_id) as s:
+        return s.execute(
+            sql_text(
+                # The DB column is `metadata` (mapped to the ORM attribute
+                # `record_metadata`; `metadata` is reserved in SQLAlchemy
+                # declarative). Alias it back for ergonomic row access.
+                "SELECT external_id, record_type, source_api, content_ref, "
+                "content_size_bytes, metadata AS record_metadata "
+                "FROM telemetry_records WHERE tenant_id = :t "
+                "AND source_api = 'compliance_content' ORDER BY chain_seq"
+            ),
+            {"t": tenant_id},
+        ).all()
+
+
+def test_pull_content_happy_path(content_tenant: str) -> None:
+    from vargate_telemetry.tasks.pull_compliance import (
+        _pull_content_for_tenant,
+    )
+
+    stub = _single_chat_stub(
+        messages=[
+            _msg_dict("msg_1", "user", "Help me draft requirements?"),
+            _msg_dict("msg_2", "assistant", "Sure, here's a draft..."),
+        ]
+    )
+    result = _pull_content_for_tenant(
+        content_tenant, client=stub, store_fn=_fake_store
+    )
+    assert result == {
+        "content_pulled": 2,
+        "content_deduped": 0,
+        "status": "ok",
+    }
+    assert stub.closed is False  # injected client not owned/closed by us
+
+    rows = _content_rows(content_tenant)
+    assert {r.external_id for r in rows} == {"msg_1", "msg_2"}
+    assert all(r.record_type == "chat_message" for r in rows)
+    assert all(
+        r.content_ref and r.content_ref.endswith(".enc") for r in rows
+    )
+    assert all(
+        r.content_size_bytes and r.content_size_bytes > 0 for r in rows
+    )
+    by_id = {r.external_id: r.record_metadata for r in rows}
+    assert by_id["msg_1"]["chat_id"] == "claude_chat_T1"
+    assert by_id["msg_1"]["role"] == "user"
+    assert by_id["msg_2"]["role"] == "assistant"
+
+
+def test_pull_content_dedups_on_rerun(content_tenant: str) -> None:
+    from vargate_telemetry.tasks.pull_compliance import (
+        _pull_content_for_tenant,
+    )
+
+    msgs = [
+        _msg_dict("msg_A", "user", "first"),
+        _msg_dict("msg_B", "assistant", "second"),
+    ]
+    first = _pull_content_for_tenant(
+        content_tenant, client=_single_chat_stub(messages=msgs),
+        store_fn=_fake_store,
+    )
+    assert first["content_pulled"] == 2
+    # Same messages again: the per-message existence check dedups all.
+    second = _pull_content_for_tenant(
+        content_tenant, client=_single_chat_stub(messages=msgs),
+        store_fn=_fake_store,
+    )
+    assert second == {
+        "content_pulled": 0,
+        "content_deduped": 2,
+        "status": "ok",
+    }
+    assert len(_content_rows(content_tenant)) == 2
+
+
+def test_pull_content_soft_skips_when_no_key(content_tenant: str) -> None:
+    """No client injected + no Compliance Access Key sealed →
+    compliance_client_for_tenant raises LookupError → soft skip."""
+    from vargate_telemetry.tasks.pull_compliance import (
+        _pull_content_for_tenant,
+    )
+
+    result = _pull_content_for_tenant(content_tenant)  # builds its own client
+    assert result["status"] == "no_content_key"
+    assert result["content_pulled"] == 0
+    assert _content_rows(content_tenant) == []
+
+
+def test_pull_content_soft_skips_on_403(content_tenant: str) -> None:
+    from vargate_telemetry.tasks.pull_compliance import (
+        _pull_content_for_tenant,
+    )
+
+    stub = StubContentClient(
+        orgs=[],
+        users_by_org={},
+        chats=[],
+        messages_by_chat={},
+        orgs_raises=InsufficientScope("forbidden"),
+    )
+    result = _pull_content_for_tenant(
+        content_tenant, client=stub, store_fn=_fake_store
+    )
+    assert result["status"] == "no_content_access"
+    assert _content_rows(content_tenant) == []
+
+
+def test_pull_content_advances_cursor(content_tenant: str) -> None:
+    from vargate_telemetry.db import session_scope
+    from vargate_telemetry.tasks.pull_compliance import (
+        SOURCE_API_CONTENT,
+        _pull_content_for_tenant,
+    )
+
+    stub = _single_chat_stub(
+        messages=[_msg_dict("msg_C", "user", "hello")],
+        updated_at="2026-05-25T12:00:00Z",
+    )
+    _pull_content_for_tenant(content_tenant, client=stub, store_fn=_fake_store)
+    with session_scope(content_tenant) as s:
+        row = s.execute(
+            sql_text(
+                "SELECT cursor, last_status FROM pull_state "
+                "WHERE tenant_id = :t AND source_api = :sa"
+            ),
+            {"t": content_tenant, "sa": SOURCE_API_CONTENT},
+        ).first()
+    assert row is not None
+    assert row.last_status == "ok"
+    assert datetime.fromisoformat(row.cursor) == datetime(
+        2026, 5, 25, 12, 0, tzinfo=timezone.utc
+    )
+
+
+def test_pull_content_flags_soft_deleted_chat(content_tenant: str) -> None:
+    from vargate_telemetry.tasks.pull_compliance import (
+        _pull_content_for_tenant,
+    )
+
+    stub = _single_chat_stub(
+        messages=[_msg_dict("msg_D", "user", "in a deleted chat")],
+        deleted_at="2026-05-26T09:00:00Z",
+    )
+    _pull_content_for_tenant(content_tenant, client=stub, store_fn=_fake_store)
+    rows = _content_rows(content_tenant)
+    assert len(rows) == 1
+    assert rows[0].record_metadata["chat_deleted_at"].startswith("2026-05-26")
+
+
+def test_pull_content_skips_textless_message(content_tenant: str) -> None:
+    from vargate_telemetry.tasks.pull_compliance import (
+        _pull_content_for_tenant,
+    )
+
+    stub = _single_chat_stub(
+        messages=[
+            _msg_dict("msg_text", "user", "has text"),
+            _msg_dict("msg_empty", "user", None),  # file-only / no text
+        ]
+    )
+    result = _pull_content_for_tenant(
+        content_tenant, client=stub, store_fn=_fake_store
+    )
+    assert result["content_pulled"] == 1
+    assert {r.external_id for r in _content_rows(content_tenant)} == {
+        "msg_text"
+    }
+
+
+def test_pull_content_real_storage_roundtrip(content_tenant: str) -> None:
+    """Integration: real store_content (DEK + MinIO). The stored blob
+    decrypts back to the message text and the record points at it. The
+    Anthropic side stays stubbed (build-blind) — only local storage real."""
+    from vargate_telemetry.storage.content import retrieve_content
+    from vargate_telemetry.tasks.pull_compliance import (
+        _pull_content_for_tenant,
+    )
+
+    text = "A real message stored end to end."
+    stub = _single_chat_stub(messages=[_msg_dict("msg_real", "user", text)])
+    # No store_fn => real store_content path.
+    result = _pull_content_for_tenant(content_tenant, client=stub)
+    assert result["content_pulled"] == 1
+
+    rows = _content_rows(content_tenant)
+    assert len(rows) == 1
+    content_ref = rows[0].content_ref
+    assert content_ref
+    assert (
+        retrieve_content(content_tenant, content_ref).decode("utf-8") == text
+    )
+
+
+def test_compliance_client_for_tenant_builds_from_sealed_key(
+    content_tenant: str,
+) -> None:
+    from vargate_telemetry.anthropic import (
+        ANTHROPIC_COMPLIANCE_KEY_SECRET,
+        compliance_client_for_tenant,
+    )
+    from vargate_telemetry.crypto.seal import seal_secret
+
+    seal_secret(
+        content_tenant,
+        ANTHROPIC_COMPLIANCE_KEY_SECRET,
+        b"sk-ant-api01-sealedkey",
+    )
+    client = compliance_client_for_tenant(content_tenant, min_wait=0.0)
+    try:
+        assert client._client.headers["x-api-key"] == "sk-ant-api01-sealedkey"
+    finally:
+        client.close()
+
+
+def test_compliance_client_for_tenant_lookuperror_without_key(
+    content_tenant: str,
+) -> None:
+    from vargate_telemetry.anthropic import compliance_client_for_tenant
+
+    with pytest.raises(LookupError):
+        compliance_client_for_tenant(content_tenant)

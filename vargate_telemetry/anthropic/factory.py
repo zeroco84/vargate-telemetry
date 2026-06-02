@@ -61,3 +61,34 @@ def admin_client_for_tenant(
         "utf-8"
     )
     return AnthropicAdminClient(api_key=api_key, **client_kwargs)
+
+
+def compliance_client_for_tenant(
+    tenant_id: str,
+    **client_kwargs: Any,
+) -> AnthropicAdminClient:
+    """Build a client pre-loaded with the tenant's Compliance Access Key.
+
+    Mirrors ``admin_client_for_tenant`` but reads the
+    ``anthropic_compliance_access_key`` secret (sealed by the TM5 T5.1
+    onboarding flow). T5.2's content pull calls this once per tenant.
+
+    The same ``AnthropicAdminClient`` class carries either key type —
+    the key only determines which endpoints succeed (the Compliance
+    Access Key reaches `/v1/compliance/apps/chats/*` content; an Admin
+    key would 403 there).
+
+    Raises ``LookupError`` (propagated from ``unseal_secret``) when the
+    tenant has no DEK provisioned **or** no Compliance Access Key sealed
+    — i.e. the tenant hasn't completed the T5.1 onboarding step. The
+    content pull treats that as a soft skip, not an error.
+
+    Callers MUST NOT persist or log the returned key.
+    """
+    if not tenant_id:
+        raise ValueError("tenant_id required")
+
+    api_key = unseal_secret(
+        tenant_id, ANTHROPIC_COMPLIANCE_KEY_SECRET
+    ).decode("utf-8")
+    return AnthropicAdminClient(api_key=api_key, **client_kwargs)

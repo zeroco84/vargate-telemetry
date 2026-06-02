@@ -15,21 +15,25 @@ two-endpoint-family split:
     fan-out.
   - **Content endpoints** (``/v1/compliance/apps/chats/*``). Require a
     separate **Compliance Access Key** (``sk-ant-api01-...``) created
-    in claude.ai by an Enterprise Primary Owner. T5.3 ships the
-    ``pull_content_for_tenant`` STUB — the function structure is in
-    place so the dispatcher can call it per-tenant, but the body
-    raises ``NotConfigured`` because no tenant has a sealed
-    Compliance Access Key yet. A future sprint adds the onboarding
-    flow that collects it and replaces the stub body.
+    in claude.ai by an Enterprise owner (collected via the TM5 T5.1
+    onboarding flow). ``pull_content_for_tenant`` (T5.2) walks orgs →
+    users → chats → messages and stores each message's TEXT encrypted
+    under the tenant DEK (MinIO via ``store_content``) with a
+    chain-bound ``telemetry_record``. A tenant with no sealed key
+    soft-skips (``status="no_content_key"``); the pull is **built
+    blind** (no sandbox Compliance Access Key yet) and unit-tested
+    against mocks — live-verify is deferred (Track-D-D4 style).
 
-Why a stub instead of just deleting the call site
-==================================================
+Content vs Activity Feed
+========================
 
-The dispatcher pattern below already iterates active tenants and
-fan-outs ``pull_content_for_tenant`` per row. When the Compliance
-Access Key flow lands, it's a single function-body fill-in here, not
-a dispatcher refactor. Documented inline so future-you doesn't think
-the stub is a forgotten TODO.
+Both streams share the per-tenant cursor model (``pull_state``,
+distinct ``source_api``) + the 600 rpm per-parent-org budget. The
+Content stream is per-MESSAGE grain (``external_id = message id``):
+messages are immutable, so dedup is clean and a chat that gains new
+messages re-surfaces (its ``updated_at`` advances past the cursor)
+and only the new messages append. Text-first — files / generated
+files / artifacts / projects are out of T5 read-first scope.
 
 Activity-type-agnostic ingest
 =============================
@@ -79,7 +83,7 @@ import hashlib
 import json
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from sqlalchemy import text as sql_text
 from sqlalchemy.exc import IntegrityError
@@ -89,11 +93,14 @@ from vargate_telemetry.anthropic import (
     AnthropicAdminClient,
     InsufficientScope,
     admin_client_for_tenant,
+    compliance_client_for_tenant,
 )
 from vargate_telemetry.celery_app import celery_app
 from vargate_telemetry.chain import append_telemetry_record
 from vargate_telemetry.db import scheduler_session_scope, session_scope
 from vargate_telemetry.metering import increment
+from vargate_telemetry.storage import object_store
+from vargate_telemetry.storage.content import store_content
 
 
 _log = logging.getLogger(__name__)
@@ -120,6 +127,18 @@ DEFAULT_INITIAL_LOOKBACK_DAYS = 1
 DEFAULT_PER_PAGE_LIMIT = 100
 MAX_PAGES_PER_INVOCATION = 50
 
+# Content stream (T5.2). First-run lookback for chats when no cursor
+# exists. Chats are lower-volume than activities, so a wider initial
+# window is fine.
+DEFAULT_CONTENT_LOOKBACK_DAYS = 30
+# The chats endpoint accepts 1–10 user_ids per call (Anthropic docs).
+USER_IDS_PER_CHATS_CALL = 10
+# Cap chats processed per invocation to bound per-tick work + respect the
+# 600 rpm per-parent-org budget the content stream SHARES with the
+# Activity Feed (each chat is 1 list page hit + 1 messages fetch).
+# Remainder rolls forward via the persisted cursor on the next tick.
+MAX_CHATS_PER_INVOCATION = 200
+
 
 # ───────────────────────────────────────────────────────────────────────────
 # Public exception types
@@ -129,10 +148,12 @@ MAX_PAGES_PER_INVOCATION = 50
 class NotConfigured(Exception):
     """The tenant has no sealed credential for this ingest stream.
 
-    Raised by ``pull_content_for_tenant`` when the tenant has no
-    Compliance Access Key sealed in ``encrypted_secrets``. The
-    dispatcher catches this and logs+skips; it is NOT a retryable
-    error.
+    Retained for back-compat. As of T5.2 the content pull no longer
+    raises this — it **soft-skips** instead, returning
+    ``{"status": "no_content_key"}`` when the tenant has no Compliance
+    Access Key sealed in ``encrypted_secrets`` (so a not-yet-onboarded
+    tenant doesn't generate a failed Celery task every tick). Kept as a
+    public symbol in case external callers still reference it.
     """
 
 
@@ -371,35 +392,277 @@ def _pull_activities_for_tenant(
 
 
 # ───────────────────────────────────────────────────────────────────────────
-# Content-stream stub — body lands in a future sprint
+# Content stream (T5.2) — chat message text capture
+#
+# Enumeration chain: organizations → users → chats → messages. The chats
+# endpoint requires ``user_ids[]`` (from the org-users endpoint, whose
+# ``{org_uuid}`` comes from the orgs endpoint), so a Compliance Access Key
+# used here needs BOTH ``read:compliance_org_data`` and
+# ``read:compliance_user_data`` — confirmed at T5.1 onboarding, re-checked
+# by the 403 soft-skip here. Per-message grain (external_id = message id):
+# messages are immutable, so dedup is clean and a chat that gains new
+# messages re-surfaces (its ``updated_at`` advances past the cursor) and
+# its new messages append while the old ones dedup.
+#
+# Scope: chat + message TEXT only. Files / generated files / artifacts /
+# projects are out of T5 read-first scope (a text-less message is skipped,
+# not stored). Hard-deleted chats never appear in list_chats; soft-deleted
+# ones (``deleted_at`` set) ARE captured, with the flag in metadata.
 # ───────────────────────────────────────────────────────────────────────────
 
 
-def _pull_content_for_tenant(tenant_id: str) -> dict[str, Any]:
-    """Stub for the content ingestion stream (T5.x).
+def _message_text(msg: Any) -> str:
+    """Join the text content blocks of one chat message.
 
-    Raises ``NotConfigured`` because today's onboarding doesn't
-    collect a Compliance Access Key. The dispatcher pattern below
-    already calls this per-tenant; when the Compliance Access Key
-    onboarding flow lands, this stub's body is replaced with the
-    real ``client.list_chats`` → ``get_chat_messages`` →
-    ``store_content`` → ``append_telemetry_record`` pipeline.
+    Text-first: only ``type=='text'`` blocks with non-empty ``text``
+    contribute. Files / tool blocks / artifacts are ignored here (later
+    sprint). Returns ``""`` for a message with no text content.
+    """
+    parts = [
+        b.text
+        for b in (msg.content or [])
+        if getattr(b, "type", None) == "text" and getattr(b, "text", None)
+    ]
+    return "\n\n".join(parts)
 
-    Why a stub, not just an omission: keeping the function shape
-    here means the dispatcher's iteration loop doesn't need to grow
-    a conditional branch for "is content stream wired yet?" — it
-    just catches ``NotConfigured`` and skips. The control flow at
-    activation time is "remove the raise, fill in the body" rather
-    than "thread a new task name through the dispatcher."
+
+def _content_metadata(chat: Any, msg: Any) -> dict[str, Any]:
+    """The searchable envelope stored alongside the encrypted message text.
+
+    Carries chat-level context (so the T5.3 view can group messages by
+    chat) + the soft-delete flag. The message TEXT itself is NOT here —
+    it's the encrypted MinIO blob referenced by ``content_ref``.
+    """
+    md: dict[str, Any] = {
+        "chat_id": chat.id,
+        "message_id": msg.id,
+        "role": msg.role,
+    }
+    if chat.name is not None:
+        md["chat_name"] = chat.name
+    if chat.model is not None:
+        md["model"] = chat.model
+    if chat.project_id is not None:
+        md["project_id"] = chat.project_id
+    if chat.organization_uuid is not None:
+        md["organization_uuid"] = chat.organization_uuid
+    if chat.user is not None:
+        md["user_id"] = chat.user.id
+        md["user_email"] = chat.user.email_address
+    # Soft-deleted chats are captured WITH the flag (hard-deleted chats
+    # never appear in list_chats at all, so they're simply absent).
+    if chat.deleted_at is not None:
+        md["chat_deleted_at"] = chat.deleted_at.isoformat()
+    return md
+
+
+def _chunks(seq: list[Any], size: int) -> Iterator[list[Any]]:
+    """Yield successive ``size``-length slices of ``seq``."""
+    for i in range(0, len(seq), size):
+        yield seq[i : i + size]
+
+
+def _pull_content_for_tenant(
+    tenant_id: str,
+    *,
+    since: Optional[datetime] = None,
+    client: Optional[AnthropicAdminClient] = None,
+    store_fn: Optional[Callable[[str, bytes], tuple[str, bytes, int]]] = None,
+) -> dict[str, Any]:
+    """Pull chat message content since the cursor; encrypt + persist.
+
+    Walks orgs → users → chats → messages: enumerate every org's users,
+    list each user's chats updated since the cursor, fetch each chat's
+    messages, and for every not-yet-stored message store the text under
+    the tenant DEK (AES-GCM → MinIO via ``store_content``) + append a
+    chain-bound ``telemetry_record`` (``source_api='compliance_content'``,
+    ``record_type='chat_message'``, with ``content_ref`` + ``content_hash``).
+
+    Returns ``{"content_pulled": N, "content_deduped": M, "status": "ok"}``.
+
+    Soft skips (return cleanly, NOT a Celery retry):
+      - ``status="no_content_key"`` — no Compliance Access Key sealed
+        (tenant hasn't completed the T5.1 onboarding step).
+      - ``status="no_content_access"`` — the key 403s on a content /
+        org-data endpoint (wrong scope or plan tier).
+
+    ``since`` overrides the cursor (tests / re-ingest tooling). ``client``
+    and ``store_fn`` are injectable seams for tests (avoid live Anthropic
+    + live MinIO respectively).
     """
     if not tenant_id:
         raise ValueError("tenant_id required")
-    raise NotConfigured(
-        f"Compliance Access Key not configured for tenant {tenant_id!r}. "
-        "Content ingestion requires a separate sk-ant-api01-* key "
-        "provisioned via the (future) compliance-access-key onboarding "
-        "flow. Activity Feed ingest is unaffected."
-    )
+
+    store = store_fn if store_fn is not None else store_content
+
+    # Build the client unless injected. No sealed key => soft skip.
+    owned_client = client is None
+    if owned_client:
+        try:
+            client = compliance_client_for_tenant(tenant_id)
+        except LookupError:
+            _log.info(
+                "pull_content: no Compliance Access Key for %s; skipping",
+                tenant_id,
+            )
+            return {
+                "content_pulled": 0,
+                "content_deduped": 0,
+                "status": "no_content_key",
+            }
+
+    # Cursor is the updated_at high-water mark: a chat that gains new
+    # messages re-surfaces because its updated_at advances past it.
+    if since is not None:
+        starting_at = since
+    else:
+        with session_scope(tenant_id) as s:
+            cursor = _load_cursor(s, tenant_id, SOURCE_API_CONTENT)
+        starting_at = cursor or (
+            _now() - timedelta(days=DEFAULT_CONTENT_LOOKBACK_DAYS)
+        )
+
+    pull_started = _now()
+    content_pulled = 0
+    content_deduped = 0
+    max_updated_seen = starting_at
+    chats_processed = 0
+
+    try:
+        try:
+            # 1. Enumerate every org's users -> the user_ids[] chats needs.
+            user_ids: list[str] = []
+            for org in client.list_organizations():
+                for user in client.list_organization_users(org.uuid):
+                    user_ids.append(user.id)
+            user_ids = list(dict.fromkeys(user_ids))  # dedup, keep order
+
+            # 2. List chats updated since the cursor, in <=10-user batches.
+            stop = False
+            for batch in _chunks(user_ids, USER_IDS_PER_CHATS_CALL):
+                if stop:
+                    break
+                for chat in client.list_chats(
+                    user_ids=batch, updated_at_gte=starting_at
+                ):
+                    chat_updated = chat.updated_at or chat.created_at
+                    if chat_updated and chat_updated > max_updated_seen:
+                        max_updated_seen = chat_updated
+
+                    # 3. Fetch the chat's messages; store the new ones.
+                    detail = client.get_chat_messages(chat.id)
+                    msgs = detail.chat_messages or []
+                    if msgs:
+                        msg_ids = [m.id for m in msgs]
+                        with session_scope(tenant_id) as s:
+                            existing = {
+                                r.external_id
+                                for r in s.execute(
+                                    sql_text(
+                                        "SELECT external_id FROM "
+                                        "telemetry_records WHERE "
+                                        "tenant_id = :t AND source_api = :s "
+                                        "AND external_id = ANY(:ids)"
+                                    ),
+                                    {
+                                        "t": tenant_id,
+                                        "s": SOURCE_API_CONTENT,
+                                        "ids": msg_ids,
+                                    },
+                                )
+                            }
+                        for msg in msgs:
+                            if msg.id in existing:
+                                content_deduped += 1
+                                continue
+                            text = _message_text(msg)
+                            if not text:
+                                # Text-first: nothing to capture (e.g. a
+                                # file-only message). Skip, don't store.
+                                continue
+                            content_ref, content_hash, size = store(
+                                tenant_id, text.encode("utf-8")
+                            )
+                            try:
+                                append_telemetry_record(
+                                    tenant_id,
+                                    record_type="chat_message",
+                                    source_api=SOURCE_API_CONTENT,
+                                    external_id=msg.id,
+                                    occurred_at=msg.created_at,
+                                    content_hash=content_hash,
+                                    content_ref=content_ref,
+                                    content_size_bytes=size,
+                                    subject_user_id=(
+                                        chat.user.id if chat.user else None
+                                    ),
+                                    record_metadata=_content_metadata(
+                                        chat, msg
+                                    ),
+                                )
+                                increment(tenant_id, "chat_message")
+                                content_pulled += 1
+                            except IntegrityError:
+                                # Race: a concurrent worker inserted this
+                                # message between the existence check and
+                                # the append. Drop the orphan blob we just
+                                # wrote and count the dedup.
+                                content_deduped += 1
+                                try:
+                                    object_store.delete_content(
+                                        tenant_id, content_ref
+                                    )
+                                except Exception:
+                                    _log.warning(
+                                        "pull_content: orphan blob cleanup "
+                                        "failed for %s/%s",
+                                        tenant_id,
+                                        content_ref,
+                                    )
+
+                    chats_processed += 1
+                    if chats_processed >= MAX_CHATS_PER_INVOCATION:
+                        _log.warning(
+                            "pull_content: hit per-invocation chat cap "
+                            "(%d) for %s; advancing cursor, yielding to "
+                            "next tick",
+                            MAX_CHATS_PER_INVOCATION,
+                            tenant_id,
+                        )
+                        stop = True
+                        break
+        except InsufficientScope:
+            # Key lacks a compliance scope or the plan doesn't include
+            # the content API. Soft skip — don't retry.
+            _log.info(
+                "pull_content: 403 no_content_access for %s", tenant_id
+            )
+            return {
+                "content_pulled": 0,
+                "content_deduped": 0,
+                "status": "no_content_access",
+            }
+
+        # Advance the cursor. Use the max updated_at seen if we touched
+        # anything; else pull_started so we don't re-query an empty window.
+        new_cursor = (
+            max_updated_seen
+            if (content_pulled or content_deduped)
+            else pull_started
+        )
+        with session_scope(tenant_id) as s:
+            _save_cursor(
+                s, tenant_id, SOURCE_API_CONTENT, new_cursor, status="ok"
+            )
+    finally:
+        if owned_client:
+            client.close()
+
+    return {
+        "content_pulled": content_pulled,
+        "content_deduped": content_deduped,
+        "status": "ok",
+    }
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -424,17 +687,20 @@ def pull_activities_for_tenant(self, tenant_id: str) -> dict[str, Any]:
 
 @celery_app.task(
     bind=True,
-    max_retries=0,
+    max_retries=3,
     name="vargate_telemetry.tasks.pull_compliance.pull_content_for_tenant",
 )
 def pull_content_for_tenant(self, tenant_id: str) -> dict[str, Any]:
-    """Beat-dispatched per-tenant Content pull (T5.x).
-
-    Today: always raises ``NotConfigured``. The dispatcher catches
-    this and skips. Wrapped here as a Celery task so the dispatcher
-    fan-out signature is identical to other streams.
-    """
-    return _pull_content_for_tenant(tenant_id)
+    """Beat-dispatched per-tenant Content pull (T5.2). Retries on any
+    exception OTHER than the soft skips — ``no_content_key`` (no
+    Compliance Access Key sealed) and ``no_content_access`` (403) return
+    cleanly, so a tenant that simply hasn't onboarded the key doesn't
+    generate a failed-task every tick."""
+    try:
+        return _pull_content_for_tenant(tenant_id)
+    except Exception as exc:
+        _log.exception("pull_content failed for %s", tenant_id)
+        raise self.retry(exc=exc, countdown=120)
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -489,18 +755,16 @@ def dispatch_compliance_activity_pulls(region: Optional[str] = None) -> int:
     name="vargate_telemetry.tasks.pull_compliance.dispatch_compliance_content_pulls",
 )
 def dispatch_compliance_content_pulls(region: Optional[str] = None) -> int:
-    """Beat fan-out for the Content stream (T5.x).
+    """Beat fan-out for the Content stream (T5.2).
 
-    Today: every dispatched task immediately raises ``NotConfigured``
-    because no tenant has a sealed Compliance Access Key yet. The
-    dispatcher itself catches the raise inside the per-tenant task
-    and logs+skips — see ``pull_content_for_tenant``. We still queue
-    the tasks so the metrics show "N tenants attempted, N skipped"
-    rather than silently producing zero activity.
-
-    Future sprint: when the Compliance Access Key onboarding flow
-    lands, no change required here — the per-tenant task's body
-    starts succeeding and counts flow through.
+    Enumerates active tenants and queues one ``pull_content_for_tenant``
+    per row — identical fan-out shape to the Activity Feed dispatcher
+    (``.delay`` to a worker, not a synchronous in-beat call). A tenant
+    with no sealed Compliance Access Key soft-skips inside the per-tenant
+    task (``status="no_content_key"``), so dispatching every tenant is
+    cheap and correct — no failure metric, no retry, no per-tenant
+    capability state to track at dispatch (the dispatch-all-with-soft-skip
+    pattern; revisit at ~50 tenants).
     """
     # TM5 T5.0: default dispatches all active tenants; the region gap
     # (defaulting to VARGATE_REGION=us) silently skipped eu tenants.
@@ -521,28 +785,12 @@ def dispatch_compliance_content_pulls(region: Optional[str] = None) -> int:
                 {"r": region},
             ).all()
 
-    skipped = 0
     for row in rows:
-        # Call the pure-Python stub directly inside the dispatcher
-        # (rather than `.delay`-ing) so the NotConfigured raises here
-        # and we can count skips without polluting Celery's failure
-        # metrics with expected errors. When T5.x activates content
-        # ingestion, switch this to `.delay(row.tenant_id)`.
-        try:
-            _pull_content_for_tenant(row.tenant_id)
-        except NotConfigured as exc:
-            skipped += 1
-            _log.info(
-                "pull_content skipped for %s: %s",
-                row.tenant_id,
-                exc,
-            )
+        pull_content_for_tenant.delay(row.tenant_id)
 
     _log.info(
-        "dispatch_compliance_content_pulls: %d tenants, %d skipped "
-        "(no Compliance Access Key configured), region %s",
+        "dispatch_compliance_content_pulls: queued %d tenants in region %s",
         len(rows),
-        skipped,
         region or "all",
     )
     return len(rows)

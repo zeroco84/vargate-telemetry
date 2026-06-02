@@ -327,6 +327,8 @@ class AnthropicAdminClient:
         created_at_gt: Optional[datetime] = None,
         created_at_lte: Optional[datetime] = None,
         created_at_lt: Optional[datetime] = None,
+        updated_at_gte: Optional[datetime] = None,
+        updated_at_lte: Optional[datetime] = None,
         activity_types: Optional[list[str]] = None,
         actor_ids: Optional[list[str]] = None,
         organization_ids: Optional[list[str]] = None,
@@ -358,6 +360,10 @@ class AnthropicAdminClient:
             params.append(("created_at.lte", created_at_lte.isoformat()))
         if created_at_lt is not None:
             params.append(("created_at.lt", created_at_lt.isoformat()))
+        if updated_at_gte is not None:
+            params.append(("updated_at.gte", updated_at_gte.isoformat()))
+        if updated_at_lte is not None:
+            params.append(("updated_at.lte", updated_at_lte.isoformat()))
         for v in activity_types or ():
             params.append(("activity_types[]", v))
         for v in actor_ids or ():
@@ -426,6 +432,8 @@ class AnthropicAdminClient:
         project_ids: Optional[list[str]] = None,
         created_at_gte: Optional[datetime] = None,
         created_at_lte: Optional[datetime] = None,
+        updated_at_gte: Optional[datetime] = None,
+        updated_at_lte: Optional[datetime] = None,
         limit: Optional[int] = None,
     ) -> Iterator[Chat]:
         """Yield chat metadata records from
@@ -454,6 +462,8 @@ class AnthropicAdminClient:
             project_ids=project_ids,
             created_at_gte=created_at_gte,
             created_at_lte=created_at_lte,
+            updated_at_gte=updated_at_gte,
+            updated_at_lte=updated_at_lte,
             limit=limit,
         )
         yield from self._paginate_compliance_typed(
