@@ -2098,6 +2098,57 @@ paths:
         '500':
           $ref: '#/components/responses/InternalError'
 
+  /content/export:
+    get:
+      tags: [content]
+      summary: Export captured content as an eDiscovery bundle (admin)
+      description: |
+        TM6 T6.2 — admin only. Returns a downloadable ZIP bundle:
+        `manifest.json` (metadata + chain-verification summary),
+        `chats.json` (the captured chats with decrypted message text),
+        `chain_proof.json` (per-record hash-chain proof — chain_seq /
+        self_hash / prev_hash / content_hash + the GENESIS-to-tip
+        verify result), and a `README.txt` explaining how an auditor can
+        independently confirm the export wasn't altered. Scoped by tenant
+        (always) and optionally by data subject + date range. Purged
+        messages appear in the proof but without content.
+      operationId: exportContent
+      parameters:
+        - name: subject_user_id
+          in: query
+          required: false
+          schema:
+            type: string
+            minLength: 1
+        - name: start
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+        - name: end
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+      responses:
+        '200':
+          description: A ZIP bundle (manifest + chats + chain proof).
+          content:
+            application/zip:
+              schema:
+                type: string
+                format: binary
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
   /sessions:
     get:
       tags: [sessions]

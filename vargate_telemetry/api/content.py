@@ -34,14 +34,23 @@ content retriever. The decrypt-on-read path is also covered by a real
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Optional
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Path, Query, status
+from fastapi import (
+    APIRouter,
+    Body,
+    Depends,
+    HTTPException,
+    Path,
+    Query,
+    Response,
+    status,
+)
 from pydantic import BaseModel, Field
 from sqlalchemy import text as sql_text
 
-from vargate_telemetry import content_deletion
+from vargate_telemetry import content_deletion, content_export
 from vargate_telemetry.auth.middleware import AuthenticatedUser, current_user
 from vargate_telemetry.auth.roles import require_admin
 from vargate_telemetry.db import session_scope
@@ -495,3 +504,47 @@ def crypto_shred_tenant_endpoint(
         tenant_id, reason=req.reason, requested_by=user.user_id
     )
     return TenantShredResult(**result)
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# GET /content/export (T6.2) — eDiscovery bundle (admin)
+# ───────────────────────────────────────────────────────────────────────────
+
+
+@router.get(
+    "/content/export",
+    operation_id="exportContent",
+    tags=["content"],
+    summary="Export captured content as an eDiscovery bundle (admin)",
+    response_class=Response,
+    responses={
+        200: {
+            "description": "A ZIP bundle (manifest + chats + chain proof).",
+            "content": {"application/zip": {}},
+        }
+    },
+)
+def export_content(
+    subject_user_id: Optional[str] = Query(default=None, min_length=1),
+    start: Optional[datetime] = Query(default=None),
+    end: Optional[datetime] = Query(default=None),
+    user: AuthenticatedUser = Depends(require_admin),
+) -> Response:
+    """Build a downloadable ZIP: a manifest + the decrypted chats + a
+    hash-chain verification proof (so an auditor can independently confirm
+    the export wasn't altered — see the bundle's README). Scoped by tenant
+    (always, via RLS) + optional ``subject_user_id`` / ``start`` / ``end``.
+    Purged messages appear in the proof but carry no content."""
+    tenant_id = _require_tenant(user)
+    filename, payload = content_export.build_export_bundle(
+        tenant_id,
+        generated_at=datetime.now(timezone.utc),
+        subject_user_id=subject_user_id,
+        start=start,
+        end=end,
+    )
+    return Response(
+        content=payload,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
