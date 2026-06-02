@@ -1168,6 +1168,24 @@ components:
         alert_recipients:
           $ref: '#/components/schemas/AlertRecipients'
 
+    TestAlertResult:
+      type: object
+      required: [budget_id, channels_attempted, summary]
+      description: |
+        Result of a `POST /budgets/{id}/test-alert`. `channels_attempted`
+        lists the channels that had recipients (e.g. `["slack", "email"]`);
+        `summary` is the best-effort per-channel send outcome.
+      properties:
+        budget_id:
+          type: string
+        channels_attempted:
+          type: array
+          items:
+            type: string
+        summary:
+          type: object
+          additionalProperties: true
+
     BudgetDetail:
       allOf:
         - $ref: '#/components/schemas/Budget'
@@ -2585,6 +2603,41 @@ paths:
           $ref: '#/components/responses/Unauthenticated'
         '403':
           $ref: '#/components/responses/Forbidden'
+
+  /budgets/{budget_id}/test-alert:
+    post:
+      tags: [budgets]
+      summary: Send a synthetic [TEST] alert through a budget's channels (admin)
+      description: |
+        Fire a clearly-marked `[TEST]` budget alert through every channel
+        configured on the budget (email / Slack / PagerDuty), so an
+        operator can verify a webhook actually delivers before relying on
+        it. Best-effort — per-channel outcomes are in `summary`; the call
+        never fails because a channel did. `channels_attempted` is empty
+        when no channel has recipients.
+      operationId: testBudgetAlert
+      parameters:
+        - name: budget_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Per-channel dispatch result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TestAlertResult'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
 
   /budget-alerts:
     get:

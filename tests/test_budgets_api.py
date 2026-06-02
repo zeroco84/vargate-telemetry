@@ -1017,3 +1017,89 @@ def test_acknowledge_alert_404_when_already_acked(
     )
     assert r.status_code == 404
     assert r.json()["detail"]["code"] == "alert_not_found_or_already_acked"
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# POST /budgets/{id}/test-alert — fire a synthetic [TEST] alert (gap-close)
+# ───────────────────────────────────────────────────────────────────────────
+
+
+def _create_budget(client: TestClient, tenant: str, recipients: dict) -> str:
+    body = {
+        "name": "Test-alert cap",
+        "scope_kind": "tenant",
+        "scope_value": None,
+        "period": "monthly",
+        "threshold_usd": "100.00",
+        "alert_recipients": recipients,
+    }
+    r = client.post("/budgets", json=body, headers=_bearer(tenant))
+    assert r.status_code == 201, r.text
+    return r.json()["id"]
+
+
+def test_test_alert_dispatches_to_slack(
+    clean_budgets: None, client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import httpx
+
+    from vargate_telemetry.notify import slack as slack_mod
+
+    # Stub the one webhook POST so no real network — a 200 with a request
+    # set (raise_for_status needs the request instance).
+    monkeypatch.setattr(
+        slack_mod,
+        "_post",
+        lambda url, payload: httpx.Response(
+            200, request=httpx.Request("POST", url)
+        ),
+    )
+    tenant = "tnt_us_budget_testalert_slack"
+    _provision_tenant(tenant)
+    bid = _create_budget(
+        client,
+        tenant,
+        {"slack_webhook": ["https://hooks.slack.com/services/T/B/xyz"]},
+    )
+
+    r = client.post(f"/budgets/{bid}/test-alert", headers=_bearer(tenant))
+    assert r.status_code == 200, r.text
+    out = r.json()
+    assert out["channels_attempted"] == ["slack"]
+    assert out["summary"]["slack"][0]["status"] == "ok"
+
+
+def test_test_alert_with_no_recipients_attempts_nothing(
+    clean_budgets: None, client: TestClient
+) -> None:
+    tenant = "tnt_us_budget_testalert_none"
+    _provision_tenant(tenant)
+    bid = _create_budget(client, tenant, {})
+    r = client.post(f"/budgets/{bid}/test-alert", headers=_bearer(tenant))
+    assert r.status_code == 200, r.text
+    assert r.json()["channels_attempted"] == []
+
+
+def test_test_alert_forbidden_for_member(
+    clean_budgets: None, client: TestClient
+) -> None:
+    tenant = "tnt_us_budget_testalert_member"
+    _provision_tenant(tenant)
+    bid = _create_budget(client, tenant, {})
+    member = _provision_user(tenant, role="member")
+    r = client.post(
+        f"/budgets/{bid}/test-alert", headers=_bearer(tenant, member)
+    )
+    assert r.status_code == 403, r.text
+
+
+def test_test_alert_unknown_budget_404(
+    clean_budgets: None, client: TestClient
+) -> None:
+    tenant = "tnt_us_budget_testalert_404"
+    _provision_tenant(tenant)
+    r = client.post(
+        f"/budgets/{uuid.uuid4()}/test-alert", headers=_bearer(tenant)
+    )
+    assert r.status_code == 404, r.text
+    assert r.json()["detail"]["code"] == "budget_not_found"

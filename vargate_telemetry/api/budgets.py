@@ -558,6 +558,87 @@ def update_budget(
     return _row_to_budget_out(result)
 
 
+class TestAlertResult(BaseModel):
+    budget_id: str
+    # Channels that had recipients + were attempted (e.g. ["slack", "email"]).
+    channels_attempted: list[str]
+    # Per-channel send result (best-effort; from send_budget_alert).
+    summary: dict[str, Any]
+
+
+@router.post(
+    "/budgets/{budget_id}/test-alert",
+    response_model=TestAlertResult,
+    operation_id="testBudgetAlert",
+    tags=["budgets"],
+    summary="Send a synthetic [TEST] alert through a budget's channels (admin)",
+)
+def test_budget_alert(
+    budget_id: UUID = Path(...),
+    user: AuthenticatedUser = Depends(require_admin),
+) -> TestAlertResult:
+    """Fire a clearly-marked ``[TEST]`` budget alert through every channel
+    configured on the budget (email / Slack / PagerDuty) so an operator
+    can verify a webhook actually delivers before relying on it.
+    Best-effort: per-channel outcomes are in ``summary``; the call never
+    fails because a channel did. ``channels_attempted`` is empty when no
+    channel has recipients configured."""
+    from datetime import date
+    from decimal import Decimal
+
+    from vargate_telemetry.notify.budget_alert import (
+        BudgetAlertContext,
+        send_budget_alert,
+    )
+
+    tenant_id = _require_tenant(user)
+    with session_scope(tenant_id) as s:
+        row = s.execute(
+            sql_text(
+                """
+                SELECT name, scope_kind, scope_value, period,
+                       threshold_usd, alert_recipients
+                FROM budgets
+                WHERE id = :id AND deleted_at IS NULL
+                """
+            ),
+            {"id": str(budget_id)},
+        ).first()
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "code": "budget_not_found",
+                "message": f"No live budget with id {budget_id}.",
+            },
+        )
+
+    today = date.today()
+    scope_label = (
+        f"all of {tenant_id}"
+        if row.scope_kind == "tenant"
+        else f"{row.scope_kind}={row.scope_value}"
+    )
+    threshold = Decimal(str(row.threshold_usd))
+    ctx = BudgetAlertContext(
+        budget_name=f"[TEST] {row.name}",
+        scope_kind=row.scope_kind,
+        scope_label=scope_label,
+        period=row.period,
+        period_start=today,
+        period_end=today,
+        threshold_crossed=Decimal("1.00"),
+        threshold_usd=threshold,
+        current_spend_usd=threshold,
+    )
+    summary = send_budget_alert(row.alert_recipients, ctx)
+    return TestAlertResult(
+        budget_id=str(budget_id),
+        channels_attempted=list(summary.keys()),
+        summary=summary,
+    )
+
+
 @router.delete(
     "/budgets/{budget_id}",
     status_code=status.HTTP_204_NO_CONTENT,

@@ -17,11 +17,20 @@ A budget's `alert_recipients` is a JSONB object:
 }
 ```
 
-Set it in the dashboard: **Budgets → New budget** (or edit) → the
-Email / Slack / PagerDuty fields (comma- or space-separated). Any channel
-can be empty. Validation rejects malformed values up front (422):
-non-email addresses, Slack URLs that aren't `https://hooks.slack.com/…`,
-empty/whitespace PagerDuty keys, and unknown channel keys.
+Set it in the dashboard at create time (**Budgets → New budget** → the
+Email / Slack / PagerDuty fields) and edit it later on the budget's
+detail page: **Budgets → (a budget) → Alert channels → Edit** (admins),
+which `PATCH`es `alert_recipients`. Values are comma- or space-separated;
+any channel can be empty. Validation rejects malformed values up front
+(422): non-email addresses, Slack URLs that aren't
+`https://hooks.slack.com/…`, empty/whitespace PagerDuty keys, and unknown
+channel keys.
+
+**Verify a channel works:** the budget detail page has a **Send test
+alert** button (admins) → `POST /budgets/{id}/test-alert`. It fires a
+clearly-marked `[TEST]` alert through every configured channel so you can
+confirm a webhook delivers *before* relying on it. Best-effort; the
+response lists which channels were attempted.
 
 | Channel | What's sent | How to get the credential |
 |---|---|---|
@@ -69,7 +78,11 @@ dropped, lossy by design).
 
 - `vargate_telemetry/notify/budget_alert.py` (`send_budget_alert` dispatch),
   `notify/slack.py`, `notify/pagerduty.py`, `notify/email.py`.
-- `vargate_telemetry/api/budgets.py` (`AlertRecipients` model + validation).
+- `vargate_telemetry/api/budgets.py` (`AlertRecipients` model + validation;
+  `PATCH /budgets/{id}` edits channels; `POST /budgets/{id}/test-alert`
+  fires a synthetic `[TEST]` alert).
 - `vargate_telemetry/tasks/evaluate_budgets.py` (the evaluator that calls it).
 - Frontend: `apps/ogma-dashboard/src/pages/dashboard/Budgets.tsx` (create
-  form), `BudgetDetail.tsx` (per-channel summary), `lib/budgets.ts`.
+  form), `BudgetDetail.tsx` (`AlertChannelsCard` — per-channel summary +
+  admin edit form + Send-test-alert), `lib/budgets.ts`
+  (`updateBudget` / `sendTestAlert`).
