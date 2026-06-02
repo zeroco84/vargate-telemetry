@@ -97,6 +97,10 @@ services:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
       MINIO_TENANT_CONTENT_BUCKET: ${MINIO_TENANT_CONTENT_BUCKET:-tenant-content}
+      # TM6 T6.0: when set, the bootstrap creates a scoped service
+      # account with these creds (Put/Get/Delete on the content bucket).
+      OGMA_MINIO_ACCESS_KEY: ${OGMA_MINIO_ACCESS_KEY:-}
+      OGMA_MINIO_SECRET_KEY: ${OGMA_MINIO_SECRET_KEY:-}
     networks:
       - telemetry_internal
     entrypoint:
@@ -112,6 +116,23 @@ services:
         # No lifecycle policy: tenant content retention is governed by
         # explicit code paths (T5+ delete on `account_deleted`), not by
         # MinIO auto-expiry. A future crypto-shred PRD lands here.
+        # TM6 T6.0: create a least-privilege service account scoped to
+        # the content bucket (Put/Get/Delete on tenant-content/* only —
+        # no ListBucket, no admin). Idempotent; only when scoped creds
+        # are provided (else the app falls back to root). mc svcacct
+        # syntax verified live at the TM6 deploy.
+        if [ -n "$${OGMA_MINIO_ACCESS_KEY:-}" ]; then
+          echo "▶ ensuring scoped content service account"
+          printf '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:PutObject","s3:GetObject","s3:DeleteObject"],"Resource":["arn:aws:s3:::%s/*"]}]}' "$${MINIO_TENANT_CONTENT_BUCKET}" > /tmp/ogma-content-policy.json
+          if mc admin user svcacct info ogma "$${OGMA_MINIO_ACCESS_KEY}" >/dev/null 2>&1; then
+            mc admin user svcacct edit --policy /tmp/ogma-content-policy.json ogma "$${OGMA_MINIO_ACCESS_KEY}"
+          else
+            mc admin user svcacct add --access-key "$${OGMA_MINIO_ACCESS_KEY}" --secret-key "$${OGMA_MINIO_SECRET_KEY}" --policy /tmp/ogma-content-policy.json ogma "$${MINIO_ROOT_USER}"
+          fi
+          echo "✓ scoped content svcacct ready"
+        else
+          echo "▶ OGMA_MINIO_ACCESS_KEY unset — skipping scoped svcacct (root fallback)"
+        fi
         echo "▶ bucket inventory:"
         mc ls "ogma/$${MINIO_TENANT_CONTENT_BUCKET}" || true
         echo "✓ minio-bootstrap done"
@@ -195,6 +216,11 @@ services:
       # account with PutObject/GetObject on `tenant-content/*` only.
       MINIO_ENDPOINT: ${MINIO_ENDPOINT:-http://minio:9000}
       MINIO_TENANT_CONTENT_BUCKET: ${MINIO_TENANT_CONTENT_BUCKET:-tenant-content}
+      # TM6 T6.0: scoped MinIO service account (Put/Get/Delete on
+      # tenant-content/* only — object_store prefers these when set).
+      # Root creds below stay as the pre-migration / dev fallback.
+      OGMA_MINIO_ACCESS_KEY: ${OGMA_MINIO_ACCESS_KEY:-}
+      OGMA_MINIO_SECRET_KEY: ${OGMA_MINIO_SECRET_KEY:-}
       MINIO_ROOT_USER: ${MINIO_ROOT_USER}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
       # TM3 Phase B4: AWS SES for budget-alert email. The
@@ -286,6 +312,11 @@ services:
       # the gateway can construct the boto3 client on demand.
       MINIO_ENDPOINT: ${MINIO_ENDPOINT:-http://minio:9000}
       MINIO_TENANT_CONTENT_BUCKET: ${MINIO_TENANT_CONTENT_BUCKET:-tenant-content}
+      # TM6 T6.0: scoped MinIO service account (Put/Get/Delete on
+      # tenant-content/* only — object_store prefers these when set).
+      # Root creds below stay as the pre-migration / dev fallback.
+      OGMA_MINIO_ACCESS_KEY: ${OGMA_MINIO_ACCESS_KEY:-}
+      OGMA_MINIO_SECRET_KEY: ${OGMA_MINIO_SECRET_KEY:-}
       MINIO_ROOT_USER: ${MINIO_ROOT_USER}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
       # TM2 Phase A2: bridge JWT keypair. Gateway signs short-lived (60s)

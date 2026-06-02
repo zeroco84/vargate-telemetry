@@ -119,6 +119,32 @@ _client: Optional[Any] = None
 _client_lock = threading.Lock()
 
 
+def _resolve_credentials() -> tuple[str, str]:
+    """Resolve the MinIO (access_key, secret_key) for the boto3 client.
+
+    TM6 T6.0: prefer the scoped service account
+    (``OGMA_MINIO_ACCESS_KEY`` / ``OGMA_MINIO_SECRET_KEY`` — least
+    privilege: Put/Get/Delete on ``tenant-content/*`` only). Fall back to
+    root creds (``MINIO_ROOT_USER`` / ``MINIO_ROOT_PASSWORD``) when the
+    scoped vars are unset (dev / pre-migration) so existing envs keep
+    working. The scoped account shrinks the blast radius of a
+    gateway/worker compromise from "all of MinIO" to "the content bucket".
+    """
+    access_key = os.environ.get("OGMA_MINIO_ACCESS_KEY") or os.environ.get(
+        "MINIO_ROOT_USER"
+    )
+    secret_key = os.environ.get("OGMA_MINIO_SECRET_KEY") or os.environ.get(
+        "MINIO_ROOT_PASSWORD"
+    )
+    if not access_key or not secret_key:
+        raise StorageError(
+            "No MinIO credentials set. Set OGMA_MINIO_ACCESS_KEY / "
+            "OGMA_MINIO_SECRET_KEY (the scoped service account) — or, for "
+            "dev / bootstrap, MINIO_ROOT_USER / MINIO_ROOT_PASSWORD."
+        )
+    return access_key, secret_key
+
+
 def _build_client() -> Any:
     """Build the boto3 S3 client configured for MinIO.
 
@@ -135,13 +161,7 @@ def _build_client() -> Any:
             "MINIO_ENDPOINT is not set. The object-store wrapper "
             "requires it to construct the boto3 client."
         )
-    access_key = os.environ.get("MINIO_ROOT_USER")
-    secret_key = os.environ.get("MINIO_ROOT_PASSWORD")
-    if not access_key or not secret_key:
-        raise StorageError(
-            "MINIO_ROOT_USER / MINIO_ROOT_PASSWORD must be set for "
-            "the object-store wrapper."
-        )
+    access_key, secret_key = _resolve_credentials()
 
     # `addressing_style="path"` is required for MinIO — it doesn't do
     # virtual-hosted-style buckets out of the box. Same setting works

@@ -163,3 +163,55 @@ def test_put_rejects_tenant_id_with_slash() -> None:
     pin the guard against future API drift."""
     with pytest.raises(ValueError, match="may not contain"):
         object_store.put_content("tnt_us_/../other_tenant", "k", b"x")
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Credential resolution (TM6 T6.0) — scoped svc account preferred, root
+# fallback. Pure env logic; no live MinIO.
+# ───────────────────────────────────────────────────────────────────────────
+
+
+def test_resolve_credentials_prefers_scoped_svcaccount(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OGMA_MINIO_ACCESS_KEY", "scoped-ak")
+    monkeypatch.setenv("OGMA_MINIO_SECRET_KEY", "scoped-sk")
+    monkeypatch.setenv("MINIO_ROOT_USER", "root-ak")
+    monkeypatch.setenv("MINIO_ROOT_PASSWORD", "root-sk")
+    assert object_store._resolve_credentials() == ("scoped-ak", "scoped-sk")
+
+
+def test_resolve_credentials_falls_back_to_root(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("OGMA_MINIO_ACCESS_KEY", raising=False)
+    monkeypatch.delenv("OGMA_MINIO_SECRET_KEY", raising=False)
+    monkeypatch.setenv("MINIO_ROOT_USER", "root-ak")
+    monkeypatch.setenv("MINIO_ROOT_PASSWORD", "root-sk")
+    assert object_store._resolve_credentials() == ("root-ak", "root-sk")
+
+
+def test_resolve_credentials_empty_scoped_falls_back_to_root(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # compose passes ${OGMA_MINIO_ACCESS_KEY:-} → "" when unset in .env;
+    # an empty string must fall through to root, not raise.
+    monkeypatch.setenv("OGMA_MINIO_ACCESS_KEY", "")
+    monkeypatch.setenv("OGMA_MINIO_SECRET_KEY", "")
+    monkeypatch.setenv("MINIO_ROOT_USER", "root-ak")
+    monkeypatch.setenv("MINIO_ROOT_PASSWORD", "root-sk")
+    assert object_store._resolve_credentials() == ("root-ak", "root-sk")
+
+
+def test_resolve_credentials_raises_when_none_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for var in (
+        "OGMA_MINIO_ACCESS_KEY",
+        "OGMA_MINIO_SECRET_KEY",
+        "MINIO_ROOT_USER",
+        "MINIO_ROOT_PASSWORD",
+    ):
+        monkeypatch.delenv(var, raising=False)
+    with pytest.raises(object_store.StorageError):
+        object_store._resolve_credentials()
