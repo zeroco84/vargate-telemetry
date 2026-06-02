@@ -109,6 +109,60 @@ os.environ["DATABASE_URL"] = _test_url
 
 
 # ───────────────────────────────────────────────────────────────────────────
+# Module-load step 2: redirect REDIS_URL to a dedicated test Redis DB.
+#
+# The live celery-beat/worker run on Redis DB 0 and flush the shared
+# `vargate:meter:active` hash every 60s (a RENAME-then-drain). A test that
+# also uses DB 0 races that flush — the worker steals the hash mid-test and
+# drains it into the PROD db, so the test's own flush sees only the
+# leftovers → a partial usage_records sum (the intermittent t2 flake).
+#
+# Tests run on a dedicated Redis DB the live processes never touch, exactly
+# mirroring the DATABASE_URL → _test isolation above. The metering / sso
+# Redis clients are lazy (read REDIS_URL on first use), so this rewrite at
+# conftest import lands before any client is built. The session baseline
+# FLUSHDBs this DB, so the guard refuses anything but the dedicated index.
+# ───────────────────────────────────────────────────────────────────────────
+
+TEST_REDIS_DB = "15"
+
+_orig_redis = os.environ.get("REDIS_URL", "")
+if not _orig_redis:
+    raise RuntimeError(
+        "REDIS_URL is not set. The test conftest needs it for the Redis "
+        "host/credentials; the DB index gets rewritten to a test DB."
+    )
+
+
+def _redirect_to_test_redis(url: str) -> str:
+    """Point a redis:// URL at DB ``TEST_REDIS_DB``. Handles an explicit
+    trailing ``/<db>``, an optional query string, or no db index (Redis
+    defaults to 0). Idempotent if already on the test DB."""
+    if re.search(rf"/{TEST_REDIS_DB}(\?|$)", url):
+        return url  # already redirected
+    if re.search(r"/\d+(\?|$)", url):
+        return re.sub(r"/\d+(\?|$)", f"/{TEST_REDIS_DB}\\1", url)
+    if "?" in url:
+        base, query = url.split("?", 1)
+        return f"{base.rstrip('/')}/{TEST_REDIS_DB}?{query}"
+    return f"{url.rstrip('/')}/{TEST_REDIS_DB}"
+
+
+_test_redis = _redirect_to_test_redis(_orig_redis)
+
+# Fail-fast guard: the session baseline FLUSHDBs this DB, so it MUST be the
+# dedicated test index — never the live DB 0.
+if not re.search(rf"/{TEST_REDIS_DB}(\?|$)", _test_redis):
+    raise RuntimeError(
+        "REFUSING TO RUN TESTS: REDIS_URL did not redirect to the test "
+        f"Redis DB {TEST_REDIS_DB}. After redirect the URL is:\n  "
+        f"{_test_redis!r}\nAborting before any FLUSHDB-bearing fixture runs."
+    )
+
+os.environ["REDIS_URL"] = _test_redis
+
+
+# ───────────────────────────────────────────────────────────────────────────
 # Module-load step 2: TM2 — bridge JWT keypair for tests.
 # Runs before any test imports vargate_telemetry.auth.bridge_keys.
 # Generates a fresh ECDSA P-256 keypair into a tmp path, sets the
@@ -286,3 +340,11 @@ def _clean_database_baseline(apply_migrations: None) -> None:
                     + " RESTART IDENTITY CASCADE"
                 )
             )
+
+    # Clear the test Redis DB too (metering's vargate:meter:* hash, sso
+    # nonces, etc.) so a prior pytest invocation's residue can't leak in.
+    # REDIS_URL was redirected to the dedicated test DB at module load
+    # (guarded above), so this FLUSHDB never touches the live DB 0.
+    import redis as _redis_pkg
+
+    _redis_pkg.Redis.from_url(os.environ["REDIS_URL"]).flushdb()
