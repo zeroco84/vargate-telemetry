@@ -97,65 +97,80 @@ def render_budget_alert(ctx: BudgetAlertContext) -> tuple[str, str, str]:
         f"dashboard:\n\n"
         f"  {_dashboard_url()}\n\n"
         f"-- \n"
-        f"This alert is from Ogma — your AI usage audit ledger.\n"
+        f"This alert is from Ogma by Vargate — your AI usage audit ledger.\n"
         f"You're receiving this because you're listed as a recipient on "
         f"the \"{ctx.budget_name}\" budget. Update recipients in\n"
         f"Ogma → Budgets.\n"
     )
 
-    # Minimal-HTML body — no inline images, no remote fonts. Plain
-    # table + link. Compliance-friendly inboxes (mostly the audience
-    # here) tend to strip rich HTML; we lose nothing by staying simple.
+    # Branded but inbox-safe HTML — inline styles only, no remote
+    # images or web fonts (the compliance-leaning audience's mail
+    # clients strip those). A dark "Ogma by Vargate" header bar carries
+    # the identity; the body stays a plain table + CTA. Colors match the
+    # design-system ink/paper palette (#1f1f1e / #ffffff).
     html_body = f"""<!DOCTYPE html>
 <html>
-<body style="font-family: -apple-system, system-ui, sans-serif;
-             font-size: 14px; color: #1c1c1c; max-width: 560px;">
-  <h2 style="font-size: 16px; font-weight: 600; margin: 0 0 16px;">
-    Budget alert — &ldquo;{ctx.budget_name}&rdquo; at {pct} of cap
-  </h2>
-  <p>
-    Your budget &ldquo;<strong>{ctx.budget_name}</strong>&rdquo;
-    has crossed <strong>{pct}</strong> of its {ctx.period} cap.
-  </p>
-  <table style="border-collapse: collapse; margin: 16px 0;">
-    <tr>
-      <td style="padding: 4px 12px 4px 0; color: #6b6b6b;">Current spend</td>
-      <td style="padding: 4px 0; font-family: ui-monospace, monospace;">
-        ${ctx.current_spend_usd}
-      </td>
-    </tr>
-    <tr>
-      <td style="padding: 4px 12px 4px 0; color: #6b6b6b;">Threshold</td>
-      <td style="padding: 4px 0; font-family: ui-monospace, monospace;">
-        ${ctx.threshold_usd}
-      </td>
-    </tr>
-    <tr>
-      <td style="padding: 4px 12px 4px 0; color: #6b6b6b;">Period</td>
-      <td style="padding: 4px 0;">
-        {ctx.period_start} to {ctx.period_end}
-      </td>
-    </tr>
-    <tr>
-      <td style="padding: 4px 12px 4px 0; color: #6b6b6b;">Scope</td>
-      <td style="padding: 4px 0;">{ctx.scope_label}</td>
-    </tr>
-  </table>
-  <p>
-    <a href="{_dashboard_url()}"
-       style="display: inline-block; padding: 8px 16px;
-              background: #1c1c1c; color: #fff;
-              text-decoration: none; border-radius: 4px;">
-      View &amp; acknowledge in dashboard
-    </a>
-  </p>
-  <hr style="border: 0; border-top: 1px solid #e6e6e6; margin: 24px 0;">
-  <p style="color: #6b6b6b; font-size: 12px;">
-    This alert is from Ogma — your AI usage audit ledger.
-    You're receiving this because you're listed as a recipient
-    on the &ldquo;{ctx.budget_name}&rdquo; budget.
-    Update recipients in Ogma → Budgets.
-  </p>
+<body style="margin: 0; padding: 0; background: #f4f4f3;
+             font-family: -apple-system, system-ui, 'Segoe UI', sans-serif;">
+  <div style="max-width: 560px; margin: 0 auto; background: #ffffff;
+              border: 1px solid #e6e6e6; border-radius: 8px;
+              overflow: hidden;">
+    <div style="background: #1f1f1e; padding: 18px 24px;">
+      <span style="color: #ffffff; font-size: 18px; font-weight: 700;
+                   letter-spacing: -0.01em;">Ogma</span>
+      <span style="color: #9a9a98; font-size: 13px;
+                   margin-left: 8px;">by Vargate</span>
+    </div>
+    <div style="padding: 24px; font-size: 14px; color: #1f1f1e;">
+      <h2 style="font-size: 16px; font-weight: 600; margin: 0 0 16px;">
+        Budget alert — &ldquo;{ctx.budget_name}&rdquo; at {pct} of cap
+      </h2>
+      <p style="margin: 0 0 16px;">
+        Your budget &ldquo;<strong>{ctx.budget_name}</strong>&rdquo;
+        has crossed <strong>{pct}</strong> of its {ctx.period} cap.
+      </p>
+      <table style="border-collapse: collapse; margin: 0 0 20px;">
+        <tr>
+          <td style="padding: 4px 12px 4px 0; color: #6b6b6b;">Current spend</td>
+          <td style="padding: 4px 0; font-family: ui-monospace, monospace;">
+            ${ctx.current_spend_usd}
+          </td>
+        </tr>
+        <tr>
+          <td style="padding: 4px 12px 4px 0; color: #6b6b6b;">Threshold</td>
+          <td style="padding: 4px 0; font-family: ui-monospace, monospace;">
+            ${ctx.threshold_usd}
+          </td>
+        </tr>
+        <tr>
+          <td style="padding: 4px 12px 4px 0; color: #6b6b6b;">Period</td>
+          <td style="padding: 4px 0;">
+            {ctx.period_start} to {ctx.period_end}
+          </td>
+        </tr>
+        <tr>
+          <td style="padding: 4px 12px 4px 0; color: #6b6b6b;">Scope</td>
+          <td style="padding: 4px 0;">{ctx.scope_label}</td>
+        </tr>
+      </table>
+      <p style="margin: 0;">
+        <a href="{_dashboard_url()}"
+           style="display: inline-block; padding: 10px 18px;
+                  background: #1f1f1e; color: #ffffff;
+                  text-decoration: none; border-radius: 6px;
+                  font-weight: 500;">
+          View &amp; acknowledge in dashboard
+        </a>
+      </p>
+    </div>
+    <div style="padding: 16px 24px; border-top: 1px solid #e6e6e6;
+                color: #6b6b6b; font-size: 12px; background: #fafafa;">
+      This alert is from <strong>Ogma by Vargate</strong> — your AI usage
+      audit ledger. You're receiving this because you're listed as a
+      recipient on the &ldquo;{ctx.budget_name}&rdquo; budget.
+      Update recipients in Ogma &rarr; Budgets.
+    </div>
+  </div>
 </body>
 </html>"""
 

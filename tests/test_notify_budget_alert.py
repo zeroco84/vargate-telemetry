@@ -100,6 +100,9 @@ def test_html_body_is_well_formed_and_includes_cta(
     # No remote font / image asset shenanigans — pure inline styles.
     assert "googleapis.com" not in html
     assert "<img" not in html
+    # TM4 polish: branded "Ogma by Vargate" header + footer.
+    assert "Ogma" in html
+    assert "by Vargate" in html
 
 
 def test_scope_label_for_workspace_includes_kind_and_value() -> None:
