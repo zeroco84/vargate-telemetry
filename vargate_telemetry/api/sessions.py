@@ -23,10 +23,13 @@ Endpoints
 Session identity
 ================
 
-``session_id`` is the base64url-encoded form of
-``"{date}|{actor_type}|{actor_handle}"``. Opaque to clients but
-decodeable server-side, which lets the detail endpoint resolve the
-underlying records without a side index.
+``session_id`` (T6.S) wraps the natural key
+``"{date}|{actor_type}|{actor_handle}"`` as ``"v2:" +
+base64url(nonce || AES-GCM(...))`` under a per-tenant key derived from
+the tenant DEK — opaque to clients (they can't read the actor handle
+out of a shared URL) but decryptable server-side, so the detail endpoint
+resolves the underlying records without a side index. Legacy v1 ids
+(bare base64url) still decode for pre-T6.S links.
 
 Actor handle
 ============
@@ -61,11 +64,14 @@ zero rows under the requesting tenant's RLS view).
 from __future__ import annotations
 
 import base64
+import hashlib
+import hmac
 import json
 import logging
 from datetime import date, datetime
 from typing import Any, Optional
 
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, status
 from pydantic import BaseModel, Field
 from sqlalchemy import text as sql_text
@@ -232,54 +238,65 @@ class SessionDetailResponse(BaseModel):
 _SESSION_ID_SEP = "|"
 
 
-def _encode_session_id(d: date, actor_type: str, actor_key: str) -> str:
-    """Encode a Session's natural key as an opaque, URL-safe string.
+# Session ids are wrapped (T6.S) so a shared URL doesn't leak the actor
+# handle. v2 = "v2:" + base64url(nonce || AES-GCM(natural_key)) under a
+# per-tenant key derived from the tenant DEK. Deterministic: the nonce is
+# an HMAC(key, plaintext) SIV, so the same session always yields the same
+# id and a nonce only ever repeats for an identical plaintext (→ identical
+# ciphertext — safe, no GCM nonce-reuse leak). Opaque to clients (no key →
+# can't decrypt the actor out of it), reversible by the server (the detail
+# endpoint decrypts to query). Legacy v1 ids (bare base64url of the
+# natural key) still decode, so pre-T6.S links keep working.
+_SESSION_ID_V2_PREFIX = "v2:"
+_SESSION_WRAP_INFO = b"vargate.telemetry/session_id/v2"
 
-    Format: base64url(``"{date}|{actor_type}|{actor_key}"``). The
-    separator is a literal pipe — actor_keys can contain ``@``, ``.``,
-    ``+``, hyphens, etc., and we don't want to URL-encode every
-    response on the way out. The pipe is rare in real actor handles
-    but defensively reject it on encode to keep round-trips stable.
-    """
+
+def _session_wrap_key(tenant_id: str) -> bytes:
+    """Per-tenant 32-byte wrap key, derived from the tenant DEK via stdlib
+    HMAC. Provisions a DEK on demand (idempotent) if the tenant lacks one,
+    so listing sessions never fails on a missing DEK."""
+    from vargate_telemetry.crypto.seal import (
+        get_tenant_dek,
+        provision_tenant_dek,
+    )
+
+    try:
+        dek = get_tenant_dek(tenant_id)
+    except LookupError:
+        provision_tenant_dek(tenant_id)
+        dek = get_tenant_dek(tenant_id)
+    return hmac.new(dek, _SESSION_WRAP_INFO, hashlib.sha256).digest()
+
+
+def _encode_session_id(
+    d: date, actor_type: str, actor_key: str, *, wrap_key: bytes
+) -> str:
+    """Encode a Session's natural key as an opaque, URL-safe id (T6.S v2)
+    that clients cannot reverse to the actor handle."""
     if _SESSION_ID_SEP in actor_type or _SESSION_ID_SEP in actor_key:
-        # Pipe inside an actor handle is the only ambiguity case; a
-        # vendor-side actor with a literal pipe in the email would
-        # corrupt the decode. Not a security boundary — just a
-        # round-trip guard.
+        # Pipe inside an actor handle would corrupt the decode split —
+        # round-trip guard (not a security boundary).
         actor_type = actor_type.replace(_SESSION_ID_SEP, "_")
         actor_key = actor_key.replace(_SESSION_ID_SEP, "_")
-    raw = f"{d.isoformat()}{_SESSION_ID_SEP}{actor_type}{_SESSION_ID_SEP}{actor_key}"
-    return base64.urlsafe_b64encode(raw.encode("utf-8")).rstrip(b"=").decode("ascii")
+    raw = (
+        f"{d.isoformat()}{_SESSION_ID_SEP}{actor_type}"
+        f"{_SESSION_ID_SEP}{actor_key}"
+    ).encode("utf-8")
+    nonce = hmac.new(wrap_key, raw, hashlib.sha256).digest()[:12]
+    blob = nonce + AESGCM(wrap_key).encrypt(nonce, raw, None)
+    token = base64.urlsafe_b64encode(blob).rstrip(b"=").decode("ascii")
+    return _SESSION_ID_V2_PREFIX + token
 
 
-def _decode_session_id(session_id: str) -> tuple[date, str, str]:
-    """Reverse of ``_encode_session_id``. Raises HTTPException 400 on
-    malformed input — opaque does NOT mean "trust the client to send
-    a real id," only "the client can't construct one from
-    semantically meaningful pieces without decoding ours first."
-
-    Returns ``(date, actor_type, actor_key)``.
-    """
-    try:
-        # Re-pad for urlsafe_b64decode tolerance.
-        padded = session_id + "=" * (-len(session_id) % 4)
-        raw = base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8")
-    except Exception as exc:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail={
-                "code": "invalid_session_id",
-                "message": "session_id is malformed (not valid base64url).",
-            },
-        ) from exc
-
+def _parse_session_parts(raw: str) -> tuple[date, str, str]:
+    """Validate + split a decoded ``"{date}|{actor_type}|{actor_key}"``."""
     parts = raw.split(_SESSION_ID_SEP)
     if len(parts) != 3:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={
                 "code": "invalid_session_id",
-                "message": f"session_id decoded but did not have three parts (got {len(parts)}).",
+                "message": f"session_id did not have three parts (got {len(parts)}).",
             },
         )
     date_str, actor_type, actor_key = parts
@@ -294,6 +311,48 @@ def _decode_session_id(session_id: str) -> tuple[date, str, str]:
             },
         ) from exc
     return d, actor_type, actor_key
+
+
+def _decode_session_id(session_id: str, *, wrap_key: bytes) -> tuple[date, str, str]:
+    """Reverse of ``_encode_session_id``. Accepts v2 (wrapped) and legacy
+    v1 (bare base64url) ids. Raises HTTPException 400 on malformed input —
+    incl. a v2 id from another tenant, whose AES-GCM tag won't verify under
+    this tenant's key (so cross-tenant ids can't be decoded). Opaque does
+    NOT mean "trust the client to send a real id"."""
+    if session_id.startswith(_SESSION_ID_V2_PREFIX):
+        token = session_id[len(_SESSION_ID_V2_PREFIX):]
+        try:
+            blob = base64.urlsafe_b64decode(
+                (token + "=" * (-len(token) % 4)).encode("ascii")
+            )
+            raw = (
+                AESGCM(wrap_key)
+                .decrypt(blob[:12], blob[12:], None)
+                .decode("utf-8")
+            )
+        except Exception as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "code": "invalid_session_id",
+                    "message": "session_id is malformed or not valid for this tenant.",
+                },
+            ) from exc
+        return _parse_session_parts(raw)
+
+    # Legacy v1: bare base64url of the natural key (pre-T6.S links).
+    try:
+        padded = session_id + "=" * (-len(session_id) % 4)
+        raw = base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8")
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "invalid_session_id",
+                "message": "session_id is malformed (not valid base64url).",
+            },
+        ) from exc
+    return _parse_session_parts(raw)
 
 
 # Cursor encoding for the list endpoint. The cursor is the
@@ -511,12 +570,14 @@ def list_sessions(
             last_row.actor_key or "",
         )
 
+    wrap_key = _session_wrap_key(user.tenant_id)
     sessions = [
         SessionSummary(
             session_id=_encode_session_id(
                 r.session_date,
                 r.actor_type or "",
                 r.actor_key or "",
+                wrap_key=wrap_key,
             ),
             session_date=r.session_date,
             actor=SessionActor(
@@ -586,7 +647,9 @@ def get_session_detail(
             },
         )
 
-    session_date, actor_type, actor_key = _decode_session_id(session_id)
+    session_date, actor_type, actor_key = _decode_session_id(
+        session_id, wrap_key=_session_wrap_key(user.tenant_id)
+    )
 
     sql = f"""
         SELECT
