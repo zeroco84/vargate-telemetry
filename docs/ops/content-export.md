@@ -1,10 +1,17 @@
 # eDiscovery content export (TM6 T6.2)
 
-`GET /content/export` (admin only) builds a downloadable **ZIP bundle**
-of a tenant's captured content for legal / compliance discovery. Its
-differentiator over a plain dump is a **chain-verification proof**: an
-auditor can independently confirm the exported content is exactly what
-was recorded, and that the underlying audit chain is intact.
+`GET /content/export` builds a downloadable **ZIP bundle** of a tenant's
+captured content for legal / compliance discovery. Its differentiator
+over a plain dump is a **chain-verification proof**: an auditor can
+independently confirm the exported content is exactly what was recorded,
+and that the underlying audit chain is intact.
+
+**Gating:** the whole content surface (view / export / delete / reveal)
+is **compliance-tier** gated — it requires both an **admin** role and the
+`content_capture` capability (a Compliance Access Key sealed for the
+tenant). A non-compliance caller gets `403 compliance_tier_required` (not
+an empty result), so the entitlement is enforced server-side, not just
+hidden in the UI.
 
 ## Formats
 

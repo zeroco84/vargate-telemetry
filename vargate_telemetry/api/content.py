@@ -52,7 +52,7 @@ from sqlalchemy import text as sql_text
 
 from vargate_telemetry import content_deletion, content_export
 from vargate_telemetry.auth.middleware import AuthenticatedUser, current_user
-from vargate_telemetry.auth.roles import require_admin
+from vargate_telemetry.auth.roles import require_admin, require_content_capture
 from vargate_telemetry.db import session_scope
 from vargate_telemetry.pii_detector import detect_and_redact
 
@@ -225,7 +225,7 @@ def _require_tenant(user: AuthenticatedUser) -> str:
     summary="List captured compliance-content chats for the tenant",
 )
 def list_content_chats(
-    user: AuthenticatedUser = Depends(current_user),
+    user: AuthenticatedUser = Depends(require_content_capture),
 ) -> ChatListResponse:
     """Aggregate the per-message ``compliance_content`` records into one
     row per ``chat_id`` (newest activity first). Metadata only — no
@@ -324,7 +324,7 @@ def list_content_chats(
 )
 def get_content_chat_detail(
     chat_id: str = Path(..., min_length=1),
-    user: AuthenticatedUser = Depends(current_user),
+    user: AuthenticatedUser = Depends(require_content_capture),
 ) -> ChatDetailResponse:
     """Returns the chat with message text decrypted on read and **PII
     masked** (T6.3). Use the reveal endpoint for unmasked content."""
@@ -464,6 +464,7 @@ def _build_chat_detail(
     operation_id="revealContentChat",
     tags=["content"],
     summary="Reveal one chat's content with PII unmasked (admin, audit-logged)",
+    dependencies=[Depends(require_content_capture)],
 )
 def reveal_content_chat(
     chat_id: str = Path(..., min_length=1),
@@ -494,6 +495,7 @@ def reveal_content_chat(
     operation_id="deleteContentChat",
     tags=["content"],
     summary="Delete one captured chat's content (admin)",
+    dependencies=[Depends(require_content_capture)],
 )
 def delete_content_chat(
     chat_id: str = Path(..., min_length=1),
@@ -516,6 +518,7 @@ def delete_content_chat(
     operation_id="deleteUserContent",
     tags=["content"],
     summary="Delete all of one user's captured content — DSR (admin)",
+    dependencies=[Depends(require_content_capture)],
 )
 def delete_user_content_endpoint(
     subject_user_id: str = Path(..., min_length=1),
@@ -540,6 +543,7 @@ def delete_user_content_endpoint(
     operation_id="cryptoShredTenant",
     tags=["content"],
     summary="Crypto-shred ALL tenant content — terminal offboarding (admin)",
+    dependencies=[Depends(require_content_capture)],
 )
 def crypto_shred_tenant_endpoint(
     req: TenantShredRequest = Body(...),
@@ -580,6 +584,7 @@ _EXPORT_FORMATS = ("zip", "pdf", "both")
     operation_id="exportContent",
     tags=["content"],
     summary="Export captured content — JSON bundle, PDF, or both (admin)",
+    dependencies=[Depends(require_content_capture)],
     response_class=Response,
     responses={
         200: {

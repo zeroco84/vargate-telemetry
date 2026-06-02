@@ -79,6 +79,14 @@ def make_tenant():
                 },
             )
         provision_tenant_dek(tenant_id)
+        # Compliance-tier tenant: seal a (fake) Compliance Access Key so
+        # the content endpoints' content_capture gate passes.
+        from vargate_telemetry.anthropic import ANTHROPIC_COMPLIANCE_KEY_SECRET
+        from vargate_telemetry.crypto.seal import seal_secret
+
+        seal_secret(
+            tenant_id, ANTHROPIC_COMPLIANCE_KEY_SECRET, b"sk-ant-api01-testcompliance"
+        )
         created.append(tenant_id)
         return tenant_id, user_uuid
 

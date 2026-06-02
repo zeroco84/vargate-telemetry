@@ -102,3 +102,58 @@ def require_admin(
             },
         )
     return user
+
+
+def require_content_capture(
+    user: AuthenticatedUser = Depends(current_user),
+) -> AuthenticatedUser:
+    """FastAPI dependency: 403 unless the caller's tenant is on the
+    **compliance tier** — i.e. a Compliance Access Key is sealed, which is
+    exactly what unlocks the ``content_capture`` capability that
+    ``/me/capabilities`` reports.
+
+    Gates the compliance content surface (view / export / delete /
+    reveal): those operate on captured content, which only exists for a
+    compliance-tier tenant. Without this, a non-compliance admin could
+    reach the API directly (the dashboard already hides the surface); the
+    response would be empty rather than an explicit entitlement error.
+
+    Layers on ``current_user`` (401 if unauthenticated). 400 if no tenant
+    is bound; 403 ``compliance_tier_required`` otherwise.
+    """
+    if user.tenant_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "no_tenant_bound",
+                "message": "Your session is not bound to a tenant yet.",
+            },
+        )
+
+    from vargate_telemetry.anthropic import ANTHROPIC_COMPLIANCE_KEY_SECRET
+
+    with session_scope(user.tenant_id) as session:
+        has_key = (
+            session.execute(
+                sql_text(
+                    "SELECT 1 FROM encrypted_secrets "
+                    "WHERE secret_name = :n LIMIT 1"
+                ),
+                {"n": ANTHROPIC_COMPLIANCE_KEY_SECRET},
+            ).first()
+            is not None
+        )
+
+    if not has_key:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "code": "compliance_tier_required",
+                "message": (
+                    "This action requires the compliance tier. Connect a "
+                    "Compliance Access Key in Settings → Integrations to "
+                    "enable content capture, export, and deletion."
+                ),
+            },
+        )
+    return user

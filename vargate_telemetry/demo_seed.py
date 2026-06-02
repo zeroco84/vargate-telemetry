@@ -53,9 +53,12 @@ def _at(day: int, hour: int = 9) -> datetime:
 
 
 def ensure_tenant(tenant_id: str) -> None:
-    """Create the tenant row (if missing) + provision its DEK so
-    store_content works. Both idempotent."""
-    from vargate_telemetry.crypto.seal import provision_tenant_dek
+    """Create the tenant row (if missing), provision its DEK, and seal a
+    placeholder Compliance Access Key so the demo tenant is on the
+    compliance tier — the content view, export, and deletion all gate on
+    that capability. All idempotent."""
+    from vargate_telemetry.anthropic import ANTHROPIC_COMPLIANCE_KEY_SECRET
+    from vargate_telemetry.crypto.seal import provision_tenant_dek, seal_secret
 
     with engine.begin() as conn:
         conn.execute(
@@ -67,6 +70,11 @@ def ensure_tenant(tenant_id: str) -> None:
             {"t": tenant_id},
         )
     provision_tenant_dek(tenant_id)
+    seal_secret(
+        tenant_id,
+        ANTHROPIC_COMPLIANCE_KEY_SECRET,
+        b"sk-ant-api01-demo-compliance-key",
+    )
 
 
 def _content_exists(tenant_id: str, external_id: str) -> bool:

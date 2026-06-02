@@ -59,9 +59,21 @@ def content_tenant() -> Iterator[str]:
             ),
             {"t": tid},
         )
+    # Compliance-tier tenant: a DEK + a sealed (fake) Compliance Access
+    # Key so the content endpoints' content_capture gate passes.
+    from vargate_telemetry.anthropic import ANTHROPIC_COMPLIANCE_KEY_SECRET
+    from vargate_telemetry.crypto.seal import provision_tenant_dek, seal_secret
+
+    provision_tenant_dek(tid)
+    seal_secret(tid, ANTHROPIC_COMPLIANCE_KEY_SECRET, b"sk-ant-api01-testcompliance")
     yield tid
     with engine.begin() as conn:
-        for tbl in ("telemetry_records", "tenants"):
+        for tbl in (
+            "encrypted_secrets",
+            "tenant_deks",
+            "telemetry_records",
+            "tenants",
+        ):
             conn.execute(
                 sql_text(f"DELETE FROM {tbl} WHERE tenant_id = :t"),
                 {"t": tid},
@@ -117,6 +129,31 @@ def _seed_message(
         content_size_bytes=len(text),
         record_metadata=md,
     )
+
+
+def _provision_compliance(tid: str) -> None:
+    """Make `tid` a compliance-tier tenant (DEK + sealed Compliance Access
+    Key) so it passes the content endpoints' content_capture gate."""
+    from vargate_telemetry.anthropic import ANTHROPIC_COMPLIANCE_KEY_SECRET
+    from vargate_telemetry.crypto.seal import provision_tenant_dek, seal_secret
+
+    provision_tenant_dek(tid)
+    seal_secret(tid, ANTHROPIC_COMPLIANCE_KEY_SECRET, b"sk-ant-api01-testcompliance")
+
+
+def _cleanup_tenant(tid: str) -> None:
+    from vargate_telemetry.db import engine
+
+    with engine.begin() as conn:
+        for tbl in (
+            "encrypted_secrets",
+            "tenant_deks",
+            "telemetry_records",
+            "tenants",
+        ):
+            conn.execute(
+                sql_text(f"DELETE FROM {tbl} WHERE tenant_id = :t"), {"t": tid}
+            )
 
 
 _T = datetime(2026, 5, 20, 10, 0, 0, tzinfo=timezone.utc)
@@ -175,9 +212,13 @@ def test_list_chats_isolated_per_tenant(
         occurred_at=_T, content_ref="r/x",
     )
     other = f"tnt_eu_cv_{uuid.uuid4().hex[:12]}"
-    resp = client.get("/content/chats", headers=_bearer(other))
-    assert resp.status_code == 200, resp.text
-    assert resp.json()["chats"] == []
+    _provision_compliance(other)  # compliance-tier, so RLS (not the gate) is what isolates
+    try:
+        resp = client.get("/content/chats", headers=_bearer(other))
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["chats"] == []
+    finally:
+        _cleanup_tenant(other)
 
 
 def test_list_chats_no_tenant_bound_is_400(client: TestClient) -> None:
@@ -292,7 +333,11 @@ def test_chat_detail_isolated_per_tenant(
         occurred_at=_T, content_ref="r/z",
     )
     other = f"tnt_eu_cv_{uuid.uuid4().hex[:12]}"
-    resp = client.get(
-        "/content/chats/chat_shared_id", headers=_bearer(other)
-    )
-    assert resp.status_code == 404, resp.text
+    _provision_compliance(other)  # compliance-tier, so RLS (not the gate) 404s
+    try:
+        resp = client.get(
+            "/content/chats/chat_shared_id", headers=_bearer(other)
+        )
+        assert resp.status_code == 404, resp.text
+    finally:
+        _cleanup_tenant(other)
