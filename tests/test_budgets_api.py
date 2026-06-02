@@ -235,7 +235,7 @@ def test_create_tenant_scoped_budget_happy_path(
         "scope_value": None,
         "period": "monthly",
         "threshold_usd": "500.00",
-        "alert_recipients": ["rick@vargate.ai", "ops@vargate.ai"],
+        "alert_recipients": {"email": ["rick@vargate.ai", "ops@vargate.ai"]},
     }
     r = client.post("/budgets", json=body, headers=_bearer(tenant))
     assert r.status_code == 201, r.text
@@ -245,7 +245,13 @@ def test_create_tenant_scoped_budget_happy_path(
     assert out["scope_value"] is None
     assert out["period"] == "monthly"
     assert Decimal(out["threshold_usd"]) == Decimal("500.00")
-    assert out["alert_recipients"] == ["rick@vargate.ai", "ops@vargate.ai"]
+    assert out["alert_recipients"]["email"] == [
+        "rick@vargate.ai",
+        "ops@vargate.ai",
+    ]
+    # The other channels default to empty.
+    assert out["alert_recipients"]["slack_webhook"] == []
+    assert out["alert_recipients"]["pagerduty_key"] == []
     assert out["created_at"] is not None
 
 
@@ -262,7 +268,7 @@ def test_member_cannot_create_budget(
         "scope_value": None,
         "period": "monthly",
         "threshold_usd": "10.00",
-        "alert_recipients": [],
+        "alert_recipients": {},
     }
     r = client.post("/budgets", json=body, headers=_bearer(tenant, member))
     assert r.status_code == 403, r.text
@@ -284,7 +290,7 @@ def test_list_rows_carry_current_spend_and_ratio(
             "scope_value": None,
             "period": "monthly",
             "threshold_usd": "100.00",
-            "alert_recipients": [],
+            "alert_recipients": {},
         },
         headers=_bearer(tenant),
     )
@@ -325,7 +331,7 @@ def test_scope_label_resolves_workspace_name(
             "scope_value": "wrkspc_eng",
             "period": "monthly",
             "threshold_usd": "100.00",
-            "alert_recipients": [],
+            "alert_recipients": {},
         },
         headers=_bearer(tenant),
     ).json()
@@ -350,7 +356,7 @@ def test_create_workspace_scoped_budget(
         "scope_value": "wrkspc_eng",
         "period": "weekly",
         "threshold_usd": "100.00",
-        "alert_recipients": [],
+        "alert_recipients": {},
     }
     r = client.post("/budgets", json=body, headers=_bearer(tenant))
     assert r.status_code == 201
@@ -420,8 +426,66 @@ def test_create_rejects_invalid_email_recipient(
         "scope_value": None,
         "period": "monthly",
         "threshold_usd": "100.00",
-        "alert_recipients": ["not-an-email"],
+        "alert_recipients": {"email": ["not-an-email"]},
     }
+    r = client.post("/budgets", json=body, headers=_bearer(tenant))
+    assert r.status_code == 422
+
+
+def _budget_body(tenant: str, recipients: dict) -> dict:
+    return {
+        "name": "channels",
+        "scope_kind": "tenant",
+        "scope_value": None,
+        "period": "monthly",
+        "threshold_usd": "100.00",
+        "alert_recipients": recipients,
+    }
+
+
+def test_create_with_slack_and_pagerduty_channels(
+    clean_budgets: None, client: TestClient
+) -> None:
+    """TM5 T5.4: a budget can carry email + Slack + PagerDuty recipients;
+    the response echoes all three channels."""
+    tenant = "tnt_us_budget_channels"
+    _provision_tenant(tenant)
+    body = _budget_body(
+        tenant,
+        {
+            "email": ["ops@vargate.ai"],
+            "slack_webhook": ["https://hooks.slack.com/services/T/B/x"],
+            "pagerduty_key": ["routingkey0123456789abcdef012345"],
+        },
+    )
+    r = client.post("/budgets", json=body, headers=_bearer(tenant))
+    assert r.status_code == 201, r.text
+    rec = r.json()["alert_recipients"]
+    assert rec["email"] == ["ops@vargate.ai"]
+    assert rec["slack_webhook"] == ["https://hooks.slack.com/services/T/B/x"]
+    assert rec["pagerduty_key"] == ["routingkey0123456789abcdef012345"]
+
+
+def test_create_rejects_non_slack_webhook_url(
+    clean_budgets: None, client: TestClient
+) -> None:
+    tenant = "tnt_us_budget_bad_slack"
+    _provision_tenant(tenant)
+    body = _budget_body(
+        tenant, {"slack_webhook": ["https://evil.example.com/hook"]}
+    )
+    r = client.post("/budgets", json=body, headers=_bearer(tenant))
+    assert r.status_code == 422
+
+
+def test_create_rejects_unknown_channel_key(
+    clean_budgets: None, client: TestClient
+) -> None:
+    """extra='forbid' — a misspelled / unsupported channel is a 422,
+    not a silently-dropped config."""
+    tenant = "tnt_us_budget_bad_channel"
+    _provision_tenant(tenant)
+    body = _budget_body(tenant, {"sms": ["+15555550123"]})
     r = client.post("/budgets", json=body, headers=_bearer(tenant))
     assert r.status_code == 422
 
@@ -680,17 +744,21 @@ def test_patch_updates_recipients(
             "scope_value": None,
             "period": "monthly",
             "threshold_usd": "50.00",
-            "alert_recipients": ["one@vargate.ai"],
+            "alert_recipients": {"email": ["one@vargate.ai"]},
         },
         headers=auth,
     ).json()
     r = client.patch(
         f"/budgets/{created['id']}",
-        json={"alert_recipients": ["two@vargate.ai", "three@vargate.ai"]},
+        json={
+            "alert_recipients": {
+                "email": ["two@vargate.ai", "three@vargate.ai"]
+            }
+        },
         headers=auth,
     )
     assert r.status_code == 200
-    assert r.json()["alert_recipients"] == [
+    assert r.json()["alert_recipients"]["email"] == [
         "two@vargate.ai",
         "three@vargate.ai",
     ]

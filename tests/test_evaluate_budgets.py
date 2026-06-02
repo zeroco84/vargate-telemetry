@@ -150,7 +150,7 @@ def _create_budget(
                     created_by_user_id
                 ) VALUES (
                     :t, :name, :scope_kind, :scope_value,
-                    :period, :threshold, :recipients,
+                    :period, :threshold, CAST(:recipients AS jsonb),
                     :user_uuid
                 )
                 RETURNING id::text
@@ -163,7 +163,15 @@ def _create_budget(
                 "scope_value": scope_value,
                 "period": period,
                 "threshold": threshold_usd,
-                "recipients": recipients or [],
+                # T5.4: alert_recipients is now per-channel JSONB. The
+                # test's email list maps to the email channel.
+                "recipients": json.dumps(
+                    {
+                        "email": list(recipients or []),
+                        "slack_webhook": [],
+                        "pagerduty_key": [],
+                    }
+                ),
                 "user_uuid": user_uuid,
             },
         ).one()

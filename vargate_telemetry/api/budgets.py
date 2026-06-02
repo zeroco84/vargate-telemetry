@@ -46,6 +46,7 @@ disappear (audit-chain principle).
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from datetime import date, datetime
@@ -54,7 +55,14 @@ from typing import Annotated, Any, Literal, Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, status
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    EmailStr,
+    Field,
+    field_validator,
+    model_validator,
+)
 from sqlalchemy import text as sql_text
 
 from vargate_telemetry.auth.middleware import (
@@ -102,6 +110,45 @@ def _validate_scope_pair(
         )
 
 
+class AlertRecipients(BaseModel):
+    """Per-channel alert recipients for a budget (TM5 T5.4).
+
+    Email is the default channel; Slack incoming-webhook URLs and
+    PagerDuty Events API routing keys fire only when populated. Stored
+    as the budget's ``alert_recipients`` JSONB. ``extra="forbid"`` so a
+    misspelled channel key (e.g. ``slack`` for ``slack_webhook``) is a
+    422, not a silently-ignored config.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    email: list[EmailStr] = Field(default_factory=list)
+    slack_webhook: list[str] = Field(default_factory=list)
+    pagerduty_key: list[str] = Field(default_factory=list)
+
+    @field_validator("slack_webhook")
+    @classmethod
+    def _check_slack(cls, v: list[str]) -> list[str]:
+        for url in v:
+            if not url.startswith("https://hooks.slack.com/"):
+                raise ValueError(
+                    "slack_webhook entries must be Slack incoming-webhook "
+                    "URLs (https://hooks.slack.com/services/...)"
+                )
+        return v
+
+    @field_validator("pagerduty_key")
+    @classmethod
+    def _check_pagerduty(cls, v: list[str]) -> list[str]:
+        for key in v:
+            if not key.strip() or len(key) > 128 or any(c.isspace() for c in key):
+                raise ValueError(
+                    "pagerduty_key entries must be non-empty Events API "
+                    "routing keys with no whitespace"
+                )
+        return v
+
+
 class BudgetCreate(BaseModel):
     """Request body for ``POST /api/budgets``."""
 
@@ -110,7 +157,7 @@ class BudgetCreate(BaseModel):
     scope_value: Optional[str] = Field(None, max_length=256)
     period: Period
     threshold_usd: Decimal = Field(..., gt=Decimal("0"))
-    alert_recipients: list[EmailStr] = Field(default_factory=list)
+    alert_recipients: AlertRecipients = Field(default_factory=AlertRecipients)
 
     @model_validator(mode="after")
     def _check_scope(self) -> "BudgetCreate":
@@ -131,7 +178,7 @@ class BudgetUpdate(BaseModel):
 
     name: Optional[str] = Field(None, min_length=1, max_length=256)
     threshold_usd: Optional[Decimal] = Field(None, gt=Decimal("0"))
-    alert_recipients: Optional[list[EmailStr]] = None
+    alert_recipients: Optional[AlertRecipients] = None
 
 
 class BudgetOut(BaseModel):
@@ -145,7 +192,7 @@ class BudgetOut(BaseModel):
     scope_value: Optional[str]
     period: Period
     threshold_usd: Decimal
-    alert_recipients: list[str]
+    alert_recipients: AlertRecipients
     created_at: datetime
     updated_at: datetime
     created_by_user_id: Optional[UUID]
@@ -229,7 +276,9 @@ def _row_to_budget_out(row: Any) -> BudgetOut:
         scope_value=row.scope_value,
         period=row.period,
         threshold_usd=row.threshold_usd,
-        alert_recipients=list(row.alert_recipients or []),
+        alert_recipients=AlertRecipients.model_validate(
+            row.alert_recipients or {}
+        ),
         created_at=row.created_at,
         updated_at=row.updated_at,
         created_by_user_id=row.created_by_user_id,
@@ -376,7 +425,7 @@ def create_budget(
                 )
                 VALUES (
                     :tenant_id, :name, :scope_kind, :scope_value,
-                    :period, :threshold_usd, :alert_recipients,
+                    :period, :threshold_usd, CAST(:alert_recipients AS jsonb),
                     :created_by_user_id
                 )
                 RETURNING id, name, scope_kind, scope_value, period,
@@ -391,9 +440,11 @@ def create_budget(
                 "scope_value": body.scope_value,
                 "period": body.period,
                 "threshold_usd": body.threshold_usd,
-                # EmailStr serializes to plain str — keep the wire
-                # representation a flat array of strings.
-                "alert_recipients": [str(e) for e in body.alert_recipients],
+                # Per-channel JSONB. model_dump(mode="json") flattens
+                # EmailStr -> str; json.dumps + CAST(... AS jsonb) writes it.
+                "alert_recipients": json.dumps(
+                    body.alert_recipients.model_dump(mode="json")
+                ),
                 "created_by_user_id": creator_uuid,
             },
         ).one()
@@ -463,8 +514,10 @@ def update_budget(
         set_clauses.append("threshold_usd = :threshold_usd")
         params["threshold_usd"] = body.threshold_usd
     if body.alert_recipients is not None:
-        set_clauses.append("alert_recipients = :alert_recipients")
-        params["alert_recipients"] = [str(e) for e in body.alert_recipients]
+        set_clauses.append("alert_recipients = CAST(:alert_recipients AS jsonb)")
+        params["alert_recipients"] = json.dumps(
+            body.alert_recipients.model_dump(mode="json")
+        )
 
     if not set_clauses:
         raise HTTPException(

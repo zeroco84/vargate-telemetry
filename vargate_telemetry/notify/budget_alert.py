@@ -21,13 +21,15 @@ import os
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
-from typing import Optional
+from typing import Any, Optional, Union
 
 from vargate_telemetry.notify.email import (
     EmailDeliveryError,
     SesNotConfigured,
     send_email,
 )
+from vargate_telemetry.notify.pagerduty import send_pagerduty_alert
+from vargate_telemetry.notify.slack import send_slack_alert
 
 
 _log = logging.getLogger(__name__)
@@ -177,39 +179,85 @@ def render_budget_alert(ctx: BudgetAlertContext) -> tuple[str, str, str]:
     return subject, html_body, text_body
 
 
-def send_budget_alert(
-    recipients: list[str], ctx: BudgetAlertContext
-) -> Optional[str]:
-    """Format + send the budget-alert email.
+# Per-channel recipient config (TM5 T5.4). The budget's
+# `alert_recipients` is a JSONB object of this shape; email stays the
+# default channel.
+_CHANNELS = ("email", "slack_webhook", "pagerduty_key")
 
-    Returns the SES MessageId on success, ``None`` if recipients is
-    empty (treated as a no-op rather than an error — a budget with
-    no recipients is a valid configuration that the customer may
-    iterate toward).
 
-    Raises ``SesNotConfigured`` or ``EmailDeliveryError`` — the
-    evaluator catches both and logs; we don't want a transient SES
-    blip to roll back the alert-event INSERT (which would un-dedup
-    the alert and re-fire on the next 15-minute tick).
+def _normalize_recipients(
+    recipients: Union[dict[str, Any], list[str], None],
+) -> dict[str, list[str]]:
+    """Coerce the recipients arg into the per-channel dict.
+
+    Accepts the per-channel config dict, OR a bare list of email
+    addresses (back-compat for any legacy caller / test), OR None.
     """
-    if not recipients:
-        _log.info(
-            "send_budget_alert: budget %r has no recipients; "
-            "skipping (alert row still recorded).",
-            ctx.budget_name,
-        )
-        return None
+    if isinstance(recipients, dict):
+        return {ch: list(recipients.get(ch) or []) for ch in _CHANNELS}
+    if recipients:  # a non-empty bare list → email-only
+        return {"email": list(recipients), "slack_webhook": [], "pagerduty_key": []}
+    return {ch: [] for ch in _CHANNELS}
 
+
+def _send_email_channel(emails: list[str], ctx: BudgetAlertContext) -> dict[str, Any]:
+    """Render + send the branded email to the address list.
+
+    Catches the SES exceptions here (instead of bubbling to the
+    evaluator) so a transient SES blip doesn't roll back the
+    alert-event INSERT — the dashboard remains the source of truth.
+    """
     subject, html_body, text_body = render_budget_alert(ctx)
     try:
-        return send_email(
-            to=list(recipients),
+        message_id = send_email(
+            to=list(emails),
             subject=subject,
             html_body=html_body,
             text_body=text_body,
         )
-    except (SesNotConfigured, EmailDeliveryError):
-        # Re-raise so the evaluator can log structurally. We don't
-        # swallow at this layer because there's a real difference
-        # between "delivery failed" and "we chose not to send".
-        raise
+        return {"status": "ok", "message_id": message_id, "count": len(emails)}
+    except (SesNotConfigured, EmailDeliveryError) as exc:
+        _log.warning(
+            "send_budget_alert: email channel failed for budget %r: %s",
+            ctx.budget_name,
+            exc,
+        )
+        return {"status": "error", "detail": str(exc)}
+
+
+def send_budget_alert(
+    recipients: Union[dict[str, Any], list[str], None],
+    ctx: BudgetAlertContext,
+) -> dict[str, Any]:
+    """Dispatch the budget alert over every configured channel.
+
+    ``recipients`` is the per-channel config
+    ``{"email": [...], "slack_webhook": [...], "pagerduty_key": [...]}``
+    (a bare email list is accepted as email-only, back-compat).
+
+    **Best-effort + isolated**: each channel's failure is caught,
+    logged, and recorded in the returned summary — never raised. A
+    notify failure must not roll back the evaluator's alert-event row
+    (which would un-dedup the alert and re-fire next tick). Email is the
+    default channel; Slack / PagerDuty fire only when configured.
+
+    Returns a per-channel result summary (empty dict if no channel had
+    recipients — a valid "alert recorded, nobody notified" state).
+    """
+    config = _normalize_recipients(recipients)
+    summary: dict[str, Any] = {}
+
+    if config["email"]:
+        summary["email"] = _send_email_channel(config["email"], ctx)
+    if config["slack_webhook"]:
+        summary["slack"] = send_slack_alert(config["slack_webhook"], ctx)
+    if config["pagerduty_key"]:
+        summary["pagerduty"] = send_pagerduty_alert(config["pagerduty_key"], ctx)
+
+    if not summary:
+        _log.info(
+            "send_budget_alert: budget %r has no recipients on any "
+            "channel; skipping (alert row still recorded).",
+            ctx.budget_name,
+        )
+    return summary

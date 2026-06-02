@@ -20,12 +20,23 @@ from unittest.mock import MagicMock
 import pytest
 
 from vargate_telemetry.notify import email as email_mod
+from vargate_telemetry.notify import pagerduty as pagerduty_mod
+from vargate_telemetry.notify import slack as slack_mod
 from vargate_telemetry.notify.budget_alert import (
     BudgetAlertContext,
     render_budget_alert,
     send_budget_alert,
 )
 from vargate_telemetry.notify.email import EmailDeliveryError
+from vargate_telemetry.notify.pagerduty import render_pagerduty_event
+from vargate_telemetry.notify.slack import render_slack_alert
+
+
+def _ok_response() -> MagicMock:
+    """A fake httpx.Response that passes raise_for_status()."""
+    r = MagicMock()
+    r.raise_for_status.return_value = None
+    return r
 
 
 @pytest.fixture(autouse=True)
@@ -117,47 +128,140 @@ def test_scope_label_for_workspace_includes_kind_and_value() -> None:
 # ───────────────────────────────────────────────────────────────────────────
 
 
-def test_send_budget_alert_noops_on_empty_recipient_list() -> None:
-    """Empty recipients is valid configuration — wrapper returns
-    None without raising and without calling SES."""
-    result = send_budget_alert(recipients=[], ctx=_ctx())
-    assert result is None
-
-
-def test_send_budget_alert_dispatches_to_ses(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def _stub_ses(monkeypatch: pytest.MonkeyPatch, *, fail: bool = False) -> MagicMock:
     monkeypatch.setenv("OGMA_ALERT_FROM_ADDRESS", "alerts@vargate.ai")
     mock_client = MagicMock()
-    mock_client.send_email.return_value = {"MessageId": "id-xyz"}
-    monkeypatch.setattr(
-        email_mod, "_build_ses_client", lambda: mock_client
-    )
+    if fail:
+        mock_client.send_email.side_effect = RuntimeError("oops")
+    else:
+        mock_client.send_email.return_value = {"MessageId": "id-xyz"}
+    monkeypatch.setattr(email_mod, "_build_ses_client", lambda: mock_client)
+    return mock_client
 
-    msg_id = send_budget_alert(
-        recipients=["rick@vargate.ai", "ops@vargate.ai"],
+
+def test_send_budget_alert_noops_on_empty_config() -> None:
+    """No recipients on any channel is valid config — returns an empty
+    summary, no raise, no I/O. (Bare empty list = email-only-empty too.)"""
+    assert send_budget_alert(recipients={}, ctx=_ctx()) == {}
+    assert send_budget_alert(recipients=[], ctx=_ctx()) == {}
+
+
+def test_send_budget_alert_email_channel(monkeypatch: pytest.MonkeyPatch) -> None:
+    mock_client = _stub_ses(monkeypatch)
+    summary = send_budget_alert(
+        recipients={"email": ["rick@vargate.ai", "ops@vargate.ai"]},
         ctx=_ctx(),
     )
-    assert msg_id == "id-xyz"
-    args, kwargs = mock_client.send_email.call_args
+    assert summary["email"]["status"] == "ok"
+    assert summary["email"]["message_id"] == "id-xyz"
+    assert "slack" not in summary and "pagerduty" not in summary
+    _, kwargs = mock_client.send_email.call_args
     assert kwargs["Destination"]["ToAddresses"] == [
         "rick@vargate.ai",
         "ops@vargate.ai",
     ]
-    assert "Sera prod monthly" in kwargs["Message"]["Subject"]["Data"]
 
 
-def test_send_budget_alert_propagates_email_delivery_error(
+def test_send_budget_alert_accepts_legacy_email_list(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("OGMA_ALERT_FROM_ADDRESS", "alerts@vargate.ai")
-    mock_client = MagicMock()
-    mock_client.send_email.side_effect = RuntimeError("oops")
-    monkeypatch.setattr(
-        email_mod, "_build_ses_client", lambda: mock_client
-    )
+    """A bare list is still accepted as email-only (back-compat)."""
+    _stub_ses(monkeypatch)
+    summary = send_budget_alert(recipients=["rick@vargate.ai"], ctx=_ctx())
+    assert summary["email"]["status"] == "ok"
 
-    with pytest.raises(EmailDeliveryError):
-        send_budget_alert(
-            recipients=["rick@example.com"], ctx=_ctx()
-        )
+
+def test_send_budget_alert_email_error_recorded_not_raised(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An SES failure is caught + recorded in the summary, NOT raised —
+    a notify failure must not roll back the evaluator's alert row."""
+    _stub_ses(monkeypatch, fail=True)
+    summary = send_budget_alert(recipients={"email": ["x@y.com"]}, ctx=_ctx())
+    assert summary["email"]["status"] == "error"
+
+
+def test_send_budget_alert_dispatches_slack(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list = []
+    monkeypatch.setattr(
+        slack_mod,
+        "_post",
+        lambda url, payload: calls.append((url, payload)) or _ok_response(),
+    )
+    summary = send_budget_alert(
+        recipients={"slack_webhook": ["https://hooks.slack.com/services/T/B/x"]},
+        ctx=_ctx(),
+    )
+    assert summary["slack"][0]["status"] == "ok"
+    assert calls[0][0] == "https://hooks.slack.com/services/T/B/x"
+    assert "blocks" in calls[0][1]  # Block Kit payload sent
+
+
+def test_send_budget_alert_dispatches_pagerduty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list = []
+    monkeypatch.setattr(
+        pagerduty_mod,
+        "_post",
+        lambda payload: calls.append(payload) or _ok_response(),
+    )
+    summary = send_budget_alert(
+        recipients={"pagerduty_key": ["routingkey0123456789"]},
+        ctx=_ctx(threshold=Decimal("1.00")),
+    )
+    assert summary["pagerduty"][0]["status"] == "ok"
+    assert calls[0]["routing_key"] == "routingkey0123456789"
+    assert calls[0]["event_action"] == "trigger"
+    assert calls[0]["payload"]["severity"] == "critical"  # 100% -> critical
+
+
+def test_send_budget_alert_channels_are_isolated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failing Slack webhook must not stop email or PagerDuty."""
+    _stub_ses(monkeypatch)
+
+    def _slack_boom(url, payload):
+        raise RuntimeError("slack 404")
+
+    monkeypatch.setattr(slack_mod, "_post", _slack_boom)
+    monkeypatch.setattr(pagerduty_mod, "_post", lambda payload: _ok_response())
+
+    summary = send_budget_alert(
+        recipients={
+            "email": ["x@y.com"],
+            "slack_webhook": ["https://hooks.slack.com/services/T/B/x"],
+            "pagerduty_key": ["routingkey0123456789"],
+        },
+        ctx=_ctx(),
+    )
+    assert summary["email"]["status"] == "ok"
+    assert summary["slack"][0]["status"] == "error"  # isolated failure
+    assert summary["pagerduty"][0]["status"] == "ok"
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Channel renderers (pure)
+# ───────────────────────────────────────────────────────────────────────────
+
+
+def test_render_slack_alert_has_text_fallback_and_blocks() -> None:
+    payload = render_slack_alert(_ctx(threshold=Decimal("0.85")))
+    assert "Sera prod monthly" in payload["text"]
+    assert "85%" in payload["text"]
+    assert isinstance(payload["blocks"], list) and payload["blocks"]
+
+
+def test_render_pagerduty_event_shape_and_severity() -> None:
+    warn = render_pagerduty_event("rk", _ctx(threshold=Decimal("0.70")))
+    assert warn["event_action"] == "trigger"
+    assert warn["routing_key"] == "rk"
+    assert warn["payload"]["severity"] == "warning"
+    assert "Sera prod monthly" in warn["payload"]["summary"]
+    # dedup_key is stable per (budget, period, threshold).
+    crit = render_pagerduty_event("rk", _ctx(threshold=Decimal("1.00")))
+    assert crit["payload"]["severity"] == "critical"
+    assert warn["dedup_key"] != crit["dedup_key"]

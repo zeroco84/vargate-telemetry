@@ -67,8 +67,6 @@ from vargate_telemetry.celery_app import celery_app
 from vargate_telemetry.db import scheduler_session_scope, session_scope
 from vargate_telemetry.notify import (
     BudgetAlertContext,
-    EmailDeliveryError,
-    SesNotConfigured,
     send_budget_alert,
 )
 
@@ -100,7 +98,7 @@ def _evaluate_one_budget(
     scope_value: Optional[str],
     period: str,
     threshold_usd: Decimal,
-    recipients: list[str],
+    recipients: dict,  # per-channel JSONB: {email, slack_webhook, pagerduty_key}
     now: Optional[datetime] = None,
 ) -> list[Decimal]:
     """Evaluate one budget. Returns the thresholds that newly fired.
@@ -161,41 +159,31 @@ def _evaluate_one_budget(
             continue  # already fired this period
         newly_fired.append(threshold)
 
-        # Email is best-effort — failure does NOT roll back the
-        # alert row. The dashboard becomes the source of truth.
-        try:
-            send_budget_alert(
-                recipients=recipients,
-                ctx=BudgetAlertContext(
-                    budget_name=name,
-                    scope_kind=scope_kind,
-                    scope_label=_scope_label(scope_kind, scope_value),
-                    period=period,
-                    period_start=window.start_date,
-                    period_end=window.end.date(),
-                    threshold_crossed=threshold,
-                    threshold_usd=threshold_usd,
-                    current_spend_usd=spend,
-                ),
-            )
-        except SesNotConfigured:
-            _log.warning(
-                "send_budget_alert: SES not configured; alert recorded "
-                "but email NOT sent for budget %s (%s) at threshold %s",
-                budget_id,
-                name,
-                threshold,
-            )
-        except EmailDeliveryError as exc:
-            _log.exception(
-                "send_budget_alert: SES delivery failed for budget %s "
-                "(%s) at threshold %s — alert row remains; rely on "
-                "dashboard. Underlying error: %s",
-                budget_id,
-                name,
-                threshold,
-                exc,
-            )
+        # Multi-channel dispatch (email / Slack / PagerDuty) is
+        # best-effort + isolated inside send_budget_alert — a notify
+        # failure NEVER rolls back the alert row (the dashboard is the
+        # source of truth). It returns a per-channel summary; we log it.
+        summary = send_budget_alert(
+            recipients=recipients,
+            ctx=BudgetAlertContext(
+                budget_name=name,
+                scope_kind=scope_kind,
+                scope_label=_scope_label(scope_kind, scope_value),
+                period=period,
+                period_start=window.start_date,
+                period_end=window.end.date(),
+                threshold_crossed=threshold,
+                threshold_usd=threshold_usd,
+                current_spend_usd=spend,
+            ),
+        )
+        _log.info(
+            "budget alert dispatched for %s (%s) at threshold %s: %s",
+            budget_id,
+            name,
+            threshold,
+            summary,
+        )
 
     return newly_fired
 
@@ -239,7 +227,7 @@ def evaluate_budgets_for_tenant(tenant_id: str) -> dict:
                     scope_value=row.scope_value,
                     period=row.period,
                     threshold_usd=Decimal(row.threshold_usd),
-                    recipients=list(row.alert_recipients or []),
+                    recipients=row.alert_recipients or {},
                 )
                 for t in fired:
                     thresholds_fired.append(f"{row.id}:{t}")

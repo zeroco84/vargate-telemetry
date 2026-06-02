@@ -849,6 +849,34 @@ components:
         Reset cadence. UTC-aligned: daily = UTC midnight,
         weekly = ISO Monday, monthly = 1st of UTC month.
 
+    AlertRecipients:
+      type: object
+      description: |
+        Per-channel alert recipients (TM5 T5.4). Email is the default
+        channel; Slack incoming-webhook URLs and PagerDuty Events API v2
+        routing keys fire only when populated. Unknown channel keys are
+        rejected (422). Stored as the budget's `alert_recipients` JSONB.
+      additionalProperties: false
+      properties:
+        email:
+          type: array
+          default: []
+          items:
+            type: string
+            format: email
+        slack_webhook:
+          type: array
+          default: []
+          items:
+            type: string
+            description: Slack incoming-webhook URL (https://hooks.slack.com/services/...).
+        pagerduty_key:
+          type: array
+          default: []
+          items:
+            type: string
+            description: PagerDuty Events API v2 routing (integration) key.
+
     Budget:
       type: object
       required:
@@ -896,14 +924,7 @@ components:
             Always positive; the CHECK constraint at the DB
             forbids ≤ 0.
         alert_recipients:
-          type: array
-          items:
-            type: string
-            format: email
-          description: |
-            Email addresses to notify when a threshold fires. May
-            be empty (alert event still records; no email goes
-            out).
+          $ref: '#/components/schemas/AlertRecipients'
         created_at:
           type: string
           format: date-time
@@ -938,11 +959,7 @@ components:
           type: string
           description: USD cap as a string-encoded Decimal, > 0.
         alert_recipients:
-          type: array
-          items:
-            type: string
-            format: email
-          default: []
+          $ref: '#/components/schemas/AlertRecipients'
 
     BudgetUpdate:
       type: object
@@ -960,10 +977,7 @@ components:
           type: string
           description: USD cap as a string-encoded Decimal, > 0.
         alert_recipients:
-          type: array
-          items:
-            type: string
-            format: email
+          $ref: '#/components/schemas/AlertRecipients'
 
     BudgetDetail:
       allOf:
