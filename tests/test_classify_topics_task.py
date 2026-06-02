@@ -48,7 +48,9 @@ def clean() -> Iterator[None]:
     _truncate()
 
 
-def _provision_tenant(tenant_id: str) -> None:
+def _provision_tenant(
+    tenant_id: str, region: str = "us", active: bool = True
+) -> None:
     from vargate_telemetry.db import engine
 
     with engine.begin() as conn:
@@ -56,11 +58,11 @@ def _provision_tenant(tenant_id: str) -> None:
             sql_text(
                 """
                 INSERT INTO tenants (tenant_id, region, active, billing_status)
-                VALUES (:t, 'us', TRUE, 'trial')
+                VALUES (:t, :region, :active, 'trial')
                 ON CONFLICT (tenant_id) DO NOTHING
                 """
             ),
-            {"t": tenant_id},
+            {"t": tenant_id, "region": region, "active": active},
         )
 
 
@@ -262,3 +264,96 @@ def test_no_key_aborts_cleanly(
     result = classify_topics.classify_topics_for_tenant(tenant)
     assert result["skipped_no_key"] is True
     assert _topics(tenant) == []
+
+
+# ─── dispatch_classify_topics: beat fan-out / region gap (TM5 T5.0) ──────────
+
+
+@pytest.fixture
+def dispatch_tenants() -> Iterator[dict]:
+    """Seed uniquely-named tenants across regions (+ one inactive) for the
+    dispatcher tests and DELETE only those on teardown.
+
+    Scoped on purpose: a global ``TRUNCATE tenants ... CASCADE`` would
+    cascade-wipe every tenant's telemetry_records / usage_records /
+    pull_state mid-suite and clobber other tests (it broke the t2
+    pipeline test). Unique ids + subset assertions are also residue-immune
+    — other tests' tenants in the shared DB don't matter.
+    """
+    import uuid as _uuid
+
+    from vargate_telemetry.db import engine
+
+    sfx = _uuid.uuid4().hex[:8]
+    ids = {
+        "us_active": f"tnt_us_ctd_{sfx}",
+        "eu_active_1": f"tnt_eu_ctd_{sfx}_1",
+        "eu_active_2": f"tnt_eu_ctd_{sfx}_2",
+        "us_inactive": f"tnt_us_cdi_{sfx}",
+    }
+    _provision_tenant(ids["us_active"], region="us")
+    _provision_tenant(ids["eu_active_1"], region="eu")
+    _provision_tenant(ids["eu_active_2"], region="eu")
+    _provision_tenant(ids["us_inactive"], region="us", active=False)
+    yield ids
+    with engine.begin() as conn:
+        conn.execute(
+            sql_text("DELETE FROM tenants WHERE tenant_id = ANY(:ids)"),
+            {"ids": list(ids.values())},
+        )
+
+
+def _capture_dispatch(monkeypatch: pytest.MonkeyPatch) -> list:
+    """Replace classify_topics_for_tenant.delay with a recorder.
+
+    Returns the list that accumulates each dispatched tenant_id, so a test
+    can assert exactly which tenants the dispatcher fanned out to without
+    touching the broker.
+    """
+    dispatched: list = []
+    monkeypatch.setattr(
+        classify_topics.classify_topics_for_tenant,
+        "delay",
+        lambda tenant_id: dispatched.append(tenant_id),
+    )
+    return dispatched
+
+
+def test_dispatch_no_region_fans_out_to_all_active_regions(
+    dispatch_tenants: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Default (region=None, how beat calls it) dispatches EVERY active
+    tenant regardless of region — the TM5 T5.0 region-gap fix.
+
+    Subset assertions (other tests' tenants may share the DB): both
+    regions' active seeded tenants fan out; the inactive one does not.
+    """
+    dispatched = _capture_dispatch(monkeypatch)
+
+    classify_topics.dispatch_classify_topics()
+
+    ds = set(dispatched)
+    assert {
+        dispatch_tenants["us_active"],
+        dispatch_tenants["eu_active_1"],
+        dispatch_tenants["eu_active_2"],
+    } <= ds
+    assert dispatch_tenants["us_inactive"] not in ds
+
+
+def test_dispatch_explicit_region_still_filters(
+    dispatch_tenants: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An explicit region arg keeps the single-region override: only that
+    region's active tenants are dispatched (the us seeded tenant excluded).
+    """
+    dispatched = _capture_dispatch(monkeypatch)
+
+    classify_topics.dispatch_classify_topics(region="eu")
+
+    ds = set(dispatched)
+    assert {
+        dispatch_tenants["eu_active_1"],
+        dispatch_tenants["eu_active_2"],
+    } <= ds
+    assert dispatch_tenants["us_active"] not in ds

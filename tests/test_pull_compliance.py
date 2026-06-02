@@ -372,37 +372,121 @@ def test_pull_activities_skips_when_no_activity_feed_access(
 # ───────────────────────────────────────────────────────────────────────────
 
 
-def test_dispatch_compliance_content_skips_when_not_configured(
-    clean_pull_state: None,
-) -> None:
-    """The content dispatcher iterates active tenants and calls
-    `_pull_content_for_tenant` per row. Every call raises
-    NotConfigured today (no tenant has a sealed Compliance Access
-    Key), so the dispatcher counts the skips and returns the tenant
-    count. The return value is the tenant count, not the skip count
-    — the dispatcher's own metric is "how many we ATTEMPTED."
-    """
-    from vargate_telemetry.db import engine
-    from vargate_telemetry.tasks.pull_compliance import (
-        dispatch_compliance_content_pulls,
-    )
+@pytest.fixture
+def dispatch_tenants() -> Iterator[dict]:
+    """Unique-id tenants (2 us + 1 eu active, 1 eu inactive) for the
+    dispatcher tests; scoped DELETE teardown. Subset/disjoint assertions
+    keep this immune to other tests' tenants in the shared DB — never a
+    global `TRUNCATE tenants` (that cascade-wipes other tests; it broke
+    the t2 pipeline)."""
+    import uuid as _uuid
 
-    # Insert two active tenants.
+    from vargate_telemetry.db import engine
+
+    sfx = _uuid.uuid4().hex[:8]
+    ids = {
+        "us_1": f"t-cpdisp-us1-{sfx}",
+        "us_2": f"t-cpdisp-us2-{sfx}",
+        "eu_1": f"t-cpdisp-eu1-{sfx}",
+        "eu_inactive": f"t-cpdisp-eui-{sfx}",
+    }
     with engine.begin() as conn:
         conn.execute(
             sql_text(
                 "INSERT INTO tenants (tenant_id, region, active, "
-                "                     billing_status) VALUES "
-                "('t-content-a', 'us', TRUE, 'trial'), "
-                "('t-content-b', 'us', TRUE, 'trial')"
-            )
+                "billing_status) VALUES "
+                "(:u1, 'us', true, 'trial'), (:u2, 'us', true, 'trial'), "
+                "(:e1, 'eu', true, 'trial'), (:ei, 'eu', false, 'trial')"
+            ),
+            {
+                "u1": ids["us_1"],
+                "u2": ids["us_2"],
+                "e1": ids["eu_1"],
+                "ei": ids["eu_inactive"],
+            },
+        )
+    yield ids
+    with engine.begin() as conn:
+        conn.execute(
+            sql_text("DELETE FROM tenants WHERE tenant_id = ANY(:ids)"),
+            {"ids": list(ids.values())},
         )
 
-    result = dispatch_compliance_content_pulls(region="us")
 
-    # Two tenants attempted; the function returns the count attempted.
-    # All would be skipped internally with NotConfigured (logs only).
-    assert result == 2
+def test_dispatch_compliance_content_default_dispatches_all_regions(
+    dispatch_tenants: dict,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TM5 T5.0: the content dispatcher with NO region attempts every
+    active tenant across regions; explicit region filters. Also covers
+    the NotConfigured skip path — no tenant has a Compliance Access Key,
+    so each per-tenant call raises NotConfigured and the dispatcher
+    counts the attempt without crashing. We capture the attempted ids by
+    monkeypatching `_pull_content_for_tenant` (it's called directly, not
+    via .delay) to record + raise NotConfigured."""
+    from vargate_telemetry.tasks import pull_compliance
+
+    attempted: list[str] = []
+
+    def _capture(tenant_id: str) -> None:
+        attempted.append(tenant_id)
+        raise pull_compliance.NotConfigured("no compliance key (test)")
+
+    monkeypatch.setattr(
+        pull_compliance, "_pull_content_for_tenant", _capture
+    )
+
+    # Default (no region): all active tenants attempted; NotConfigured
+    # handled (returns the attempted count, doesn't crash).
+    result = pull_compliance.dispatch_compliance_content_pulls()
+    assert isinstance(result, int)
+    a = set(attempted)
+    assert {
+        dispatch_tenants["us_1"],
+        dispatch_tenants["us_2"],
+        dispatch_tenants["eu_1"],
+    } <= a
+    assert dispatch_tenants["eu_inactive"] not in a
+
+    # Explicit region filters to that region's active tenants.
+    attempted.clear()
+    pull_compliance.dispatch_compliance_content_pulls(region="eu")
+    a = set(attempted)
+    assert dispatch_tenants["eu_1"] in a
+    assert dispatch_tenants["us_1"] not in a
+
+
+def test_dispatch_compliance_activity_default_dispatches_all_regions(
+    dispatch_tenants: dict,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TM5 T5.0 for the Activity Feed dispatcher: with NO region, every
+    active tenant across regions is queued via
+    `pull_activities_for_tenant.delay`; explicit region filters. Subset
+    assertion — other tests' tenants may also be present."""
+    from vargate_telemetry.tasks import pull_compliance
+
+    dispatched: list[str] = []
+    monkeypatch.setattr(
+        pull_compliance.pull_activities_for_tenant,
+        "delay",
+        lambda tenant_id: dispatched.append(tenant_id),
+    )
+
+    pull_compliance.dispatch_compliance_activity_pulls()
+    d = set(dispatched)
+    assert {
+        dispatch_tenants["us_1"],
+        dispatch_tenants["us_2"],
+        dispatch_tenants["eu_1"],
+    } <= d
+    assert dispatch_tenants["eu_inactive"] not in d
+
+    dispatched.clear()
+    pull_compliance.dispatch_compliance_activity_pulls(region="eu")
+    d = set(dispatched)
+    assert dispatch_tenants["eu_1"] in d
+    assert dispatch_tenants["us_1"] not in d
 
 
 # ───────────────────────────────────────────────────────────────────────────

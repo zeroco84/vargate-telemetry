@@ -73,7 +73,6 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import os
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Optional
 
@@ -413,8 +412,9 @@ def pull_code_analytics_for_tenant(self, tenant_id: str) -> dict[str, Any]:
 def dispatch_code_analytics_pulls(region: Optional[str] = None) -> int:
     """Beat fan-out for the Code Analytics stream.
 
-    Enumerates active tenants in the current region and queues one
-    ``pull_code_analytics_for_tenant`` per row. Returns the count.
+    Enumerates active tenants (all regions by default; pass ``region``
+    to restrict) and queues one ``pull_code_analytics_for_tenant`` per
+    row. Returns the count.
 
     Mirrors ``pull_admin.dispatch_admin_pulls`` and
     ``pull_compliance.dispatch_compliance_activity_pulls`` — same
@@ -429,16 +429,24 @@ def dispatch_code_analytics_pulls(region: Optional[str] = None) -> int:
     Analytics is free for all Admin-API orgs per Anthropic's docs,
     that path is rare in practice.
     """
-    target_region = region or os.environ.get("VARGATE_REGION", "us")
-
+    # TM5 T5.0: default dispatches all active tenants; the region gap
+    # (defaulting to VARGATE_REGION=us) silently skipped eu tenants.
+    # region arg kept as an explicit override.
     with scheduler_session_scope() as s:
-        rows = s.execute(
-            sql_text(
-                "SELECT tenant_id FROM tenants "
-                "WHERE active = true AND region = :r"
-            ),
-            {"r": target_region},
-        ).all()
+        if region is None:
+            rows = s.execute(
+                sql_text(
+                    "SELECT tenant_id FROM tenants WHERE active = true"
+                ),
+            ).all()
+        else:
+            rows = s.execute(
+                sql_text(
+                    "SELECT tenant_id FROM tenants "
+                    "WHERE active = true AND region = :r"
+                ),
+                {"r": region},
+            ).all()
 
     for row in rows:
         pull_code_analytics_for_tenant.delay(row.tenant_id)
@@ -446,7 +454,7 @@ def dispatch_code_analytics_pulls(region: Optional[str] = None) -> int:
     _log.info(
         "dispatch_code_analytics_pulls: queued %d tenants in region %s",
         len(rows),
-        target_region,
+        region or "all",
     )
     return len(rows)
 

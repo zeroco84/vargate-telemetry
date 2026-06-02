@@ -252,24 +252,51 @@ def test_pull_isolated_per_tenant(clean_pull_state: None) -> None:
 # -------------------------- dispatch_admin_pulls -------------------------
 
 
-def test_dispatch_filters_active_and_region(
-    clean_pull_state: None,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Only active tenants in the requested region get dispatched."""
-    from vargate_telemetry.db import engine
-    from vargate_telemetry.tasks import pull_admin
+@pytest.fixture
+def dispatch_tenants() -> Iterator[dict]:
+    """Unique-id tenants (us+eu active, us inactive) for the dispatcher
+    tests; scoped DELETE teardown. Subset/disjoint assertions keep this
+    immune to other tests' tenants in the shared DB — never a global
+    `TRUNCATE tenants` (that cascade-wipes other tests; it broke t2)."""
+    import uuid as _uuid
 
+    from vargate_telemetry.db import engine
+
+    sfx = _uuid.uuid4().hex[:8]
+    ids = {
+        "us_active": f"t-padisp-us-{sfx}",
+        "eu_active": f"t-padisp-eu-{sfx}",
+        "us_inactive": f"t-padisp-ui-{sfx}",
+    }
     with engine.begin() as conn:
         conn.execute(
             sql_text(
                 "INSERT INTO tenants (tenant_id, region, active, billing_status) "
-                "VALUES "
-                "('t-us-active',   'us', true,  'paying'), "
-                "('t-us-inactive', 'us', false, 'cancelled'), "
-                "('t-eu-active',   'eu', true,  'paying')"
-            )
+                "VALUES (:ua, 'us', true, 'paying'), "
+                "(:ea, 'eu', true, 'paying'), (:ui, 'us', false, 'cancelled')"
+            ),
+            {
+                "ua": ids["us_active"],
+                "ea": ids["eu_active"],
+                "ui": ids["us_inactive"],
+            },
         )
+    yield ids
+    with engine.begin() as conn:
+        conn.execute(
+            sql_text("DELETE FROM tenants WHERE tenant_id = ANY(:ids)"),
+            {"ids": list(ids.values())},
+        )
+
+
+def test_dispatch_default_dispatches_all_active_regardless_of_region(
+    dispatch_tenants: dict,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TM5 T5.0: with no region arg (how beat calls it), every active
+    tenant is dispatched regardless of region. Subset assertion — other
+    tests' tenants may also be present in the shared DB."""
+    from vargate_telemetry.tasks import pull_admin
 
     dispatched: list[str] = []
     monkeypatch.setattr(
@@ -278,7 +305,30 @@ def test_dispatch_filters_active_and_region(
         lambda tenant_id: dispatched.append(tenant_id),
     )
 
-    count = pull_admin.dispatch_admin_pulls(region="us")
+    pull_admin.dispatch_admin_pulls()
 
-    assert count == 1
-    assert dispatched == ["t-us-active"]
+    ds = set(dispatched)
+    assert {dispatch_tenants["us_active"], dispatch_tenants["eu_active"]} <= ds
+    assert dispatch_tenants["us_inactive"] not in ds
+
+
+def test_dispatch_explicit_region_still_filters(
+    dispatch_tenants: dict,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit region arg keeps the filtered behavior: only active
+    tenants in that region get dispatched (eu excluded)."""
+    from vargate_telemetry.tasks import pull_admin
+
+    dispatched: list[str] = []
+    monkeypatch.setattr(
+        pull_admin.pull_admin_for_tenant,
+        "delay",
+        lambda tenant_id: dispatched.append(tenant_id),
+    )
+
+    pull_admin.dispatch_admin_pulls(region="us")
+
+    ds = set(dispatched)
+    assert dispatch_tenants["us_active"] in ds
+    assert dispatch_tenants["eu_active"] not in ds

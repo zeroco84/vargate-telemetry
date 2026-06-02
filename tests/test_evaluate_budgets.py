@@ -28,7 +28,9 @@ import pytest
 from sqlalchemy import text as sql_text
 
 from vargate_telemetry.notify import email as email_mod
+from vargate_telemetry.tasks import evaluate_budgets as eb_mod
 from vargate_telemetry.tasks.evaluate_budgets import (
+    dispatch_evaluate_budgets,
     evaluate_budgets_for_tenant,
 )
 
@@ -496,3 +498,92 @@ def test_soft_deleted_budget_is_not_evaluated(
     result = evaluate_budgets_for_tenant(tenant)
     assert result["budgets_checked"] == 0
     mock_ses.send_email.assert_not_called()
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Dispatcher (beat fan-out) — TM5 T5.0 region-gap fix
+# ───────────────────────────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def dispatch_tenants() -> Iterator[list[str]]:
+    """Provision uniquely-named active tenants across >1 region.
+
+    The dispatcher runs cross-tenant under ``scheduler_session_scope``
+    and ``clean_state`` does not truncate ``tenants``, so each tenant
+    is namespaced + torn down here to keep the assertions independent
+    of rows other tests leave behind.
+    """
+    from vargate_telemetry.db import engine
+
+    run = uuid.uuid4().hex[:8]
+    seeded: list[tuple[str, str]] = [
+        (f"tnt_disp_us_{run}", "us"),
+        (f"tnt_disp_eu_{run}", "eu"),
+        (f"tnt_disp_eu2_{run}", "eu"),
+    ]
+    with engine.begin() as conn:
+        for tenant_id, region in seeded:
+            conn.execute(
+                sql_text(
+                    """
+                    INSERT INTO tenants
+                        (tenant_id, region, active, billing_status)
+                    VALUES (:t, :r, TRUE, 'trial')
+                    ON CONFLICT (tenant_id) DO NOTHING
+                    """
+                ),
+                {"t": tenant_id, "r": region},
+            )
+    ids = [t for t, _ in seeded]
+    yield ids
+    with engine.begin() as conn:
+        conn.execute(
+            sql_text("DELETE FROM tenants WHERE tenant_id = ANY(:ids)"),
+            {"ids": ids},
+        )
+
+
+def test_dispatch_no_region_dispatches_all_regions(
+    dispatch_tenants: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The beat calls the dispatcher with no region. TM5 T5.0: that
+    MUST enumerate every active tenant regardless of region — the old
+    VARGATE_REGION=us default silently skipped the eu tenants that
+    hold the real data."""
+    dispatched: list[str] = []
+    fake_delay = MagicMock(side_effect=lambda t: dispatched.append(t))
+    monkeypatch.setattr(
+        eb_mod.evaluate_budgets_for_tenant, "delay", fake_delay
+    )
+
+    count = dispatch_evaluate_budgets()
+
+    # Both regions present in this run got dispatched (us AND eu).
+    seeded = set(dispatch_tenants)
+    assert seeded.issubset(set(dispatched))
+    # Return value is the total count and matches the delay() calls.
+    assert count == fake_delay.call_count
+    assert count >= len(seeded)
+
+
+def test_dispatch_explicit_region_still_filters(
+    dispatch_tenants: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An explicit region argument remains a hard filter — only that
+    region's active tenants are dispatched."""
+    dispatched: list[str] = []
+    fake_delay = MagicMock(side_effect=lambda t: dispatched.append(t))
+    monkeypatch.setattr(
+        eb_mod.evaluate_budgets_for_tenant, "delay", fake_delay
+    )
+
+    dispatch_evaluate_budgets(region="eu")
+
+    seeded = set(dispatch_tenants)
+    eu_seeded = {t for t in seeded if "_eu" in t}
+    us_seeded = {t for t in seeded if "_us" in t}
+    # The eu tenants from this run were dispatched...
+    assert eu_seeded.issubset(set(dispatched))
+    # ...and this run's us tenant was filtered out.
+    assert us_seeded.isdisjoint(set(dispatched))

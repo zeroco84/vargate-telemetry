@@ -78,7 +78,6 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import os
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
@@ -456,16 +455,24 @@ def dispatch_compliance_activity_pulls(region: Optional[str] = None) -> int:
     session scope, same per-tenant cursor model, separate task name +
     queue so the two streams don't share a beat slot.
     """
-    target_region = region or os.environ.get("VARGATE_REGION", "us")
-
+    # TM5 T5.0: default dispatches all active tenants; the region gap
+    # (defaulting to VARGATE_REGION=us) silently skipped eu tenants.
+    # region arg kept as an explicit override.
     with scheduler_session_scope() as s:
-        rows = s.execute(
-            sql_text(
-                "SELECT tenant_id FROM tenants "
-                "WHERE active = true AND region = :r"
-            ),
-            {"r": target_region},
-        ).all()
+        if region is None:
+            rows = s.execute(
+                sql_text(
+                    "SELECT tenant_id FROM tenants WHERE active = true"
+                ),
+            ).all()
+        else:
+            rows = s.execute(
+                sql_text(
+                    "SELECT tenant_id FROM tenants "
+                    "WHERE active = true AND region = :r"
+                ),
+                {"r": region},
+            ).all()
 
     for row in rows:
         pull_activities_for_tenant.delay(row.tenant_id)
@@ -473,7 +480,7 @@ def dispatch_compliance_activity_pulls(region: Optional[str] = None) -> int:
     _log.info(
         "dispatch_compliance_activity_pulls: queued %d tenants in region %s",
         len(rows),
-        target_region,
+        region or "all",
     )
     return len(rows)
 
@@ -495,16 +502,24 @@ def dispatch_compliance_content_pulls(region: Optional[str] = None) -> int:
     lands, no change required here — the per-tenant task's body
     starts succeeding and counts flow through.
     """
-    target_region = region or os.environ.get("VARGATE_REGION", "us")
-
+    # TM5 T5.0: default dispatches all active tenants; the region gap
+    # (defaulting to VARGATE_REGION=us) silently skipped eu tenants.
+    # region arg kept as an explicit override.
     with scheduler_session_scope() as s:
-        rows = s.execute(
-            sql_text(
-                "SELECT tenant_id FROM tenants "
-                "WHERE active = true AND region = :r"
-            ),
-            {"r": target_region},
-        ).all()
+        if region is None:
+            rows = s.execute(
+                sql_text(
+                    "SELECT tenant_id FROM tenants WHERE active = true"
+                ),
+            ).all()
+        else:
+            rows = s.execute(
+                sql_text(
+                    "SELECT tenant_id FROM tenants "
+                    "WHERE active = true AND region = :r"
+                ),
+                {"r": region},
+            ).all()
 
     skipped = 0
     for row in rows:
@@ -528,7 +543,7 @@ def dispatch_compliance_content_pulls(region: Optional[str] = None) -> int:
         "(no Compliance Access Key configured), region %s",
         len(rows),
         skipped,
-        target_region,
+        region or "all",
     )
     return len(rows)
 

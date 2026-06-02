@@ -38,7 +38,6 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import os
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Iterator, Optional
 
@@ -591,16 +590,24 @@ def dispatch_admin_pulls(region: Optional[str] = None) -> int:
     `tenants` is permitted (the role's GRANT posture is the gate, not
     RLS). Returns the count of dispatched tasks.
     """
-    target_region = region or os.environ.get("VARGATE_REGION", "us")
-
+    # TM5 T5.0: default dispatches all active tenants; the region gap
+    # (defaulting to VARGATE_REGION=us) silently skipped eu tenants.
+    # region arg kept as an explicit override.
     with scheduler_session_scope() as s:
-        rows = s.execute(
-            sql_text(
-                "SELECT tenant_id FROM tenants "
-                "WHERE active = true AND region = :r"
-            ),
-            {"r": target_region},
-        ).all()
+        if region is None:
+            rows = s.execute(
+                sql_text(
+                    "SELECT tenant_id FROM tenants WHERE active = true"
+                )
+            ).all()
+        else:
+            rows = s.execute(
+                sql_text(
+                    "SELECT tenant_id FROM tenants "
+                    "WHERE active = true AND region = :r"
+                ),
+                {"r": region},
+            ).all()
 
     for row in rows:
         pull_admin_for_tenant.delay(row.tenant_id)
@@ -608,6 +615,6 @@ def dispatch_admin_pulls(region: Optional[str] = None) -> int:
     _log.info(
         "dispatch_admin_pulls: queued %d tenants in region %s",
         len(rows),
-        target_region,
+        region or "all",
     )
     return len(rows)

@@ -4,10 +4,10 @@
 """Topic-classification Celery task (TM4 Track D / D2).
 
 Beat fan-out + per-tenant classifier, mirroring the ``evaluate_budgets``
-dispatcher pattern. Every 15 minutes the dispatcher enumerates active
-tenants in the current region; each per-tenant task finds MCP records
-that have a summary but no ``interaction_topics`` row, classifies them
-in batches via Claude Haiku, and writes the labels.
+dispatcher pattern. Every 15 minutes the dispatcher enumerates all active
+tenants; each per-tenant task finds MCP records that have a summary but no
+``interaction_topics`` row, classifies them in batches via Claude Haiku,
+and writes the labels.
 
 Runs both **forward** (new MCP records) and **backfills** existing ones,
 bounded by ``CLASSIFY_RUN_LIMIT`` per tenant per tick so a large backfill
@@ -22,16 +22,15 @@ Never fake a label
 - No key (``ClassifierNotConfigured``) aborts the tenant's run cleanly —
   nothing to do until the key is wired.
 
-Region note: like every dispatcher, this defaults to
-``VARGATE_REGION=us`` — see the ``ogma_dispatch_region_gap`` finding. For
-the eu demo tenant, trigger ``classify_topics_for_tenant.delay(tid)``
-directly (as with budget eval).
+Region note: TM5 T5.0 closed the ``ogma_dispatch_region_gap`` finding —
+the dispatcher now fans out to *all* active tenants by default (no longer
+``VARGATE_REGION=us``-scoped), so eu tenants are picked up automatically.
+The ``region`` arg remains as an explicit single-region override.
 """
 
 from __future__ import annotations
 
 import logging
-import os
 from typing import Optional
 
 from sqlalchemy import text as sql_text
@@ -172,19 +171,26 @@ def classify_topics_for_tenant(tenant_id: str) -> dict:
 def dispatch_classify_topics(region: Optional[str] = None) -> int:
     """Beat fan-out. Queue one classify task per active tenant in region.
 
-    Mirrors ``dispatch_evaluate_budgets`` — same role + query shape, same
-    VARGATE_REGION default caveat.
+    Mirrors ``dispatch_evaluate_budgets`` — same role + query shape.
     """
-    target_region = region or os.environ.get("VARGATE_REGION", "us")
-
+    # TM5 T5.0: default dispatches all active tenants; the region gap
+    # (defaulting to VARGATE_REGION=us) silently skipped eu tenants. region
+    # arg kept as an explicit override.
     with scheduler_session_scope() as s:
-        rows = s.execute(
-            sql_text(
-                "SELECT tenant_id FROM tenants "
-                "WHERE active = true AND region = :r"
-            ),
-            {"r": target_region},
-        ).all()
+        if region is None:
+            rows = s.execute(
+                sql_text(
+                    "SELECT tenant_id FROM tenants WHERE active = true"
+                ),
+            ).all()
+        else:
+            rows = s.execute(
+                sql_text(
+                    "SELECT tenant_id FROM tenants "
+                    "WHERE active = true AND region = :r"
+                ),
+                {"r": region},
+            ).all()
 
     for row in rows:
         classify_topics_for_tenant.delay(row.tenant_id)
@@ -192,6 +198,6 @@ def dispatch_classify_topics(region: Optional[str] = None) -> int:
     _log.info(
         "dispatch_classify_topics: queued %d tenants in region %s",
         len(rows),
-        target_region,
+        region or "all",
     )
     return len(rows)

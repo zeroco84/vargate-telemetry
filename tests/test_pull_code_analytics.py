@@ -491,3 +491,91 @@ def test_pull_code_analytics_handles_unknown_nested_fields(
     assert meta["customer_type"] == "marketplace_b2b"
     # Top-level extra survived via extra="allow".
     assert meta["seasonal_promotion_credits"] == 42
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Dispatcher (beat fan-out) — region gap fix (TM5 T5.0)
+# ───────────────────────────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def dispatch_tenants() -> Iterator[dict]:
+    """Unique-id tenants (us+eu active, us inactive) for the dispatcher
+    tests; scoped DELETE teardown. Subset/disjoint assertions keep this
+    immune to other tests' tenants in the shared DB — never a global
+    `TRUNCATE tenants` (that cascade-wipes other tests; it broke t2)."""
+    import uuid as _uuid
+
+    from vargate_telemetry.db import engine
+
+    sfx = _uuid.uuid4().hex[:8]
+    ids = {
+        "us_active": f"t-cadisp-us-{sfx}",
+        "eu_active": f"t-cadisp-eu-{sfx}",
+        "us_inactive": f"t-cadisp-ui-{sfx}",
+    }
+    with engine.begin() as conn:
+        conn.execute(
+            sql_text(
+                "INSERT INTO tenants (tenant_id, region, active, billing_status) "
+                "VALUES (:ua, 'us', true, 'paying'), "
+                "(:ea, 'eu', true, 'paying'), (:ui, 'us', false, 'cancelled')"
+            ),
+            {
+                "ua": ids["us_active"],
+                "ea": ids["eu_active"],
+                "ui": ids["us_inactive"],
+            },
+        )
+    yield ids
+    with engine.begin() as conn:
+        conn.execute(
+            sql_text("DELETE FROM tenants WHERE tenant_id = ANY(:ids)"),
+            {"ids": list(ids.values())},
+        )
+
+
+def test_dispatch_code_analytics_default_dispatches_all_regions(
+    dispatch_tenants: dict,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TM5 T5.0: with NO region argument (how beat calls it), the
+    dispatcher enumerates ALL active tenants regardless of region (the
+    old VARGATE_REGION=us default silently skipped eu). Subset assertion —
+    other tests' tenants may also be present."""
+    from vargate_telemetry.tasks import pull_code_analytics
+
+    dispatched: list[str] = []
+    monkeypatch.setattr(
+        pull_code_analytics.pull_code_analytics_for_tenant,
+        "delay",
+        lambda tenant_id: dispatched.append(tenant_id),
+    )
+
+    pull_code_analytics.dispatch_code_analytics_pulls()
+
+    ds = set(dispatched)
+    assert {dispatch_tenants["us_active"], dispatch_tenants["eu_active"]} <= ds
+    assert dispatch_tenants["us_inactive"] not in ds
+
+
+def test_dispatch_code_analytics_explicit_region_still_filters(
+    dispatch_tenants: dict,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit ``region`` argument remains an override: only active
+    tenants in that region get dispatched (eu seeded tenant excluded)."""
+    from vargate_telemetry.tasks import pull_code_analytics
+
+    dispatched: list[str] = []
+    monkeypatch.setattr(
+        pull_code_analytics.pull_code_analytics_for_tenant,
+        "delay",
+        lambda tenant_id: dispatched.append(tenant_id),
+    )
+
+    pull_code_analytics.dispatch_code_analytics_pulls(region="eu")
+
+    ds = set(dispatched)
+    assert dispatch_tenants["eu_active"] in ds
+    assert dispatch_tenants["us_active"] not in ds
