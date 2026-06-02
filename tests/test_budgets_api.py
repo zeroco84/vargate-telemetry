@@ -300,6 +300,45 @@ def test_list_rows_carry_current_spend_and_ratio(
     assert row["current_threshold_crossed"] is None
 
 
+def test_scope_label_resolves_workspace_name(
+    clean_budgets: None, client: TestClient
+) -> None:
+    """TM4 polish: workspace/api_key scopes resolve to a human name on
+    list + detail (raw id on the create response, which isn't joined)."""
+    tenant = "tnt_us_budget_scope_label"
+    _provision_tenant(tenant)
+    from vargate_telemetry.db import engine
+
+    with engine.begin() as conn:
+        conn.execute(
+            sql_text(
+                "INSERT INTO workspaces (tenant_id, workspace_id, name) "
+                "VALUES (:t, 'wrkspc_eng', 'Engineering')"
+            ),
+            {"t": tenant},
+        )
+    created = client.post(
+        "/budgets",
+        json={
+            "name": "ws cap",
+            "scope_kind": "workspace",
+            "scope_value": "wrkspc_eng",
+            "period": "monthly",
+            "threshold_usd": "100.00",
+            "alert_recipients": [],
+        },
+        headers=_bearer(tenant),
+    ).json()
+    assert created["scope_label"] is None  # create response isn't joined
+
+    rows = client.get("/budgets", headers=_bearer(tenant)).json()["rows"]
+    assert rows[0]["scope_label"] == "Engineering"
+    detail = client.get(
+        f"/budgets/{created['id']}", headers=_bearer(tenant)
+    ).json()
+    assert detail["scope_label"] == "Engineering"
+
+
 def test_create_workspace_scoped_budget(
     clean_budgets: None, client: TestClient
 ) -> None:

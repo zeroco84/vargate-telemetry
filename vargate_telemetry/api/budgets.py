@@ -149,6 +149,11 @@ class BudgetOut(BaseModel):
     created_at: datetime
     updated_at: datetime
     created_by_user_id: Optional[UUID]
+    # TM4: human name for the scope target (workspace / api_key),
+    # resolved from the side tables Usage already joins. None for tenant
+    # scope or an id the sync hasn't seen yet — the UI falls back to the
+    # raw id. Populated on list + detail; null on create/patch responses.
+    scope_label: Optional[str] = None
 
 
 class BudgetDetail(BudgetOut):
@@ -244,6 +249,34 @@ def _most_recent_threshold_crossed(
     return max(crossed) if crossed else None
 
 
+def _resolve_scope_label(
+    s: Any, scope_kind: str, scope_value: Optional[str]
+) -> Optional[str]:
+    """Human name for a workspace/api_key scope, from the same side
+    tables Usage joins (``workspaces`` / ``api_keys``). None for tenant
+    scope or an id the sync hasn't populated yet — the UI then falls
+    back to the raw id. Runs inside an open ``session_scope`` (RLS
+    scopes the lookup to the tenant)."""
+    if not scope_value:
+        return None
+    if scope_kind == "workspace":
+        table, col = "workspaces", "workspace_id"
+    elif scope_kind == "api_key":
+        table, col = "api_keys", "api_key_id"
+    else:
+        return None
+    # table/col come from a fixed allowlist above — never user input.
+    row = s.execute(
+        sql_text(
+            f"SELECT name FROM {table} "
+            f"WHERE tenant_id = current_setting('app.tenant_id') "
+            f"AND {col} = :v"
+        ),
+        {"v": scope_value},
+    ).first()
+    return row.name if row else None
+
+
 def _budget_detail_from_row(s: Any, row: Any) -> BudgetDetail:
     """Config + current-period spend / ratio / crossed-threshold for a
     budgets row. Shared by the list + detail endpoints so the roster
@@ -262,9 +295,12 @@ def _budget_detail_from_row(s: Any, row: Any) -> BudgetDetail:
         ratio = (spend / threshold).quantize(Decimal("0.0001"))
     else:  # pragma: no cover — guarded by ck_budgets_threshold_positive
         ratio = Decimal("0.0000")
-    base = _row_to_budget_out(row)
+    payload = _row_to_budget_out(row).model_dump()
+    payload["scope_label"] = _resolve_scope_label(
+        s, row.scope_kind, row.scope_value
+    )
     return BudgetDetail(
-        **base.model_dump(),
+        **payload,
         current_period_start=window.start.date(),
         current_period_end=window.end.date(),
         current_spend_usd=spend,

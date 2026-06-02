@@ -748,6 +748,15 @@ components:
             `scope_kind == tenant`. The view layer resolves
             workspace and api_key ids to human names via the
             existing side tables.
+        scope_label:
+          type: string
+          nullable: true
+          description: |
+            TM4: resolved human name for the scope target (workspace /
+            api_key), from the side tables. NULL for tenant scope or an
+            id the sync hasn't seen yet — the UI falls back to
+            scope_value. Populated on list + detail; null on
+            create/patch responses.
         period:
           $ref: '#/components/schemas/BudgetPeriod'
         threshold_usd:
