@@ -20,10 +20,15 @@ def seed_tenant() -> Iterator[str]:
     tid = f"tnt_us_seed_{uuid.uuid4().hex[:12]}"
     yield tid
     with engine.begin() as conn:
+        # FK-safe order: children before parents (events→budgets→tenants;
+        # users→tenants). Covers the volume seed's users + budgets too.
         for tbl in (
+            "budget_alert_events",
+            "budgets",
             "encrypted_secrets",
             "tenant_deks",
             "telemetry_records",
+            "users",
             "tenants",
         ):
             conn.execute(
@@ -106,3 +111,43 @@ def test_seed_populates_each_surface(seed_tenant: str) -> None:
         ).scalar_one()
     assert budgets == 1
     assert alerts == 1
+
+
+def test_seed_volume_users_activity_and_chain(seed_tenant: str) -> None:
+    from vargate_telemetry import demo_seed
+    from vargate_telemetry.chain import verify_telemetry_chain
+    from vargate_telemetry.db import session_scope
+
+    t = seed_tenant
+    r1 = demo_seed.seed_volume(t, days=3)
+    assert r1["users_added"] == 16
+    assert r1["events_added"] > 0
+    assert r1["usage_added"] == 9  # 3 days × 3 models
+    assert r1["content_added"] > 0
+
+    # Idempotent: deterministic rng + absolute-date external_ids.
+    r2 = demo_seed.seed_volume(t, days=3)
+    assert r2 == {
+        "users_added": 0,
+        "events_added": 0,
+        "usage_added": 0,
+        "content_added": 0,
+    }
+
+    # Chain stays valid after the bulk seed + the demo deletions.
+    assert verify_telemetry_chain(t).valid is True
+
+    with session_scope(t) as s:
+        users = s.execute(
+            sql_text("SELECT count(*) FROM users WHERE tenant_id = :t"),
+            {"t": t},
+        ).scalar_one()
+        mcp = s.execute(
+            sql_text(
+                "SELECT count(*) FROM telemetry_records WHERE tenant_id = :t "
+                "AND source_api = 'mcp'"
+            ),
+            {"t": t},
+        ).scalar_one()
+    assert users == 16  # the roster stitches into the Users dashboard
+    assert mcp > 0

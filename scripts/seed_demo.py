@@ -33,6 +33,18 @@ def main() -> int:
         help="Target tenant_id. REQUIRED — never defaults (seeding the "
         "wrong tenant pollutes a real audit chain).",
     )
+    ap.add_argument(
+        "--volume",
+        action="store_true",
+        help="Also seed a realistic-volume org (~16 users, ~weeks of "
+        "activity, millions of usage tokens) on top of the minimal seed.",
+    )
+    ap.add_argument(
+        "--days",
+        type=int,
+        default=30,
+        help="Days of history for --volume (default 30).",
+    )
     args = ap.parse_args()
     tenant_id = args.tenant_id.strip()
     if not tenant_id:
@@ -48,6 +60,15 @@ def main() -> int:
         print(
             f"  {surface:<8}: +{counts.get('added', 0)} added, "
             f"{counts.get('skipped', 0)} existing"
+        )
+
+    if args.volume:
+        print(f"seeding volume data ({args.days} days) …")
+        vol = demo_seed.seed_volume(tenant_id, days=args.days)
+        print(
+            f"  volume  : +{vol['users_added']} users, "
+            f"+{vol['events_added']} events, +{vol['usage_added']} usage, "
+            f"+{vol['content_added']} content"
         )
 
     v = verify_telemetry_chain(tenant_id)
