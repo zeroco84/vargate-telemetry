@@ -28,6 +28,7 @@ def seed_tenant() -> Iterator[str]:
             "encrypted_secrets",
             "tenant_deks",
             "telemetry_records",
+            "workspaces",
             "users",
             "tenants",
         ):

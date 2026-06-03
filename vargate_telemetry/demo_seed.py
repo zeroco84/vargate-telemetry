@@ -242,14 +242,22 @@ def seed_sessions(tenant_id: str) -> dict[str, int]:
 # ── usage (admin token-usage breakdowns) ───────────────────────────────────
 
 
-def _usage_result(model: str, inp: int, out: int, cache_read: int = 0) -> dict:
+def _usage_result(
+    model: str,
+    inp: int,
+    out: int,
+    cache_read: int = 0,
+    *,
+    cache_creation: int = 0,
+    workspace_id: "str | None" = None,
+) -> dict:
     return {
-        "workspace_id": None,
+        "workspace_id": workspace_id,
         "model": model,
         "input_tokens": inp,
         "output_tokens": out,
         "cache_read_input_tokens": cache_read,
-        "cache_creation_input_tokens": 0,
+        "cache_creation_input_tokens": cache_creation,
         "cache_creation": {
             "ephemeral_5m_input_tokens": 0,
             "ephemeral_1h_input_tokens": 0,
@@ -373,7 +381,7 @@ _VOL_ROSTER = [
     ("Omar Haddad", "omar"), ("Priya Rao", "priya"), ("Quinn Ross", "quinn"),
     ("Rosa Vela", "rosa"),
 ]
-_VOL_MODELS = ["claude-opus-4-7", "claude-sonnet-4-5", "claude-haiku-4-1"]
+_VOL_MODELS = ["claude-opus-4-7", "claude-sonnet-4-6", "claude-haiku-4-5"]
 _VOL_SURFACES = ["claude_code", "claude_web", "claude_desktop"]
 _VOL_PII_SAMPLES = [
     "Customer wrote in from jane.roe@client.example, phone +1 (212) 555-0188.",
@@ -523,19 +531,63 @@ def seed_volume(tenant_id: str, *, days: int = 30) -> dict[str, int]:
                 ):
                     events_added += 1
 
-    # Org-level usage — big token buckets per day/model (millions total).
+    # Org-level admin usage — priced per-model and engineered so the
+    # Insights cards light up off real data:
+    #   - model_mix: recent 7d is Opus, prior 7d is Sonnet (a cost-
+    #     impactful week-over-week share shift),
+    #   - cache_efficiency: the Opus workload writes far more cache than
+    #     it reads back (a low hit ratio worth flagging),
+    #   - workspace_attribution: spend split across a few workspaces,
+    #   - cost_forecasting: the Opus-heavy recent week projects past the
+    #     seeded monthly cap.
+    # Deterministic (no rng) so the demo cards are stable night to night.
+    _VOL_WS = [
+        ("wrkspc_demo_eng", "Engineering", 0.6),
+        ("wrkspc_demo_growth", "Growth", 0.3),
+        ("wrkspc_demo_research", "Research", 0.1),
+    ]
+    with session_scope(tenant_id) as s:
+        for wid, wname, _share in _VOL_WS:
+            s.execute(
+                sql_text(
+                    "INSERT INTO workspaces (tenant_id, workspace_id, name) "
+                    "VALUES (:t, :w, :n) "
+                    "ON CONFLICT (tenant_id, workspace_id) DO NOTHING"
+                ),
+                {"t": tenant_id, "w": wid, "n": wname},
+            )
+
     for d in range(days):
         day = today - timedelta(days=d)
         start = datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
-        for model in _VOL_MODELS:
-            inp = rng.randint(200_000, 2_000_000)
-            out = rng.randint(50_000, 500_000)
+        if d < 7:
+            model, base_in = "claude-opus-4-7", 3_000_000
+        elif d < 14:
+            model, base_in = "claude-sonnet-4-6", 1_200_000
+        else:
+            model, base_in = "claude-haiku-4-5", 800_000
+        out = base_in // 6
+        if model == "claude-opus-4-7":
+            # poor reuse: writes a lot of cache, reads little back
+            cache_creation, cache_read = int(base_in * 0.9), int(base_in * 0.07)
+        else:
+            cache_creation, cache_read = int(base_in * 0.05), int(base_in * 0.55)
+        for wid, _wn, wshare in _VOL_WS:
             md = {
                 "starting_at": start.isoformat().replace("+00:00", "Z"),
                 "ending_at": (start + timedelta(days=1)).isoformat().replace("+00:00", "Z"),
-                "results": [_usage_result(model, inp, out, int(inp * 0.4))],
+                "results": [
+                    _usage_result(
+                        model,
+                        int(base_in * wshare),
+                        int(out * wshare),
+                        cache_read=int(cache_read * wshare),
+                        cache_creation=int(cache_creation * wshare),
+                        workspace_id=wid,
+                    )
+                ],
             }
-            ext = f"demo:vol:usage:{day.isoformat()}:{model}"
+            ext = f"demo:vol:usage:{day.isoformat()}:{model}:{wid}"
             if _append_event(
                 tenant_id,
                 source_api="admin",
