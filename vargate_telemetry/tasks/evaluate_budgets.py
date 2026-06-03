@@ -134,16 +134,19 @@ def _evaluate_one_budget(
                 """
                 INSERT INTO budget_alert_events (
                     budget_id, tenant_id, period_start,
-                    threshold_crossed, current_spend_usd
+                    threshold_crossed, current_spend_usd, kind
                 )
                 VALUES (
                     :budget_id,
                     current_setting('app.tenant_id'),
                     :period_start,
                     :threshold,
-                    :spend
+                    :spend,
+                    'current_threshold'
                 )
-                ON CONFLICT (budget_id, period_start, threshold_crossed)
+                ON CONFLICT (
+                    budget_id, period_start, threshold_crossed, kind
+                )
                 DO NOTHING
                 RETURNING id::text
                 """

@@ -51,6 +51,13 @@ class BudgetAlertContext:
     threshold_crossed: Decimal  # 0.70 / 0.85 / 1.00
     threshold_usd: Decimal
     current_spend_usd: Decimal
+    # TM7 forecast alerts. ``kind`` selects the alert flavour:
+    # "current_threshold" (default) = spend has already crossed the
+    # threshold; "forecast_threshold" = spend is PROJECTED to reach it
+    # by ``projected_breach_date`` on the current pace. Both fields are
+    # defaulted so every existing call site is unaffected.
+    kind: str = "current_threshold"
+    projected_breach_date: Optional[date] = None
 
 
 def _ratio_percent(t: Decimal) -> str:
@@ -69,12 +76,149 @@ def _dashboard_url() -> str:
     ) + "/alerts"
 
 
+def _breach_date_label(d: Optional[date]) -> str:
+    """Render a projected-breach date like ``"Jun 24"`` (no leading zero).
+
+    ``%-d`` is the glibc no-pad day directive (the codebase runs on
+    Linux). Falls back to ``"month-end"`` when the date is missing — a
+    forecast alert always carries one, but the template must never blow
+    up on a None.
+    """
+    if d is None:
+        return "month-end"
+    return d.strftime("%b %-d")
+
+
+def _render_forecast_alert(ctx: BudgetAlertContext) -> tuple[str, str, str]:
+    """Build (subject, html_body, text_body) for a forecast alert.
+
+    Mirrors the current-threshold template's branded "Ogma by Vargate"
+    chrome + dashboard CTA, but the language says the threshold is
+    PROJECTED to be reached on the current pace by ``projected_breach_date``
+    — it has NOT been crossed yet.
+    """
+    pct = _ratio_percent(ctx.threshold_crossed)
+    when = _breach_date_label(ctx.projected_breach_date)
+    # No product prefix in the subject — same convention as the
+    # current-threshold alert; the From + branded template carry identity.
+    subject = (
+        f"Forecast alert — \"{ctx.budget_name}\" projected to reach "
+        f"{pct} of cap on {when}"
+    )
+
+    period_label = {
+        "daily": "Today",
+        "weekly": "This week",
+        "monthly": "This month",
+    }.get(ctx.period, ctx.period.capitalize())
+
+    text_body = (
+        f"Your budget \"{ctx.budget_name}\" is projected to reach {pct} of "
+        f"its {ctx.period} cap on {when}, at the current pace of spend.\n\n"
+        f"  Spend so far:   ${ctx.current_spend_usd}\n"
+        f"  Threshold:      ${ctx.threshold_usd}\n"
+        f"  Period:         {ctx.period_start} to {ctx.period_end}\n"
+        f"  Scope:          {ctx.scope_label}\n\n"
+        f"This is a projection, not a crossing — {period_label.lower()}'s "
+        f"spend hasn't reached the threshold yet, but Ogma's forecast expects "
+        f"it to by {when} if the current trend holds. View the alert and "
+        f"acknowledge it in the dashboard:\n\n"
+        f"  {_dashboard_url()}\n\n"
+        f"-- \n"
+        f"This alert is from Ogma by Vargate — your AI usage audit ledger.\n"
+        f"You're receiving this because you're listed as a recipient on "
+        f"the \"{ctx.budget_name}\" budget. Update recipients in\n"
+        f"Ogma → Budgets.\n"
+    )
+
+    html_body = f"""<!DOCTYPE html>
+<html>
+<body style="margin: 0; padding: 0; background: #f4f4f3;
+             font-family: -apple-system, system-ui, 'Segoe UI', sans-serif;">
+  <div style="max-width: 560px; margin: 0 auto; background: #ffffff;
+              border: 1px solid #e6e6e6; border-radius: 8px;
+              overflow: hidden;">
+    <div style="background: #1f1f1e; padding: 18px 24px;">
+      <span style="color: #ffffff; font-size: 18px; font-weight: 700;
+                   letter-spacing: -0.01em;">Ogma</span>
+      <span style="color: #9a9a98; font-size: 13px;
+                   margin-left: 8px;">by Vargate</span>
+    </div>
+    <div style="padding: 24px; font-size: 14px; color: #1f1f1e;">
+      <h2 style="font-size: 16px; font-weight: 600; margin: 0 0 16px;">
+        Forecast alert — &ldquo;{ctx.budget_name}&rdquo; projected to reach {pct} of cap on {when}
+      </h2>
+      <p style="margin: 0 0 16px;">
+        Your budget &ldquo;<strong>{ctx.budget_name}</strong>&rdquo;
+        is projected to reach <strong>{pct}</strong> of its {ctx.period} cap
+        on <strong>{when}</strong>, at the current pace of spend. This is a
+        projection &mdash; the threshold has not been crossed yet.
+      </p>
+      <table style="border-collapse: collapse; margin: 0 0 20px;">
+        <tr>
+          <td style="padding: 4px 12px 4px 0; color: #6b6b6b;">Spend so far</td>
+          <td style="padding: 4px 0; font-family: ui-monospace, monospace;">
+            ${ctx.current_spend_usd}
+          </td>
+        </tr>
+        <tr>
+          <td style="padding: 4px 12px 4px 0; color: #6b6b6b;">Threshold</td>
+          <td style="padding: 4px 0; font-family: ui-monospace, monospace;">
+            ${ctx.threshold_usd}
+          </td>
+        </tr>
+        <tr>
+          <td style="padding: 4px 12px 4px 0; color: #6b6b6b;">Projected to reach on</td>
+          <td style="padding: 4px 0;">{when}</td>
+        </tr>
+        <tr>
+          <td style="padding: 4px 12px 4px 0; color: #6b6b6b;">Period</td>
+          <td style="padding: 4px 0;">
+            {ctx.period_start} to {ctx.period_end}
+          </td>
+        </tr>
+        <tr>
+          <td style="padding: 4px 12px 4px 0; color: #6b6b6b;">Scope</td>
+          <td style="padding: 4px 0;">{ctx.scope_label}</td>
+        </tr>
+      </table>
+      <p style="margin: 0;">
+        <a href="{_dashboard_url()}"
+           style="display: inline-block; padding: 10px 18px;
+                  background: #1f1f1e; color: #ffffff;
+                  text-decoration: none; border-radius: 6px;
+                  font-weight: 500;">
+          View &amp; acknowledge in dashboard
+        </a>
+      </p>
+    </div>
+    <div style="padding: 16px 24px; border-top: 1px solid #e6e6e6;
+                color: #6b6b6b; font-size: 12px; background: #fafafa;">
+      This alert is from <strong>Ogma by Vargate</strong> — your AI usage
+      audit ledger. You're receiving this because you're listed as a
+      recipient on the &ldquo;{ctx.budget_name}&rdquo; budget.
+      Update recipients in Ogma &rarr; Budgets.
+    </div>
+  </div>
+</body>
+</html>"""
+
+    return subject, html_body, text_body
+
+
 def render_budget_alert(ctx: BudgetAlertContext) -> tuple[str, str, str]:
     """Build (subject, html_body, text_body) for the given context.
 
     Pure function — no I/O. Tested separately from the SES call so
     template changes don't depend on AWS reachability.
+
+    Dispatches on ``ctx.kind``: a ``forecast_threshold`` context renders
+    the projection-language template; the default ``current_threshold``
+    path below is byte-for-byte the original TM3 alert.
     """
+    if ctx.kind == "forecast_threshold":
+        return _render_forecast_alert(ctx)
+
     pct = _ratio_percent(ctx.threshold_crossed)
     # No product prefix in the subject — the From (Vargate.ai) and the
     # branded email template carry the identity. Keeping the subject

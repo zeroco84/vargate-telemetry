@@ -125,6 +125,24 @@ celery_app.conf.beat_schedule = {
         "schedule": 900.0,  # every 15 minutes
         "options": {"queue": "default"},
     },
+    # TM7: forecast budget alerts. Companion to dispatch-evaluate-budgets
+    # but for the month-end PROJECTION — fires when month-to-date spend
+    # is on pace to reach a threshold by month-end, before it actually
+    # crosses. Hourly is plenty: the projection moves slowly day-over-day
+    # (a 14-day linear fit), so a 60-minute cadence catches a new
+    # projected breach well within the early-warning window without
+    # re-running the forecast every 15 minutes. Same dispatcher pattern
+    # (scheduler_session_scope enumeration, per-tenant session_scope with
+    # RLS); dedup via UNIQUE (budget_id, period_start, threshold_crossed,
+    # kind) + ON CONFLICT DO NOTHING, kind='forecast_threshold'.
+    "dispatch-evaluate-forecasts": {
+        "task": (
+            "vargate_telemetry.tasks.evaluate_forecasts."
+            "dispatch_evaluate_forecasts"
+        ),
+        "schedule": 3600.0,  # every hour
+        "options": {"queue": "default"},
+    },
     # TM3 Phase C1: user-alias reconciliation. Scans telemetry for
     # distinct actor identifiers, ensures a user_aliases row exists,
     # and email-equality auto-matches against users. Same 15-minute

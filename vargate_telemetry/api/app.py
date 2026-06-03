@@ -29,6 +29,7 @@ from vargate_telemetry.api import auth as auth_routes
 from vargate_telemetry.api import budgets as budgets_routes
 from vargate_telemetry.api import compliance_key as compliance_key_routes
 from vargate_telemetry.api import content as content_routes
+from vargate_telemetry.api import insights as insights_routes
 from vargate_telemetry.api import mcp_bridge as mcp_bridge_routes
 from vargate_telemetry.api import onboarding as onboarding_routes
 from vargate_telemetry.api import sessions as sessions_routes
@@ -90,6 +91,8 @@ def _build_app() -> FastAPI:
     app.include_router(usage_routes.router)
     # TM3 Phase B2: /api/budgets + /api/budget-alerts CRUD.
     app.include_router(budgets_routes.router)
+    # TM7: /api/insights — the dashboard "what's going on" card column.
+    app.include_router(insights_routes.router)
     # TM3 Phase C2: /api/users cross-surface roster + detail + aliases.
     app.include_router(users_routes.router)
     # TM2 Phase B1: /.well-known/ogma-public-key.json — public JWK

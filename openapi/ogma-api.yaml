@@ -54,6 +54,12 @@ tags:
       surfaces (Code Analytics actor email, MCP chat user, API key);
       Ogma stitches them via user_aliases and rolls activity up per
       person. Includes manual alias mapping for unmatched identities.
+  - name: insights
+    description: |
+      The Insights page (TM7) — a permanent hub of analytical cards
+      (cache efficiency, cost forecasting, model mix, workspace
+      attribution, plus anomaly + categorization stubs). Each card
+      reports a present-tense state whether or not it has findings.
 
 # ───────────────────────────────────────────────────────────────────────────
 # Security schemes
@@ -1019,6 +1025,141 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/CacheModelStat'
+
+    # ───────────────────────────────────────────────────────────────────────
+    # Insights (TM7)
+    # ───────────────────────────────────────────────────────────────────────
+
+    InsightSeverity:
+      type: string
+      enum: [idle, advisory, warning, action]
+      description: |
+        Ascending urgency, rendered as a three-dot indicator: idle = 0
+        filled dots (nothing to act on), advisory = 1, warning = 2,
+        action = 3.
+
+    InsightItem:
+      type: object
+      required: [label]
+      description: A supporting row inside an insight card.
+      properties:
+        label:
+          type: string
+        detail:
+          type: string
+          description: Optional muted secondary text.
+        value:
+          type: string
+          description: Optional right-aligned value (count, percentage, or dollar figure).
+
+    InsightCta:
+      type: object
+      required: [label, href]
+      description: A drill-through link rendered in a card's footer.
+      properties:
+        label:
+          type: string
+        href:
+          type: string
+
+    InsightCard:
+      type: object
+      required: [id, title, severity, findings_count, headline, items]
+      description: |
+        One analytical capability's current state (TM7). The UI shows
+        `empty_state` in place of the headline when `findings_count` is
+        0. `cta` is null when the card has no drill-through page.
+      properties:
+        id:
+          type: string
+          description: Stable card id (`cache_efficiency`, `cost_forecasting`, …).
+        title:
+          type: string
+        severity:
+          $ref: '#/components/schemas/InsightSeverity'
+        findings_count:
+          type: integer
+        headline:
+          type: string
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/InsightItem'
+        empty_state:
+          type: string
+          nullable: true
+          description: Present-tense "what this watches for" prose, shown when there are no findings.
+        cta:
+          $ref: '#/components/schemas/InsightCta'
+
+    InsightsResponse:
+      type: object
+      required: [window, refreshed_at, cards]
+      description: The full ordered column of insight cards for a tenant (TM7).
+      properties:
+        window:
+          type: string
+          description: Trailing window code echoed back (`7d`, `30d`).
+        refreshed_at:
+          type: string
+          format: date-time
+        cards:
+          type: array
+          items:
+            $ref: '#/components/schemas/InsightCard'
+
+    ForecastDailyPoint:
+      type: object
+      required: [date, usd]
+      description: One UTC day of actual spend in the forecast series.
+      properties:
+        date:
+          type: string
+          format: date
+        usd:
+          type: number
+
+    ForecastBudget:
+      type: object
+      required: [name, threshold_usd]
+      description: An active monthly tenant-scope budget cap, for the chart overlay.
+      properties:
+        name:
+          type: string
+        threshold_usd:
+          type: number
+
+    ForecastDetailResponse:
+      type: object
+      required: [period_start, period_end, current_spend, projected_end, days_remaining, days_of_data, daily_series, budgets]
+      description: |
+        Current-month spend projection + budget caps backing the
+        Cost-forecasting detail page (TM7). Money is serialised as plain
+        JSON numbers (USD).
+      properties:
+        period_start:
+          type: string
+          format: date
+        period_end:
+          type: string
+          format: date
+        current_spend:
+          type: number
+        projected_end:
+          type: number
+        days_remaining:
+          type: integer
+        days_of_data:
+          type: integer
+          description: Distinct days of actual data behind the projection (< 7 → the UI shows a not-enough-data state).
+        daily_series:
+          type: array
+          items:
+            $ref: '#/components/schemas/ForecastDailyPoint'
+        budgets:
+          type: array
+          items:
+            $ref: '#/components/schemas/ForecastBudget'
 
     # ───────────────────────────────────────────────────────────────────────
     # Budgets (TM3 Phase B)
@@ -2491,6 +2632,72 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/CacheRecommendationsResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Insights (TM7)
+  # ─────────────────────────────────────────────────────────────────────────
+
+  /insights:
+    get:
+      tags: [insights]
+      summary: Insight cards for the authenticated tenant
+      description: |
+        The Insights page (TM7): an ordered column of analytical cards,
+        one per capability (cache efficiency, cost forecasting, anomaly
+        detection, activity categorization, model mix, workspace
+        attribution). Each card reports a present-tense state — findings
+        to act on, or an idle "no findings" state — so the page is a
+        permanent surface whether or not anything is firing. Per-card
+        failures are isolated server-side and never 500 the page.
+      operationId: getInsights
+      parameters:
+        - in: query
+          name: window
+          schema:
+            type: string
+            enum: [7d, 30d]
+            default: 7d
+          description: Trailing analysis window. Unknown values fall back to 7d.
+      responses:
+        '200':
+          description: The ordered insight-card column.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InsightsResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /insights/forecast:
+    get:
+      tags: [insights]
+      summary: Current-month spend projection + budget caps
+      description: |
+        Backs the Cost-forecasting drill-in page (TM7): the trailing
+        daily-spend series, a linear month-end projection over the last
+        14 days, and the active monthly tenant-scope budget caps to
+        overlay. `days_of_data` < 7 means the projection is not yet
+        meaningful and the UI shows a not-enough-data state. The
+        projection is intentionally a simple linear trend; actual spend
+        varies with usage.
+      operationId: getForecastDetail
+      responses:
+        '200':
+          description: Spend projection + budget caps for the current UTC month.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ForecastDetailResponse'
         '400':
           $ref: '#/components/responses/BadRequest'
         '401':
