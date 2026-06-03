@@ -39,7 +39,6 @@ from decimal import Decimal
 
 from sqlalchemy import text as sql_text
 
-from vargate_telemetry.api.usage import _cache_recommendation
 from vargate_telemetry.db import session_scope
 from vargate_telemetry.insights import spend_data
 from vargate_telemetry.insights.models import (
@@ -99,6 +98,15 @@ _MODEL_TOKENS_SQL = sql_text(
 
 def build_card(tenant_id: str, window: str) -> Card:
     """Build the cache-efficiency card for ``tenant_id`` over ``window``."""
+    # Lazy import (not module-level): the tiering helper lives in
+    # api/usage.py, and the api package __init__ imports api.app, which
+    # mounts the insights router — so importing it at module load creates
+    # an insights -> api -> app -> insights cycle that only happens to
+    # resolve when api.app is imported first. By the time build_card runs
+    # the app is fully loaded, so a call-time import is always safe and
+    # lets `insights` be imported standalone (scripts, ad-hoc checks).
+    from vargate_telemetry.api.usage import _cache_recommendation
+
     days = spend_data.window_to_days(window)
 
     with session_scope(tenant_id) as s:
