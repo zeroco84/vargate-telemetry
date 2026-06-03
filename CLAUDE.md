@@ -359,3 +359,25 @@ SES rate limits and sandbox status are also in that doc. Pin boto3 version in `r
 The user-detail heatmap (GitHub-style 7-row × N-day grid) lives in `packages/design-system/src/Heatmap.tsx`, modeled on the existing `Sparkline` pattern: pure SVG, no chart library, props are `cells: HeatmapCell[]`. Cells colored by event density per day, tone-shifted by source. Tooltip on hover surfaces the date + count + source breakdown.
 
 Defer fancy interactions (zoom, multi-week ranges, click-to-drill) to TM4 if they're not needed for the demo. The cell hover is the only interaction this sprint needs.
+
+---
+
+# TM7 conventions (Insights page)
+
+> The Insights page sprint — numbered **TM7** (it follows TM6; an earlier draft labelled it TM4, which collided with the post-TM3 completion sprint). The rules below are about the Insights surface.
+
+## Insights cards are registry-driven — adding one is a module + a registry line
+
+The Insights page (`/insights`) renders whatever `insights/registry.py` lists, in display order. Each card is a module under `insights/cards/` exposing `CARD_ID`, `CARD_TITLE`, and `build_card(tenant_id, window) -> Card`. The aggregator runs each and **isolates failures** — a card that raises is logged and replaced with an idle "temporarily unavailable" card, so one bad analysis never 500s the page. **Adding a capability in a future sprint is a new card module + one line in the registry — never a change to the route, the response shape, or the page.** A card with nothing to act on returns `idle_card(...)` with present-tense "what this watches for" copy; the page is a permanent surface, not a list that empties out.
+
+---
+
+## Cost-forecast math is deliberately a linear fit — don't gild it without evidence
+
+`insights.spend_data.project_period_end` projects month-end spend with a hand-rolled least-squares line over the trailing 14 days. This is intentionally crude: the value is the *alert* ("on pace to blow the cap by the 24th"), not decimal precision. The limitation is stated in the card's empty-state copy and the forecast detail page's "actual spend may vary" note. **Resist replacing it with a seasonal/exponential/ML forecaster until there's empirical evidence the extra complexity changes a decision** — a wrong-but-simple trend that says "act now" beats a sophisticated one nobody can audit.
+
+---
+
+## Forecast alerts reuse the budget-alert framework — distinguished by `kind`, not new machinery
+
+The `forecast_threshold` alert is the same `send_budget_alert` → email/Slack/PagerDuty path as the `current_threshold` alert, the same `budget_alert_events` table, the same `render_budget_alert` template. The only differences: a `kind` column (migration `0024`, joined into `uq_budget_alert_events_dedup` so the two kinds dedup independently) and a forecast subject/body variant. **Don't build a parallel notification stack for a new alert flavour — add a `kind` and a template branch.** A forecast alert says spend is *projected* to cross a threshold by month-end on current pace; a current alert says it *has* crossed. Both fire at most once per `(budget, period, threshold, kind)`.
