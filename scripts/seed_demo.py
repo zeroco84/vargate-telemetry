@@ -46,8 +46,8 @@ def main() -> int:
     result = demo_seed.seed_all(tenant_id)
     for surface, counts in result.items():
         print(
-            f"  {surface:<8}: +{counts['added']} added, "
-            f"{counts['skipped']} existing"
+            f"  {surface:<8}: +{counts.get('added', 0)} added, "
+            f"{counts.get('skipped', 0)} existing"
         )
 
     v = verify_telemetry_chain(tenant_id)

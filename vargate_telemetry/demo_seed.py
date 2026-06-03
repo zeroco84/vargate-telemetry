@@ -287,8 +287,78 @@ def seed_usage(tenant_id: str) -> dict[str, int]:
     return {"added": added, "skipped": skipped}
 
 
+_DEMO_BUDGET_NAME = "Demo: monthly spend cap"
+
+
+def seed_budgets(tenant_id: str) -> dict[str, int]:
+    """Seed a tenant-scoped monthly budget with Slack + email alert
+    channels, plus one fired (unacknowledged) alert event — so the Budgets
+    list/detail, the /alerts view, and the alert-channel edit / Send-test
+    flows are all demoable. Idempotent (keyed on the budget name)."""
+    from datetime import date
+
+    recipients = {
+        "email": ["alerts@demo.example.com"],
+        # A placeholder webhook — the channel shows as configured ("Slack:
+        # 1 webhook"); swap a real URL via the Edit form to see live
+        # delivery. Send-test-alert will attempt it (best-effort).
+        "slack_webhook": [
+            "https://hooks.slack.com/services/T00DEMO00/B00DEMO00/"
+            "demoDEMOdemoDEMOdemo0000"
+        ],
+        "pagerduty_key": [],
+    }
+    added = 0
+    with session_scope(tenant_id) as s:
+        existing = s.execute(
+            sql_text(
+                "SELECT id FROM budgets WHERE tenant_id = :t AND name = :n "
+                "AND deleted_at IS NULL"
+            ),
+            {"t": tenant_id, "n": _DEMO_BUDGET_NAME},
+        ).first()
+        if existing is None:
+            bid = s.execute(
+                sql_text(
+                    "INSERT INTO budgets (tenant_id, name, scope_kind, "
+                    "scope_value, period, threshold_usd, alert_recipients) "
+                    "VALUES (:t, :n, 'tenant', NULL, 'monthly', 500.00, "
+                    "CAST(:r AS jsonb)) RETURNING id"
+                ),
+                {"t": tenant_id, "n": _DEMO_BUDGET_NAME, "r": json.dumps(recipients)},
+            ).scalar_one()
+            added += 1
+        else:
+            bid = existing.id
+
+        has_event = (
+            s.execute(
+                sql_text(
+                    "SELECT 1 FROM budget_alert_events WHERE budget_id = :b "
+                    "LIMIT 1"
+                ),
+                {"b": str(bid)},
+            ).first()
+            is not None
+        )
+        if not has_event:
+            s.execute(
+                sql_text(
+                    "INSERT INTO budget_alert_events (budget_id, tenant_id, "
+                    "period_start, threshold_crossed, current_spend_usd) "
+                    "VALUES (:b, :t, :ps, 0.85, 425.00)"
+                ),
+                {
+                    "b": str(bid),
+                    "t": tenant_id,
+                    "ps": date.today().replace(day=1),
+                },
+            )
+    return {"added": added, "skipped": 1 - added}
+
+
 def seed_all(tenant_id: str) -> dict[str, dict[str, int]]:
-    """Ensure the tenant + seed all three surfaces. Idempotent."""
+    """Ensure the tenant + seed every surface. Idempotent."""
     if not tenant_id:
         raise ValueError("tenant_id required")
     ensure_tenant(tenant_id)
@@ -296,4 +366,5 @@ def seed_all(tenant_id: str) -> dict[str, dict[str, int]]:
         "content": seed_content(tenant_id),
         "sessions": seed_sessions(tenant_id),
         "usage": seed_usage(tenant_id),
+        "budgets": seed_budgets(tenant_id),
     }

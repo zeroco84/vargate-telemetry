@@ -53,12 +53,14 @@ def test_seed_all_idempotent_and_chain_valid(seed_tenant: str) -> None:
     assert r1["content"]["added"] == 7  # 3 + 2 + 2 messages
     assert r1["sessions"]["added"] == 6
     assert r1["usage"]["added"] == 3
+    assert r1["budgets"]["added"] == 1
 
     # Re-run: everything already present → nothing added (idempotent).
     r2 = demo_seed.seed_all(t)
     assert r2["content"]["added"] == 0
     assert r2["sessions"]["added"] == 0
     assert r2["usage"]["added"] == 0
+    assert r2["budgets"]["added"] == 0
 
     # Chain verifies after seeding — incl. the demo deletion event.
     assert verify_telemetry_chain(t).valid is True
@@ -84,3 +86,23 @@ def test_seed_populates_each_surface(seed_tenant: str) -> None:
     )
     # Usage rows.
     assert _count(t, "record_type = 'usage' AND source_api = 'admin'") == 3
+
+    # A budget + one fired alert event (Budgets + /alerts surfaces).
+    from vargate_telemetry.db import session_scope
+
+    with session_scope(t) as s:
+        budgets = s.execute(
+            sql_text(
+                "SELECT count(*) FROM budgets WHERE tenant_id = :t "
+                "AND deleted_at IS NULL"
+            ),
+            {"t": t},
+        ).scalar_one()
+        alerts = s.execute(
+            sql_text(
+                "SELECT count(*) FROM budget_alert_events WHERE tenant_id = :t"
+            ),
+            {"t": t},
+        ).scalar_one()
+    assert budgets == 1
+    assert alerts == 1
