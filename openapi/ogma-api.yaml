@@ -382,6 +382,127 @@ components:
             tree is empty.
           examples: ["Acme Enterprise"]
 
+    OpenAIValidateKeyRequest:
+      type: object
+      required: [admin_key]
+      description: |
+        Body for both `/onboarding/openai/validate-key` and
+        `/onboarding/openai/submit` (TM8 Phase C).
+      properties:
+        admin_key:
+          type: string
+          description: |
+            OpenAI organization Admin API key (begins `sk-admin-`),
+            created at platform.openai.com → Settings → Admin keys.
+            Distinct from a standard project key (`sk-…` / `sk-proj-…`),
+            which cannot reach the organization endpoints.
+          minLength: 20
+          examples: ["sk-admin-..."]
+
+    OpenAIKeyCapabilities:
+      type: object
+      required:
+        [admin, costs, audit_logs, project_users, per_user_breakdown]
+      description: |
+        Which OpenAI Admin org endpoints the supplied key reaches (TM8
+        Phase C). Field names mirror the `openai` block of
+        `GET /me/capabilities` so one UI matrix renders both. Each bool is
+        a read-only probe against the matching endpoint family:
+
+          - `admin`              — `/usage/completions` reachable (200).
+          - `costs`              — `/costs` reachable (200).
+          - `audit_logs`         — `/audit_logs` reachable (200). NOTE
+            this is *accessibility*, not population — the endpoint 200s
+            but is empty below Enterprise (recon §4). The data-layer
+            capability in `/me/capabilities` stays False until a row
+            lands; this onboarding checklist reports reachability so the
+            user sees the key works.
+          - `project_users`      — `/users` returned at least one row.
+          - `per_user_breakdown` — a `group_by=user_id` usage row carried
+            a non-null `user_id` (PAYG already populates this, recon §2);
+            drives the honest cross-vendor user-view empty-state.
+      properties:
+        admin:
+          type: boolean
+        costs:
+          type: boolean
+        audit_logs:
+          type: boolean
+        project_users:
+          type: boolean
+        per_user_breakdown:
+          type: boolean
+
+    OpenAIValidateKeyResponse:
+      type: object
+      required: [valid, capabilities]
+      description: |
+        Result of the read-only OpenAI key probe (TM8 Phase C). The key
+        is NOT sealed by validate-key.
+      properties:
+        valid:
+          type: boolean
+          description: |
+            True iff the key authenticated (at least `/usage/completions`
+            reachable). False — with a `reason` — when OpenAI rejected the
+            key (401/403) or the wrong key type was pasted. The endpoint
+            never 500s on a bad key; the UI branches on `valid`, rendering
+            the `reason` when false.
+        org_id:
+          type: string
+          nullable: true
+          description: |
+            The OpenAI organization id the key belongs to (`org-…`),
+            harvested from the costs probe (the only endpoint that returns
+            `organization_id`, recon §3). Null if costs is unreachable /
+            empty.
+          examples: ["org-abc123"]
+        reason:
+          type: string
+          nullable: true
+          description: |
+            Human-readable explanation when `valid` is false (rejected
+            key, or wrong key type). Null on success.
+        capabilities:
+          $ref: '#/components/schemas/OpenAIKeyCapabilities'
+
+    OpenAISubmitResponse:
+      type: object
+      required: [sealed, region, capabilities]
+      description: |
+        Result of sealing an OpenAI Admin key + enqueuing the backfill
+        (TM8 Phase C).
+      properties:
+        sealed:
+          type: boolean
+          description: True once the key is validated + sealed for the tenant.
+        region:
+          type: string
+          description: |
+            Always `us` — OpenAI exposes no EU data-residency region
+            (recon §5). Echoed for symmetry with the Anthropic flow.
+          examples: ["us"]
+        org_id:
+          type: string
+          nullable: true
+          description: The OpenAI organization id the key belongs to.
+          examples: ["org-abc123"]
+        capabilities:
+          $ref: '#/components/schemas/OpenAIKeyCapabilities'
+        backfill_enqueued:
+          type: array
+          items:
+            type: string
+          description: |
+            The OpenAI ingest streams whose one-shot backfill pulls were
+            enqueued on submit (e.g. `openai_admin_usage`,
+            `openai_admin_costs`, `openai_projects`). The 15-minute beat
+            picks the streams up thereafter; these dispatches seed the
+            dashboard immediately. Empty if the dispatch hiccuped (the key
+            is still sealed and the beat will catch up).
+          examples:
+            [["openai_admin_usage", "openai_admin_costs", "openai_projects"]]
+
     ChatSummary:
       type: object
       required:
@@ -1969,6 +2090,137 @@ paths:
         '503':
           description: |
             `code: anthropic_rate_limited` — Anthropic rate-limited the
+            validation probe. Safe to retry after the indicated delay.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /onboarding/openai/validate-key:
+    post:
+      tags: [onboarding]
+      summary: Validate an OpenAI Admin API key (probe only, no seal)
+      description: |
+        Probes OpenAI's organization Admin API with the supplied key
+        (`sk-admin-…`) and returns a capability checklist — which org
+        endpoint families the key reaches — WITHOUT sealing it. The seal
+        + backfill happen in `/onboarding/openai/submit` (admin-gated).
+
+        OpenAI is Ogma's first non-Anthropic vendor; this is the
+        second-vendor card on the onboarding / Settings → Integrations
+        grid, alongside the Anthropic key. The checklist field names
+        mirror the `openai` block of `GET /me/capabilities` so the same
+        UI matrix renders both.
+
+        A rejected key (401/403 on the admin probe) or the wrong key type
+        returns `valid: false` with a human `reason` — **never a 500**: a
+        bad paste is a normal UI state, not a server error. Requires a
+        signed-in user (read-only probe, no tenant side effects); the
+        admin gate lands on submit.
+
+        TM8 Phase C. Built blind against the recon contract; the live
+        probe is verified once a real `sk-admin-` key is submitted.
+      operationId: validateOpenAIKey
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OpenAIValidateKeyRequest'
+      responses:
+        '200':
+          description: |
+            Probe completed. `valid` is true when the key authenticated
+            (checklist populated), false when OpenAI rejected it or the
+            wrong key type was pasted (with a `reason`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OpenAIValidateKeyResponse'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '503':
+          description: |
+            `code: openai_rate_limited` — OpenAI rate-limited the
+            validation probe. Safe to retry after the indicated delay.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /onboarding/openai/submit:
+    post:
+      tags: [onboarding]
+      summary: Validate + seal an OpenAI Admin key and enqueue the backfill
+      description: |
+        Re-probes the supplied OpenAI Admin key (`sk-admin-…`), seals it
+        for the caller's tenant under `openai_admin_key` (UPSERT —
+        re-submitting rotates), then enqueues the historical backfill: the
+        per-tenant usage / costs / projects pull tasks. The 15-minute beat
+        picks the streams up thereafter; these one-shot dispatches seed
+        the dashboard immediately. The OpenAI `admin` capability in
+        `GET /me/capabilities` flips True the moment the key is sealed
+        (before the first pull lands a row).
+
+        Region is always `us` (OpenAI has no EU residency, recon §5).
+
+        Admin-gated (`require_admin`). A bad / wrong-type key is rejected
+        with a `code`-tagged 400 and nothing is sealed, so there is no
+        partial state. The tenant must already be provisioned (have a DEK
+        from Anthropic region-select) — otherwise `409
+        tenant_not_provisioned`.
+
+        TM8 Phase C. Built blind against the recon contract; the live
+        seal + backfill is verified once a real `sk-admin-` key lands.
+      operationId: submitOpenAIKey
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OpenAIValidateKeyRequest'
+      responses:
+        '200':
+          description: Key validated + sealed; the usage/costs/projects backfill is enqueued.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OpenAISubmitResponse'
+        '400':
+          description: |
+            The key is the wrong type (`code: wrong_key_type` — a standard
+            project key was pasted) or was rejected by OpenAI
+            (`code: invalid_openai_key`). The UI branches on `code`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          description: |
+            `code: admin_required` — the caller is not an admin of their
+            tenant. Sealing tenant credentials is an admin action.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: |
+            `code: tenant_not_provisioned` — the tenant has no DEK. Finish
+            Anthropic onboarding (region select) before connecting an
+            OpenAI Admin key.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: |
+            `code: openai_rate_limited` — OpenAI rate-limited the
             validation probe. Safe to retry after the indicated delay.
           content:
             application/json:

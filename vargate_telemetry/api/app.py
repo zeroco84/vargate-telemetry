@@ -32,6 +32,7 @@ from vargate_telemetry.api import content as content_routes
 from vargate_telemetry.api import insights as insights_routes
 from vargate_telemetry.api import mcp_bridge as mcp_bridge_routes
 from vargate_telemetry.api import onboarding as onboarding_routes
+from vargate_telemetry.api import openai_onboarding as openai_onboarding_routes
 from vargate_telemetry.api import sessions as sessions_routes
 from vargate_telemetry.api import usage as usage_routes
 from vargate_telemetry.api import users as users_routes
@@ -84,6 +85,10 @@ def _build_app() -> FastAPI:
     # TM5 T5.1: POST /onboarding/compliance-key — validate + seal a
     # Compliance Access Key, enabling content capture (admin-gated).
     app.include_router(compliance_key_routes.router)
+    # TM8 Phase C: POST /onboarding/openai/{validate-key,submit} — probe +
+    # seal an OpenAI Admin key (second-vendor onboarding; admin-gated
+    # submit enqueues the usage/costs/projects backfill).
+    app.include_router(openai_onboarding_routes.router)
     # TM5 T5.3: GET /content/chats[/{id}] — read-only compliance content
     # view (list captured chats + decrypt-on-read message view).
     app.include_router(content_routes.router)
