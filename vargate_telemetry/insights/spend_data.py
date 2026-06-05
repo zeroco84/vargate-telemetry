@@ -18,6 +18,27 @@ array). This module owns the read shapes the cards need:
 - :func:`project_period_end` — a never-raises month-to-date forecast
   built on a hand-rolled least-squares fit over the trailing 14 days.
 
+Cross-vendor (TM8 Phase D)
+--------------------------
+
+The four functions above are the **Anthropic-only** primitives (they
+hardcode ``source_api = 'admin'``) and are unchanged — every existing
+caller keeps its exact behavior. TM8 adds a parallel, **additive**
+per-vendor layer that does NOT touch them:
+
+- :func:`vendor_spend_breakdown` — ``vendor -> VendorSpend`` over a
+  window: Anthropic spend is usage-token-**estimated** (same numbers as
+  :func:`daily_spend`); OpenAI spend is **authoritative** from the
+  ``openai_admin_costs`` stream (``amount.value``) when present, else
+  usage-estimated — and each :class:`VendorSpend` carries a ``basis``
+  flag so the UI can label which is which.
+- :func:`vendor_daily_spend` — the per-vendor daily series feeding a
+  vendor-stacked forecast chart.
+
+Both route usage-derived figures through
+:func:`vendor_cost.estimate_record_cost_usd` (the cross-vendor cost
+primitive) rather than re-implementing each vendor's token extraction.
+
 Each function opens its own :func:`session_scope` so a card can call
 them independently without threading a session around. Cost is always
 USD via :func:`compute_cost_usd`, computed once per bucket against the
@@ -54,6 +75,11 @@ from sqlalchemy import text as sql_text
 from vargate_telemetry.budgets import compute_spend_in_window
 from vargate_telemetry.db import session_scope
 from vargate_telemetry.pricing import compute_cost_usd
+from vargate_telemetry.pricing.vendor_cost import (
+    VENDOR_ANTHROPIC,
+    VENDOR_OPENAI,
+    estimate_record_cost_usd,
+)
 
 _log = logging.getLogger(__name__)
 
@@ -496,3 +522,287 @@ def project_period_end(tenant_id: str) -> ForecastResult:
             period_start=period_start_date,
             period_end=period_end_date,
         )
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Cross-vendor spend (TM8 Phase D) — additive; the Anthropic-only
+# primitives above are untouched.
+# ───────────────────────────────────────────────────────────────────────────
+#
+# Per-vendor "best source" (TM8 conventions, "/usage and /costs are
+# complementary"):
+#   - Anthropic: usage-token ESTIMATED (no authoritative billed feed in
+#     Ogma) — same numbers daily_spend produces.
+#   - OpenAI: AUTHORITATIVE from the openai_admin_costs stream
+#     (amount.value, includes non-token line items) when that stream has
+#     data in the window; else fall back to the usage-token ESTIMATE
+#     from openai_admin_usage. Either way LABEL which basis was used.
+#
+# Both paths price usage records through
+# ``vendor_cost.estimate_record_cost_usd`` (Python-side, per record)
+# rather than the SQL token-SUM the Anthropic primitives use. The
+# numeric result for Anthropic equals ``daily_spend`` — pricing is
+# linear in tokens, and within one UTC day every record shares the same
+# (UTC-midnight-bounded) rate window, so summing per-record costs equals
+# pricing the per-(day, model) token SUM.
+
+# Usage-derived basis labels surfaced on VendorSpend.basis.
+BASIS_ESTIMATED = "estimated"
+BASIS_AUTHORITATIVE = "authoritative"
+
+# source_api values the per-vendor roll-up reads. The Anthropic usage
+# stream + the two OpenAI streams (token usage + authoritative costs).
+_SOURCE_ANTHROPIC_USAGE = "admin"
+_SOURCE_OPENAI_USAGE = "openai_admin_usage"
+_SOURCE_OPENAI_COSTS = "openai_admin_costs"
+
+
+@dataclass
+class VendorSpend:
+    """One vendor's spend over a window, with the basis it was derived from.
+
+    ``vendor`` is the display name (``"Anthropic"`` / ``"OpenAI"``).
+    ``usd`` is the window total, quantized to cents. ``basis`` is
+    ``"estimated"`` (usage-token × rate card) or ``"authoritative"``
+    (OpenAI's billed ``/costs`` amounts) — the UI labels the figure
+    accordingly so customers know Anthropic is an estimate while OpenAI
+    can be the real billed number. ``daily`` is the per-UTC-day series
+    (ascending, sparse — days with no priceable spend omitted) so a card
+    can stack the vendors on one chart.
+    """
+
+    vendor: str
+    usd: Decimal
+    basis: str
+    daily: list[tuple[date, Decimal]] = field(default_factory=list)
+
+
+def _price_usage_records_by_day(
+    tenant_id: str, days: int, source_api: str
+) -> dict[date, Decimal]:
+    """Per-UTC-day estimated spend for one usage ``source_api`` stream.
+
+    Fetches each record's ``(occurred_at, metadata)`` over the trailing
+    ``days`` and prices it via
+    :func:`vendor_cost.estimate_record_cost_usd` (which dispatches on
+    ``source_api``). Records that price to ``None`` (null/unknown model,
+    empty-bucket sentinels) contribute nothing — a day with no priceable
+    spend is omitted, matching :func:`daily_spend`'s sparse-series
+    contract.
+
+    For ``source_api='admin'`` the totals equal :func:`daily_spend`'s:
+    pricing is linear in tokens, and the per-record ``occurred_at`` lands
+    in the same UTC-day rate window the SQL path's ``MIN(occurred_at)``
+    picks (rate-card windows are dated at UTC-midnight boundaries, so two
+    records for the same ``(day, model)`` can't straddle a rate change).
+
+    Unlike the SQL primitives this does NOT apply the supersession
+    filter — it doesn't need to: a legacy aggregate breakdown
+    (``model=null``) prices to ``None`` and contributes nothing, so it
+    can't double-count against the per-model rows on the same day. That
+    is exactly the posture :func:`daily_spend` documents.
+    """
+    sql = sql_text(
+        """
+        SELECT tr.occurred_at, tr.metadata
+        FROM telemetry_records tr
+        WHERE tr.tenant_id = current_setting('app.tenant_id')
+          AND tr.record_type = 'usage'
+          AND tr.source_api = :source_api
+          AND tr.occurred_at >= (now() AT TIME ZONE 'UTC')
+              - make_interval(days => :days)
+        """
+    )
+
+    per_day: dict[date, Decimal] = {}
+    with session_scope(tenant_id) as s:
+        rows = s.execute(
+            sql, {"days": days, "source_api": source_api}
+        ).all()
+
+    for row in rows:
+        occurred = row.occurred_at
+        if occurred is None:
+            continue
+        if occurred.tzinfo is None:
+            occurred = occurred.replace(tzinfo=timezone.utc)
+        cost = estimate_record_cost_usd(
+            source_api, row.metadata or {}, occurred
+        )
+        if cost is None:
+            continue
+        day = occurred.astimezone(timezone.utc).date()
+        per_day[day] = per_day.get(day, Decimal("0")) + cost
+
+    return per_day
+
+
+def _openai_actual_spend_by_day(
+    tenant_id: str, days: int
+) -> dict[date, Decimal]:
+    """Per-UTC-day AUTHORITATIVE OpenAI spend from the ``openai_admin_costs``
+    stream.
+
+    Sums ``metadata->>'amount_value'`` (the billed ``amount.value`` the
+    cost pull stores as an exact Decimal string) per UTC day over the
+    trailing ``days``. This is the real billed figure — it includes
+    non-token line items (fine-tune training, etc.) a tokens×pricing
+    estimate can never reproduce, which is why per-project / total OpenAI
+    spend prefers it.
+
+    Empty-bucket sentinel cost records carry ``amount_value = null`` and
+    are skipped by the ``IS NOT NULL`` filter. Returns ``{}`` when the
+    costs stream has no priceable rows in the window (then the caller
+    falls back to the usage estimate).
+    """
+    sql = sql_text(
+        """
+        SELECT
+            DATE(tr.occurred_at AT TIME ZONE 'UTC') AS day,
+            COALESCE(
+                SUM((tr.metadata->>'amount_value')::numeric), 0
+            ) AS amount
+        FROM telemetry_records tr
+        WHERE tr.tenant_id = current_setting('app.tenant_id')
+          AND tr.record_type = 'cost'
+          AND tr.source_api = :source_api
+          AND (tr.metadata->>'amount_value') IS NOT NULL
+          AND tr.occurred_at >= (now() AT TIME ZONE 'UTC')
+              - make_interval(days => :days)
+        GROUP BY DATE(tr.occurred_at AT TIME ZONE 'UTC')
+        """
+    )
+
+    per_day: dict[date, Decimal] = {}
+    with session_scope(tenant_id) as s:
+        rows = s.execute(
+            sql, {"days": days, "source_api": _SOURCE_OPENAI_COSTS}
+        ).all()
+
+    for row in rows:
+        # ``amount`` is a Decimal from psycopg's numeric adapter.
+        amount = Decimal(str(row.amount))
+        if amount == 0:
+            # A zero-sum day is real-but-empty; skip so the series stays
+            # sparse like the estimate path (and a $0 day adds no signal).
+            continue
+        per_day[row.day] = per_day.get(row.day, Decimal("0")) + amount
+
+    return per_day
+
+
+def _to_series(per_day: dict[date, Decimal]) -> list[tuple[date, Decimal]]:
+    """Sort a ``{day: usd}`` map into an ascending, cent-quantized series."""
+    return [
+        (day, total.quantize(Decimal("0.01")))
+        for day, total in sorted(per_day.items())
+    ]
+
+
+def vendor_daily_spend(
+    tenant_id: str, days: int
+) -> dict[str, list[tuple[date, Decimal]]]:
+    """Per-vendor daily spend series over the trailing ``days``.
+
+    Returns ``{vendor_name: [(day, usd), ...]}`` with one ascending,
+    sparse series per vendor that has any priceable spend in the window
+    (a vendor with none is omitted entirely — the caller decides whether
+    to render an empty band). Vendors:
+
+    - ``"Anthropic"`` — usage-token estimate (the ``admin`` stream),
+      identical day-by-day to :func:`daily_spend`.
+    - ``"OpenAI"`` — authoritative ``openai_admin_costs`` per-day spend
+      when that stream has data in the window; otherwise the
+      ``openai_admin_usage`` token estimate.
+
+    This is the chart feed (vendor-stacked forecast); the labelled
+    totals + basis live on :func:`vendor_spend_breakdown`.
+    """
+    out: dict[str, list[tuple[date, Decimal]]] = {}
+
+    anthropic = _price_usage_records_by_day(
+        tenant_id, days, _SOURCE_ANTHROPIC_USAGE
+    )
+    if anthropic:
+        out[VENDOR_ANTHROPIC] = _to_series(anthropic)
+
+    openai_actual = _openai_actual_spend_by_day(tenant_id, days)
+    if openai_actual:
+        out[VENDOR_OPENAI] = _to_series(openai_actual)
+    else:
+        openai_estimate = _price_usage_records_by_day(
+            tenant_id, days, _SOURCE_OPENAI_USAGE
+        )
+        if openai_estimate:
+            out[VENDOR_OPENAI] = _to_series(openai_estimate)
+
+    return out
+
+
+def vendor_spend_breakdown(
+    tenant_id: str, days: int
+) -> dict[str, VendorSpend]:
+    """Per-vendor spend split over the trailing ``days``, with basis.
+
+    The cross-vendor accessor wave-2 cost cards consume. Returns
+    ``{vendor_name: VendorSpend}`` for each vendor that has any priceable
+    spend in the window. Each :class:`VendorSpend` carries the window
+    ``usd`` total, the per-day ``daily`` series, and a ``basis`` flag:
+
+    - **Anthropic** → ``basis="estimated"`` (usage-token × rate card;
+      Ogma has no authoritative Anthropic billing feed). Equal to
+      :func:`daily_spend`'s total for the same window.
+    - **OpenAI** → ``basis="authoritative"`` when the
+      ``openai_admin_costs`` stream has billed amounts in the window
+      (the real number, incl. non-token line items); otherwise
+      ``basis="estimated"`` from the ``openai_admin_usage`` token counts.
+
+    A vendor with no priceable spend is omitted (not emitted as a $0
+    entry) — same sparse posture as the daily series. Pure read; never
+    raises on a missing stream (an absent stream is simply an empty map).
+    """
+    out: dict[str, VendorSpend] = {}
+
+    # ── Anthropic: usage-token estimate ──
+    anthropic_daily = _price_usage_records_by_day(
+        tenant_id, days, _SOURCE_ANTHROPIC_USAGE
+    )
+    if anthropic_daily:
+        series = _to_series(anthropic_daily)
+        out[VENDOR_ANTHROPIC] = VendorSpend(
+            vendor=VENDOR_ANTHROPIC,
+            usd=sum((u for _, u in series), Decimal("0")).quantize(
+                Decimal("0.01")
+            ),
+            basis=BASIS_ESTIMATED,
+            daily=series,
+        )
+
+    # ── OpenAI: authoritative /costs preferred, else usage estimate ──
+    openai_actual = _openai_actual_spend_by_day(tenant_id, days)
+    if openai_actual:
+        series = _to_series(openai_actual)
+        out[VENDOR_OPENAI] = VendorSpend(
+            vendor=VENDOR_OPENAI,
+            usd=sum((u for _, u in series), Decimal("0")).quantize(
+                Decimal("0.01")
+            ),
+            basis=BASIS_AUTHORITATIVE,
+            daily=series,
+        )
+    else:
+        openai_daily = _price_usage_records_by_day(
+            tenant_id, days, _SOURCE_OPENAI_USAGE
+        )
+        if openai_daily:
+            series = _to_series(openai_daily)
+            out[VENDOR_OPENAI] = VendorSpend(
+                vendor=VENDOR_OPENAI,
+                usd=sum((u for _, u in series), Decimal("0")).quantize(
+                    Decimal("0.01")
+                ),
+                basis=BASIS_ESTIMATED,
+                daily=series,
+            )
+
+    return out
