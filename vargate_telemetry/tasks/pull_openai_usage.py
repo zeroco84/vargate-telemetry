@@ -402,7 +402,22 @@ def _pull_openai_usage_for_tenant(
     # 3. Build the client unless one was injected.
     owned_client = client is None
     if owned_client:
-        client = admin_client_for_tenant(tenant_id)
+        try:
+            client = admin_client_for_tenant(tenant_id)
+        except LookupError:
+            # No OpenAI admin key sealed. The beat dispatcher fans out to
+            # ALL active tenants (dispatch-all-with-soft-skip) and most
+            # have no OpenAI key — soft-skip cleanly (cursor untouched, no
+            # retry) rather than letting the factory's LookupError bubble
+            # to the celery wrapper's retry path.
+            _log.debug(
+                "pull_openai_usage: no openai key sealed for %s", tenant_id
+            )
+            return {
+                "records_pulled": 0,
+                "records_deduped": 0,
+                "status": "no_openai_key",
+            }
 
     records_pulled = 0
     records_deduped = 0

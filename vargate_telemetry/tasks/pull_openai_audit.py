@@ -257,7 +257,20 @@ def _pull_openai_audit_for_tenant(
 
     owned_client = client is None
     if owned_client:
-        client = admin_client_for_tenant(tenant_id)
+        try:
+            client = admin_client_for_tenant(tenant_id)
+        except LookupError:
+            # No OpenAI admin key sealed — soft-skip (the dispatcher fans
+            # out to ALL active tenants; most have no OpenAI key). Cursor
+            # untouched, no retry.
+            _log.debug(
+                "pull_openai_audit: no openai key sealed for %s", tenant_id
+            )
+            return {
+                "records_pulled": 0,
+                "records_deduped": 0,
+                "status": "no_openai_key",
+            }
 
     records_pulled = 0
     records_deduped = 0

@@ -376,6 +376,48 @@ def test_pull_openai_usage_skips_when_403(clean_pull_state: None) -> None:
     assert cur == 0
 
 
+def test_pull_openai_usage_soft_skips_when_no_key_sealed(
+    clean_pull_state: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No OpenAI key sealed → the factory's LookupError is soft-skipped
+    (status ``no_openai_key``, no rows, no cursor, NO raise/retry). The
+    beat dispatcher fans out to ALL active tenants and most have no OpenAI
+    key — this is the common launch-time path."""
+    from vargate_telemetry.db import session_scope
+    from vargate_telemetry.tasks import pull_openai_usage as mod
+
+    tenant = "tnt_us_oai_usage_nokey"
+    _provision_tenant(tenant)
+
+    def _raise_no_key(_tenant_id: str, **_kw: object) -> object:
+        raise LookupError("no openai_admin_key sealed for this tenant")
+
+    # No client injected → the core builds one via the (patched) factory.
+    monkeypatch.setattr(mod, "admin_client_for_tenant", _raise_no_key)
+
+    result = mod._pull_openai_usage_for_tenant(tenant)
+    assert result["status"] == "no_openai_key"
+    assert result["records_pulled"] == 0
+    assert result["records_deduped"] == 0
+
+    with session_scope(tenant) as s:
+        count = s.execute(
+            sql_text(
+                "SELECT count(*) FROM telemetry_records WHERE tenant_id = :t"
+            ),
+            {"t": tenant},
+        ).scalar_one()
+        cur = s.execute(
+            sql_text(
+                "SELECT count(*) FROM pull_state "
+                "WHERE tenant_id = :t AND source_api = :s"
+            ),
+            {"t": tenant, "s": mod.SOURCE_API_OPENAI_USAGE},
+        ).scalar_one()
+    assert count == 0
+    assert cur == 0
+
+
 # ───────────────────────────────────────────────────────────────────────────
 # Dedup-only second run → cursor still advances
 # ───────────────────────────────────────────────────────────────────────────
