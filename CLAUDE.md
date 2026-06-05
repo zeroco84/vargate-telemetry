@@ -381,3 +381,29 @@ The Insights page (`/insights`) renders whatever `insights/registry.py` lists, i
 ## Forecast alerts reuse the budget-alert framework — distinguished by `kind`, not new machinery
 
 The `forecast_threshold` alert is the same `send_budget_alert` → email/Slack/PagerDuty path as the `current_threshold` alert, the same `budget_alert_events` table, the same `render_budget_alert` template. The only differences: a `kind` column (migration `0024`, joined into `uq_budget_alert_events_dedup` so the two kinds dedup independently) and a forecast subject/body variant. **Don't build a parallel notification stack for a new alert flavour — add a `kind` and a template branch.** A forecast alert says spend is *projected* to cross a threshold by month-end on current pace; a current alert says it *has* crossed. Both fire at most once per `(budget, period, threshold, kind)`.
+
+---
+
+# TM8 conventions (OpenAI / multi-vendor ingest)
+
+> TM8 makes OpenAI the first non-Anthropic vendor. Plan of record + live-probe findings: `docs/sprints/TM8-openai-ingest-detail.md` and `docs/sprints/TM8-openai-recon.md`. The rules below are the durable contracts.
+
+## Vendor module = API client only; tasks and pricing stay top-level (layout decision A)
+
+A vendor directory (`vargate_telemetry/openai/`, `anthropic/`) holds **only** the API I/O surface: `client.py`, `types.py` (flat Pydantic + `extra="allow"`), `factory.py`. Celery pull tasks live in top-level `tasks/pull_<vendor>_*.py` with an inline `_normalize_*()`; rate cards in top-level `pricing/<vendor>_rates.py`; capability probes extend `api/auth.py`; the beat schedule extends `celery_app.py`. Every vendor is organized identically and celery autodiscover/beat stays pointed at one `tasks` package. **Don't introduce a self-contained `<vendor>/tasks/` or `<vendor>/pricing/` without founder approval** — it splits the codebase into two patterns and orphans the autodiscover wiring.
+
+## OpenAI per-user attribution is NOT Enterprise-gated (unlike Anthropic)
+
+`group_by=user_id` on `/v1/organization/usage/completions` populates `user_id` on a Pay-as-you-go individual org (live-verified TM8) — so OpenAI's cross-vendor user view is **rich on every tier**, the opposite of Anthropic where per-user / Activity-Feed depth is Enterprise-only. Always request `group_by=model,user_id,api_key_id,project_id` on every usage pull; the OpenAI `user_id` → `/users.email` → `user_aliases` email-match stitches OpenAI activity into the same unified user as Claude. The `per_user_breakdown` capability is true when a grouped row returns with `user_id` non-null.
+
+## ⚠ OpenAI usage `input_tokens` INCLUDES cached tokens — bill the uncached split
+
+A usage row carries `input_tokens` (TOTAL), `input_cached_tokens` (cached portion, ~50% rate), and `input_uncached_tokens` (full rate). Cost = `input_uncached × input_rate + input_cached × cached_rate + output × output_rate`; `cache_creation` is always 0 (OpenAI has no cache-write charge). When calling an `anthropic_rates`-shaped `compute_cost_usd`, pass `input_tokens=input_uncached_tokens` and `cache_read_tokens=input_cached_tokens` — **never the raw `input_tokens` field**, or cached usage is billed twice. OpenAI model names are date-stamped (`gpt-4o-2024-08-06`) → `openai_rates.py` needs longest-prefix match like `anthropic_rates.py`.
+
+## `/usage` and `/costs` are complementary — usage for per-user, costs for authoritative spend
+
+`/usage` gives per-user/per-model **token** detail (attribution + our cost *estimate*). `/costs` gives **authoritative billed spend** at **project + line_item** grain with **no `user_id`**, and includes non-token line items (fine-tune training, etc.) that tokens×pricing can't reproduce. ⇒ per-**project** spend and totals prefer actual `/costs`; per-**user** spend is derived from usage. Ingest both as separate source_api streams (`openai_admin_usage`, `openai_admin_costs`). `audit_logs` is accessible (`200`) but **empty below Enterprise** — accessible ≠ populated; advance the cursor on empty. OpenAI tenants are region `us` (no EU residency). New `openai_*` source_api values are plain strings — **no enum DDL** (`source_api` is `TEXT`).
+
+## `/me/capabilities` is nested per-vendor, dual-emitted during rollout
+
+The contract is `{anthropic:{admin_api,activity_feed,content_capture,code_analytics,mcp_connector}, openai:{admin,costs,audit_logs,project_users,per_user_breakdown}}`. Because SPA and gateway deploy independently, the gateway **emits both** the legacy flat keys and the nested map for one release; the flat keys are dropped only after the vendor-aware SPA ships, so capabilities never blank out mid-deploy.
