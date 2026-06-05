@@ -30,11 +30,11 @@ The checklist fields line up 1:1 with the `openai` block of `GET /me/capabilitie
 |---|---|
 | `admin` | Usage endpoint reachable (the key works). |
 | `costs` | Cost endpoint reachable. |
-| `audit_logs` | Audit endpoint **reachable** — note this can be true while empty (audit logging is effectively Enterprise-gated; see below). |
+| `audit_logs` | An audit event has actually landed (recent-row presence). Stays `false` below Enterprise — endpoint reachable but returns no events. |
 | `project_users` | Your org exposes user-level data. |
 | `per_user_breakdown` | `group_by=user_id` returns populated user IDs → **per-user attribution works**. |
 
-> **Tier note (better than Anthropic here):** OpenAI's `per_user_breakdown` populates on **Pay-as-you-go**, not just Enterprise — so per-user attribution works on every paid tier. `audit_logs` is the exception: it returns `200` but is **empty below Enterprise** (audit logging is an org/Enterprise feature). If your org doesn't expose user IDs, OpenAI activity attributes to the API-key holder or lands in the **Unmapped activity** panel.
+> **Tier note (better than Anthropic here):** OpenAI's `per_user_breakdown` populates on **Pay-as-you-go**, not just Enterprise — so per-user attribution works on every paid tier. `audit_logs` only turns true once an audit event lands — below Enterprise the endpoint is reachable but empty, so it stays `false` (audit logging is effectively Enterprise-gated). If your org doesn't expose user IDs, OpenAI activity attributes to the API-key holder or lands in the **Unmapped activity** panel.
 
 ## What you'll see after connecting
 
