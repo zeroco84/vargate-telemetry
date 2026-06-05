@@ -55,6 +55,10 @@ from vargate_telemetry.auth.roles import (
 )
 from vargate_telemetry.db import session_scope
 from vargate_telemetry.pricing import compute_cost_usd
+from vargate_telemetry.pricing.vendor_cost import (
+    estimate_record_cost_usd,
+    vendor_of,
+)
 from vargate_telemetry.users import (
     ACTOR_KEY_SQL,
     EFFECTIVE_SURFACE_SQL,
@@ -73,6 +77,28 @@ _DETAIL_WINDOW_DAYS = 90
 _ROLLUP_WINDOW_DAYS = 7
 _RECENT_LIMIT = 25
 
+# Per-user priceable usage streams (TM8 Phase E). MCP is Anthropic's
+# only per-user priceable source (token ESTIMATES on the chat/tool-use
+# turn); ``openai_admin_usage`` is OpenAI's (the grouped Admin-API usage
+# row, per-user when the tier exposes ``group_by=user_id``). Both carry
+# a resolvable actor identifier in ``ACTOR_KEY_SQL`` so they join the
+# same ``user_aliases`` rows the surface rollup uses. Anthropic Admin
+# ``admin`` usage is bucket-grain (no actor) and is NOT in this set — it
+# can't attribute to a person, so it never enters per-user spend.
+#
+# The two streams are priced by DIFFERENT primitives on purpose:
+#   - ``mcp`` → ``compute_cost_usd`` on the ``*_tokens_estimate`` fields
+#     (the existing, byte-for-byte-preserved Anthropic per-user path);
+#   - ``openai_admin_usage`` → ``estimate_record_cost_usd`` (the shared
+#     cross-vendor primitive, which reads OpenAI's uncached/cached split
+#     and is double-count-safe). ``estimate_record_cost_usd`` does NOT
+#     price ``mcp`` (it only knows the ``admin`` + ``openai_admin_usage``
+#     usage streams), so the MCP path can't be folded into it without
+#     zeroing Anthropic per-user spend — hence the deliberate split.
+_SOURCE_MCP = "mcp"
+_SOURCE_OPENAI_USAGE = "openai_admin_usage"
+_PRICEABLE_PER_USER_SOURCES = (_SOURCE_MCP, _SOURCE_OPENAI_USAGE)
+
 
 # ───────────────────────────────────────────────────────────────────────────
 # Response shapes
@@ -85,12 +111,26 @@ class UserSurfaceStat(BaseModel):
     # TM4: 'admin' | 'member' — drives the role chip + promote/demote
     # control in the roster.
     role: str
+    # The EFFECTIVE surface tokens for this user over the window (e.g.
+    # 'code_analytics', 'mcp' / 'claude_code', 'openai_admin_usage').
+    # The frontend maps each token → vendor via the design-system
+    # ``sourceVendor()`` and renders a vendor-colored badge, so an
+    # OpenAI-active user's ``openai_admin_usage`` surface vendor-groups
+    # under "OpenAI" with no extra field needed.
     surfaces: list[str]
     events_7d: int
-    # Decimal string; None when the user has no priceable (MCP)
-    # activity in the window — rendered as "—" in the UI, never $0
-    # faked into a real figure.
+    # CROSS-VENDOR 7d spend total (Anthropic MCP estimate + OpenAI usage
+    # estimate). Decimal string; None when the user has NO priceable
+    # per-user activity in the window — rendered as "—" in the UI, never
+    # $0 faked into a real figure.
     spend_7d_usd: Optional[str] = None
+    # TM8 Phase E — per-vendor split of the 7d spend, ``{vendor_name:
+    # cents_string}`` (e.g. ``{"Anthropic": "6.00", "OpenAI": "1.20"}``).
+    # Only vendors with priceable spend appear; an Anthropic-only user
+    # has just ``{"Anthropic": ...}`` and an unpriceable user has ``{}``.
+    # The sum of the values equals ``spend_7d_usd``. Lets the roster show
+    # a vendor-segmented spend breakdown without a second request.
+    spend_7d_by_vendor: dict[str, str] = Field(default_factory=dict)
     last_active: Optional[datetime] = None
 
 
@@ -114,7 +154,15 @@ class HeatmapCell(BaseModel):
 
 class SpendTrendPoint(BaseModel):
     day: date
+    # The priceable source_api the spend came from ('mcp' for Anthropic
+    # per-user, 'openai_admin_usage' for OpenAI). Retained for back-compat
+    # + per-source hover.
     source_api: str
+    # TM8 Phase E — display vendor for this point ('Anthropic' / 'OpenAI'),
+    # derived from ``source_api`` via ``vendor_of``. The detail page groups
+    # the series by ``vendor`` to vendor-stack the spend trend; a point's
+    # vendor is stable for a given source_api.
+    vendor: str
     spend_usd: str
 
 
@@ -192,7 +240,16 @@ def _require_tenant(user: AuthenticatedUser) -> str:
 
 def _price_mcp_row(row: Any) -> Optional[Decimal]:
     """Cost for one MCP record from its token estimates. None when
-    the model is unknown / unpriceable (never faked)."""
+    the model is unknown / unpriceable (never faked).
+
+    Anthropic per-user path — UNCHANGED from TM3. Priced via
+    ``compute_cost_usd`` (the Anthropic rate card) directly on the MCP
+    ``*_tokens_estimate`` fields. Deliberately NOT routed through
+    ``estimate_record_cost_usd``: that primitive only prices the
+    ``admin`` + ``openai_admin_usage`` usage streams and returns ``None``
+    for ``mcp``, so folding MCP into it would zero Anthropic per-user
+    spend. The numbers here are byte-for-byte what TM3 produced.
+    """
     model = row.model
     if not model:
         return None
@@ -203,6 +260,28 @@ def _price_mcp_row(row: Any) -> Optional[Decimal]:
         cache_read_tokens=0,
         cache_creation_tokens=0,
         occurred_at=row.occurred_at,
+    )
+
+
+def _price_openai_usage_row(row: Any) -> Optional[Decimal]:
+    """Cost for one ``openai_admin_usage`` record via the shared
+    cross-vendor primitive.
+
+    Passes the record's full ``metadata`` (the per-row wrapper carrying
+    the grouped ``result``) + ``occurred_at`` to
+    :func:`estimate_record_cost_usd`, which reads OpenAI's
+    uncached/cached input split and is double-count-safe (never bills the
+    raw ``input_tokens`` total). Returns ``None`` for an empty-bucket
+    sentinel or an unknown model — same never-faked discipline as
+    :func:`_price_mcp_row`.
+    """
+    occurred = row.occurred_at
+    if occurred is None:
+        return None
+    if occurred.tzinfo is None:
+        occurred = occurred.replace(tzinfo=timezone.utc)
+    return estimate_record_cost_usd(
+        _SOURCE_OPENAI_USAGE, row.metadata or {}, occurred
     )
 
 
@@ -280,9 +359,29 @@ def list_users(
             },
         ).all()
 
-        # Per-user 7d spend from MCP priceable records (the only
-        # per-user priceable source). One query, priced in Python.
-        spend_rows = s.execute(
+        # Per-user 7d spend — CROSS-VENDOR (TM8 Phase E). Anthropic
+        # (MCP token estimate) + OpenAI (Admin-API usage estimate) are
+        # the two per-user priceable streams; each is fetched + priced
+        # by its own primitive (see _PRICEABLE_PER_USER_SOURCES), then
+        # accumulated into a per-user total AND a per-(user, vendor)
+        # split. The two accumulators are populated by
+        # ``_accumulate_spend`` below so both the list total and the
+        # per-vendor breakdown stay consistent.
+        spend_by_user: dict[str, Decimal] = defaultdict(lambda: Decimal("0"))
+        # {user_id: {vendor: Decimal}} — vendors with priceable spend only.
+        spend_by_user_vendor: dict[str, dict[str, Decimal]] = defaultdict(
+            lambda: defaultdict(lambda: Decimal("0"))
+        )
+        has_priceable: set[str] = set()
+
+        def _accumulate_spend(user_id: str, vendor: str, cost: Decimal) -> None:
+            spend_by_user[user_id] += cost
+            spend_by_user_vendor[user_id][vendor] += cost
+            has_priceable.add(user_id)
+
+        # ── Anthropic per-user (MCP) — query + pricing UNCHANGED from
+        #    TM3; only the accumulation now also records the vendor. ──
+        mcp_spend_rows = s.execute(
             sql_text(
                 f"""
                 SELECT
@@ -300,22 +399,47 @@ def list_users(
                    ON ua.source_api = tr.source_api
                   AND ua.source_identifier = {ACTOR_KEY_SQL}
                 WHERE tr.tenant_id = current_setting('app.tenant_id')
-                  AND tr.source_api = 'mcp'
+                  AND tr.source_api = :source_mcp
                   AND ua.user_id IS NOT NULL
                   AND tr.occurred_at >= :since_7d
                 """
             ),
-            {"since_7d": since_7d},
+            {"since_7d": since_7d, "source_mcp": _SOURCE_MCP},
         ).all()
-
-        spend_by_user: dict[str, Decimal] = defaultdict(lambda: Decimal("0"))
-        has_priceable: set[str] = set()
-        for row in spend_rows:
+        for row in mcp_spend_rows:
             cost = _price_mcp_row(row)
             if cost is None:
                 continue
-            spend_by_user[row.user_id] += cost
-            has_priceable.add(row.user_id)
+            _accumulate_spend(row.user_id, vendor_of(_SOURCE_MCP), cost)
+
+        # ── OpenAI per-user (openai_admin_usage) — priced via the shared
+        #    cross-vendor primitive over the record's full metadata. ──
+        openai_spend_rows = s.execute(
+            sql_text(
+                f"""
+                SELECT
+                    ua.user_id::text AS user_id,
+                    tr.metadata AS metadata,
+                    tr.occurred_at
+                FROM telemetry_records tr
+                JOIN user_aliases ua
+                   ON ua.source_api = tr.source_api
+                  AND ua.source_identifier = {ACTOR_KEY_SQL}
+                WHERE tr.tenant_id = current_setting('app.tenant_id')
+                  AND tr.source_api = :source_openai
+                  AND ua.user_id IS NOT NULL
+                  AND tr.occurred_at >= :since_7d
+                """
+            ),
+            {"since_7d": since_7d, "source_openai": _SOURCE_OPENAI_USAGE},
+        ).all()
+        for row in openai_spend_rows:
+            cost = _price_openai_usage_row(row)
+            if cost is None:
+                continue
+            _accumulate_spend(
+                row.user_id, vendor_of(_SOURCE_OPENAI_USAGE), cost
+            )
 
         # Unmapped activity: aliases with no user, + their event
         # counts so the admin can prioritize which to resolve.
@@ -362,6 +486,12 @@ def list_users(
                 if r.user_id in has_priceable
                 else None
             ),
+            spend_7d_by_vendor={
+                vendor: str(amount.quantize(Decimal("0.01")))
+                for vendor, amount in sorted(
+                    spend_by_user_vendor.get(r.user_id, {}).items()
+                )
+            },
             last_active=r.last_active,
         )
         for r in rollup
@@ -504,9 +634,22 @@ def get_user_detail(
         # than the raw alias source_api (which is always 'mcp').
         surfaces = sorted({c.source_api for c in heatmap})
 
-        # Spend trend: per-day MCP cost (priceable source). Priced in
-        # Python; grouped by day.
-        spend_src = s.execute(
+        # Spend trend — CROSS-VENDOR (TM8 Phase E). One point per
+        # (day, priceable source_api) so the detail page can vendor-stack
+        # the series (group by ``vendor``). Each vendor's stream is
+        # fetched + priced by its own primitive; an Anthropic-only user
+        # yields exactly the TM3 shape (one ``source_api="mcp"`` point per
+        # day) with the new ``vendor`` field added.
+        #
+        # Keyed by (day, source_api) — keeping the source distinct means a
+        # day with both MCP and OpenAI activity emits two points (one per
+        # vendor), which is what the vendor-stack wants.
+        spend_by_day_source: dict[
+            tuple[date, str], Decimal
+        ] = defaultdict(lambda: Decimal("0"))
+
+        # ── Anthropic (MCP) — query + pricing UNCHANGED from TM3. ──
+        mcp_spend_src = s.execute(
             sql_text(
                 f"""
                 SELECT
@@ -524,26 +667,65 @@ def get_user_detail(
                    ON ua.source_api = tr.source_api
                   AND ua.source_identifier = {ACTOR_KEY_SQL}
                 WHERE tr.tenant_id = current_setting('app.tenant_id')
-                  AND tr.source_api = 'mcp'
+                  AND tr.source_api = :source_mcp
                   AND ua.user_id = :id
                   AND tr.occurred_at >= :window_start
                 """
             ),
-            {"window_start": window_start, "id": str(user_id)},
+            {
+                "window_start": window_start,
+                "id": str(user_id),
+                "source_mcp": _SOURCE_MCP,
+            },
         ).all()
-        spend_by_day: dict[date, Decimal] = defaultdict(lambda: Decimal("0"))
-        for row in spend_src:
+        for row in mcp_spend_src:
             cost = _price_mcp_row(row)
             if cost is None:
                 continue
-            spend_by_day[row.day] += cost
+            spend_by_day_source[(row.day, _SOURCE_MCP)] += cost
+
+        # ── OpenAI (openai_admin_usage) — priced via the shared
+        #    cross-vendor primitive over the record's full metadata. ──
+        openai_spend_src = s.execute(
+            sql_text(
+                f"""
+                SELECT
+                    DATE(tr.occurred_at AT TIME ZONE 'UTC') AS day,
+                    tr.metadata AS metadata,
+                    tr.occurred_at
+                FROM telemetry_records tr
+                JOIN user_aliases ua
+                   ON ua.source_api = tr.source_api
+                  AND ua.source_identifier = {ACTOR_KEY_SQL}
+                WHERE tr.tenant_id = current_setting('app.tenant_id')
+                  AND tr.source_api = :source_openai
+                  AND ua.user_id = :id
+                  AND tr.occurred_at >= :window_start
+                """
+            ),
+            {
+                "window_start": window_start,
+                "id": str(user_id),
+                "source_openai": _SOURCE_OPENAI_USAGE,
+            },
+        ).all()
+        for row in openai_spend_src:
+            cost = _price_openai_usage_row(row)
+            if cost is None:
+                continue
+            spend_by_day_source[(row.day, _SOURCE_OPENAI_USAGE)] += cost
+
+        # Ascending by day, then source_api — stable, vendor-stackable.
         spend_trend = [
             SpendTrendPoint(
-                day=d,
-                source_api="mcp",
-                spend_usd=str(spend_by_day[d].quantize(Decimal("0.01"))),
+                day=day,
+                source_api=src,
+                vendor=vendor_of(src),
+                spend_usd=str(total.quantize(Decimal("0.01"))),
             )
-            for d in sorted(spend_by_day)
+            for (day, src), total in sorted(
+                spend_by_day_source.items(), key=lambda kv: (kv[0][0], kv[0][1])
+            )
         ]
 
         # Recent activity, cross-source, newest first.

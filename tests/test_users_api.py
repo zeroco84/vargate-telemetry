@@ -161,6 +161,51 @@ def _seed_mcp(
     _insert(tenant_id, "mcp", md, occurred_at)
 
 
+# TM8 Phase E — OpenAI per-user usage record. Mirrors what
+# pull_openai_usage writes: a per-row wrapper with the grouped `result`
+# (the priceable token split) and the cross-vendor attribution keys
+# (`user_email` when the tier resolves an email, else just
+# `subject_user_id`). The ACTOR_KEY_SQL COALESCE matches on `user_email`
+# first, falling back to `subject_user_id` for an unmapped identity.
+_GPT4O = "gpt-4o-2024-08-06"
+
+
+def _seed_openai_usage(
+    tenant_id: str,
+    *,
+    subject_user_id: str,
+    email: str | None = None,
+    occurred_at: datetime | None = None,
+    input_uncached_tokens: int = 1_000_000,
+    input_cached_tokens: int = 0,
+    output_tokens: int = 1_000_000,
+    model: str = _GPT4O,
+) -> None:
+    # `input_tokens` is the TOTAL (uncached + cached) — present so the
+    # test exercises the double-count trap: cost must derive from the
+    # split, never this raw total.
+    result = {
+        "object": "organization.usage.completions.result",
+        "model": model,
+        "user_id": subject_user_id,
+        "input_tokens": input_uncached_tokens + input_cached_tokens,
+        "input_uncached_tokens": input_uncached_tokens,
+        "input_cached_tokens": input_cached_tokens,
+        "output_tokens": output_tokens,
+    }
+    md: dict = {
+        "start_time": "2026-06-01T00:00:00+00:00",
+        "end_time": "2026-06-02T00:00:00+00:00",
+        "modality": "completions",
+        "result": result,
+        "subject_user_id": subject_user_id,
+        "model": model,
+    }
+    if email is not None:
+        md["user_email"] = email
+    _insert(tenant_id, "openai_admin_usage", md, occurred_at)
+
+
 def _insert(
     tenant_id: str, source_api: str, md: dict, occurred_at: datetime | None
 ) -> None:
@@ -271,6 +316,213 @@ def test_list_users_surfaces_unmapped_activity(
     assert len(body["unmapped"]) == 1
     assert body["unmapped"][0]["source_identifier"] == "sera-production"
     assert body["unmapped"][0]["event_count"] == 1
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# TM8 Phase E — cross-vendor user view (one person, both vendors)
+# ───────────────────────────────────────────────────────────────────────────
+
+
+def test_list_users_stitches_anthropic_and_openai(
+    clean_state: None, client: TestClient
+) -> None:
+    """A user active on BOTH Claude (MCP) and OpenAI usage shows ONE row
+    carrying both surfaces — the headline cross-vendor analytic. The
+    OpenAI activity stitches into the same user via email auto-match."""
+    tenant = "tnt_us_users_xvendor_stitch"
+    _provision_tenant(tenant)
+    uid = _provision_user(tenant, "both@example.com")
+    _seed_mcp(tenant, email="both@example.com", user_id=uid)
+    _seed_openai_usage(
+        tenant, subject_user_id="user-openai-1", email="both@example.com"
+    )
+
+    body = client.get("/users", headers=_bearer(tenant)).json()
+    assert len(body["users"]) == 1, body["users"]
+    row = body["users"][0]
+    assert row["email"] == "both@example.com"
+    # Both vendor surfaces present: 'mcp' (Anthropic) +
+    # 'openai_admin_usage' (OpenAI). The frontend maps each token →
+    # vendor via sourceVendor().
+    assert set(row["surfaces"]) == {"mcp", "openai_admin_usage"}
+    assert row["events_7d"] == 2
+
+
+def test_list_users_spend_sums_both_vendors(
+    clean_state: None, client: TestClient
+) -> None:
+    """Per-user spend_7d_usd is the CROSS-VENDOR total (Anthropic MCP +
+    OpenAI usage), and spend_7d_by_vendor carries the per-vendor split.
+    MCP: 1M in + 200k out @ Sonnet = $6.00. OpenAI gpt-4o: 1M uncached
+    in + 1M out = $12.50. Total = $18.50."""
+    tenant = "tnt_us_users_xvendor_spend"
+    _provision_tenant(tenant)
+    uid = _provision_user(tenant, "spend@example.com")
+    _seed_mcp(tenant, email="spend@example.com", user_id=uid)
+    _seed_openai_usage(
+        tenant, subject_user_id="user-openai-2", email="spend@example.com"
+    )
+
+    row = client.get("/users", headers=_bearer(tenant)).json()["users"][0]
+    assert Decimal(row["spend_7d_usd"]) == Decimal("18.50")
+    by_vendor = row["spend_7d_by_vendor"]
+    assert Decimal(by_vendor["Anthropic"]) == Decimal("6.00")
+    assert Decimal(by_vendor["OpenAI"]) == Decimal("12.50")
+    # The per-vendor split sums to the headline total.
+    assert sum(Decimal(v) for v in by_vendor.values()) == Decimal(
+        row["spend_7d_usd"]
+    )
+
+
+def test_list_users_openai_spend_is_double_count_safe(
+    clean_state: None, client: TestClient
+) -> None:
+    """OpenAI per-user spend derives from the uncached/cached split, NOT
+    the raw input_tokens total. gpt-4o with 1M uncached + 1M cached + 0
+    out = $2.50 + $1.25 = $3.75 (NOT 2M × $2.50 = $5.00 if it billed the
+    raw total)."""
+    tenant = "tnt_us_users_openai_doublecount"
+    _provision_tenant(tenant)
+    _provision_user(tenant, "cached@example.com")
+    _seed_openai_usage(
+        tenant,
+        subject_user_id="user-openai-3",
+        email="cached@example.com",
+        input_uncached_tokens=1_000_000,
+        input_cached_tokens=1_000_000,
+        output_tokens=0,
+    )
+
+    row = client.get("/users", headers=_bearer(tenant)).json()["users"][0]
+    assert Decimal(row["spend_7d_usd"]) == Decimal("3.75")
+    assert Decimal(row["spend_7d_by_vendor"]["OpenAI"]) == Decimal("3.75")
+    assert "Anthropic" not in row["spend_7d_by_vendor"]
+
+
+def test_list_users_anthropic_only_unchanged(
+    clean_state: None, client: TestClient
+) -> None:
+    """Regression: an Anthropic-only user (MCP, no OpenAI) is byte-for-
+    byte what TM3 produced — spend_7d_usd is the MCP total and
+    spend_7d_by_vendor has only the Anthropic key."""
+    tenant = "tnt_us_users_anthropic_only"
+    _provision_tenant(tenant)
+    uid = _provision_user(tenant, "anthropic@example.com")
+    _seed_mcp(tenant, email="anthropic@example.com", user_id=uid)
+
+    row = client.get("/users", headers=_bearer(tenant)).json()["users"][0]
+    assert set(row["surfaces"]) == {"mcp"}
+    assert Decimal(row["spend_7d_usd"]) == Decimal("6.00")
+    assert row["spend_7d_by_vendor"] == {"Anthropic": "6.00"}
+
+
+def test_list_users_openai_attributes_to_email_matched_user(
+    clean_state: None, client: TestClient
+) -> None:
+    """OpenAI usage whose resolved user_email matches a users.email row
+    attributes to THAT user (email auto-match), not the unmapped panel."""
+    tenant = "tnt_us_users_openai_match"
+    _provision_tenant(tenant)
+    _provision_user(tenant, "matched@example.com")
+    _seed_openai_usage(
+        tenant, subject_user_id="user-openai-4", email="matched@example.com"
+    )
+
+    body = client.get("/users", headers=_bearer(tenant)).json()
+    assert len(body["users"]) == 1
+    assert body["users"][0]["email"] == "matched@example.com"
+    assert body["users"][0]["surfaces"] == ["openai_admin_usage"]
+    # Nothing left unmapped — the email resolved.
+    assert body["unmapped"] == []
+
+
+def test_list_users_surfaces_unmapped_openai_identity(
+    clean_state: None, client: TestClient
+) -> None:
+    """An OpenAI usage row with NO resolvable email (only a raw
+    subject_user_id — the no-user-level-email tier) lands in the unmapped
+    panel keyed on that id, vendor-labelable via its source_api."""
+    tenant = "tnt_us_users_openai_unmapped"
+    _provision_tenant(tenant)
+    # No matching user; no user_email on the record.
+    _seed_openai_usage(tenant, subject_user_id="user-openai-orphan")
+
+    body = client.get("/users", headers=_bearer(tenant)).json()
+    assert body["users"] == []
+    assert len(body["unmapped"]) == 1
+    um = body["unmapped"][0]
+    assert um["source_api"] == "openai_admin_usage"
+    assert um["source_identifier"] == "user-openai-orphan"
+    assert um["event_count"] == 1
+
+
+def test_user_detail_cross_vendor_spend_trend(
+    clean_state: None, client: TestClient
+) -> None:
+    """Detail spend_trend is vendor-stacked: a user with MCP activity on
+    one day and OpenAI activity on another yields per-(day, source) points,
+    each carrying its display vendor. The heatmap + recent timeline
+    include the OpenAI source rows too."""
+    tenant = "tnt_us_users_xvendor_detail"
+    _provision_tenant(tenant)
+    uid = _provision_user(tenant, "detail@example.com")
+    now = datetime.now(tz=timezone.utc)
+    _seed_mcp(
+        tenant,
+        email="detail@example.com",
+        user_id=uid,
+        occurred_at=now - timedelta(days=1),
+    )
+    _seed_openai_usage(
+        tenant,
+        subject_user_id="user-openai-5",
+        email="detail@example.com",
+        occurred_at=now - timedelta(days=2),
+    )
+    client.get("/users", headers=_bearer(tenant))  # lazy reconcile
+
+    body = client.get(f"/users/{uid}", headers=_bearer(tenant)).json()
+    # Both vendor surfaces in the header.
+    assert set(body["surfaces"]) == {"mcp", "openai_admin_usage"}
+    # Heatmap carries both source rows.
+    heat_sources = {c["source_api"] for c in body["heatmap"]}
+    assert heat_sources == {"mcp", "openai_admin_usage"}
+    # Spend trend: one point per vendor, each tagged with its vendor +
+    # source_api. MCP = $6.00 (Anthropic); OpenAI gpt-4o = $12.50.
+    by_vendor = {p["vendor"]: p for p in body["spend_trend"]}
+    assert set(by_vendor) == {"Anthropic", "OpenAI"}
+    assert by_vendor["Anthropic"]["source_api"] == "mcp"
+    assert Decimal(by_vendor["Anthropic"]["spend_usd"]) == Decimal("6.00")
+    assert by_vendor["OpenAI"]["source_api"] == "openai_admin_usage"
+    assert Decimal(by_vendor["OpenAI"]["spend_usd"]) == Decimal("12.50")
+    # Recent timeline mixes both sources.
+    recent_sources = {r["source_api"] for r in body["recent"]}
+    assert recent_sources == {"mcp", "openai_admin_usage"}
+
+
+def test_user_detail_anthropic_only_spend_trend_unchanged(
+    clean_state: None, client: TestClient
+) -> None:
+    """Regression: an Anthropic-only user's detail spend_trend is the TM3
+    shape — one point per day, source_api='mcp' — with the additive
+    'vendor'='Anthropic' field. Single MCP day = one point at $6.00."""
+    tenant = "tnt_us_users_detail_anthropic_only"
+    _provision_tenant(tenant)
+    uid = _provision_user(tenant, "solo@example.com")
+    _seed_mcp(
+        tenant,
+        email="solo@example.com",
+        user_id=uid,
+        occurred_at=datetime.now(tz=timezone.utc) - timedelta(days=1),
+    )
+    client.get("/users", headers=_bearer(tenant))
+
+    body = client.get(f"/users/{uid}", headers=_bearer(tenant)).json()
+    assert len(body["spend_trend"]) == 1
+    pt = body["spend_trend"][0]
+    assert pt["source_api"] == "mcp"
+    assert pt["vendor"] == "Anthropic"
+    assert Decimal(pt["spend_usd"]) == Decimal("6.00")
 
 
 # ───────────────────────────────────────────────────────────────────────────
