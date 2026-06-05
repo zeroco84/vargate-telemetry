@@ -223,6 +223,119 @@ def _seed_rising_days(tenant_id: str, num_days: int) -> None:
         )
 
 
+# OpenAI usage / cost seed helpers (shapes mirror pull_openai_* +
+# test_vendor_spend). gpt-4o: input $2.50/MTok, cached $1.25, output $10.
+_GPT4O = "gpt-4o"
+
+
+def _insert_openai_record(
+    tenant_id: str,
+    *,
+    record_type: str,
+    source_api: str,
+    occurred_at: datetime,
+    metadata: dict,
+) -> None:
+    from vargate_telemetry.db import engine
+
+    eid = f"{source_api}:{uuid.uuid4()}"
+    with engine.begin() as conn:
+        conn.execute(
+            sql_text(
+                """
+                INSERT INTO telemetry_records (
+                    tenant_id, record_type, source_api, external_id,
+                    occurred_at, content_hash, metadata,
+                    chain_seq, chain_prev_hash, chain_self_hash
+                ) VALUES (
+                    :t, :rtype, :src, :eid,
+                    :occurred_at, decode(:zero32, 'hex'),
+                    :metadata,
+                    (SELECT COALESCE(MAX(chain_seq), 0) + 1
+                       FROM telemetry_records WHERE tenant_id = :t_lookup),
+                    decode(:zero32, 'hex'),
+                    decode(:one32, 'hex')
+                )
+                """
+            ),
+            {
+                "t": tenant_id,
+                "t_lookup": tenant_id,
+                "rtype": record_type,
+                "src": source_api,
+                "eid": eid,
+                "occurred_at": occurred_at,
+                "metadata": json.dumps(metadata),
+                "zero32": "00" * 32,
+                "one32": "11" * 32,
+            },
+        )
+
+
+def _seed_openai_usage(
+    tenant_id: str,
+    *,
+    occurred_at: datetime,
+    input_uncached: int,
+    input_cached: int = 0,
+    output: int = 0,
+    model: str = _GPT4O,
+) -> None:
+    md = {
+        "start_time": occurred_at.isoformat(),
+        "end_time": occurred_at.isoformat(),
+        "modality": "completions",
+        "result": {
+            "model": model,
+            "input_tokens": input_uncached + input_cached,  # TOTAL
+            "input_uncached_tokens": input_uncached,
+            "input_cached_tokens": input_cached,
+            "output_tokens": output,
+        },
+        "model": model,
+    }
+    _insert_openai_record(
+        tenant_id,
+        record_type="usage",
+        source_api="openai_admin_usage",
+        occurred_at=occurred_at,
+        metadata=md,
+    )
+
+
+def _seed_openai_cost(
+    tenant_id: str, *, occurred_at: datetime, amount_value: str
+) -> None:
+    md = {
+        "start_time": occurred_at.isoformat(),
+        "end_time": occurred_at.isoformat(),
+        "result": {"amount": {"value": amount_value, "currency": "usd"}},
+        "line_item": "gpt-4o-2024-08-06, input",
+        "project_id": "proj_alpha",
+        "amount_value": amount_value,
+        "currency": "usd",
+    }
+    _insert_openai_record(
+        tenant_id,
+        record_type="cost",
+        source_api="openai_admin_costs",
+        occurred_at=occurred_at,
+        metadata=md,
+    )
+
+
+def _seed_openai_rising_days(tenant_id: str, num_days: int) -> None:
+    """``num_days`` distinct recent UTC days of rising OpenAI usage."""
+    base = 1_000_000  # $2.50/block at gpt-4o uncached-input rate.
+    for k in range(num_days):
+        blocks = num_days - k
+        _seed_openai_usage(
+            tenant_id,
+            occurred_at=datetime.now(tz=timezone.utc) - timedelta(days=k),
+            input_uncached=base * blocks,
+        )
+
+
 # ───────────────────────────────────────────────────────────────────────────
 # (a) Not enough history → idle card
 # ───────────────────────────────────────────────────────────────────────────
@@ -333,3 +446,167 @@ def test_linear_fit_slope_on_clean_line() -> None:
     slope, intercept = spend_data.linear_fit([(0.0, 10.0), (1.0, 20.0), (2.0, 30.0)])
     assert abs(slope - 10.0) < 1e-9
     assert abs(intercept - 10.0) < 1e-9
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# (e) Cross-vendor — per-vendor projection breakdown (TM8 Phase D)
+# ───────────────────────────────────────────────────────────────────────────
+
+
+def test_cross_vendor_per_vendor_breakdown(clean_budgets: None) -> None:
+    """A tenant with BOTH Anthropic and OpenAI spend gets a per-vendor
+    breakdown in the card body, each line labelled with its basis, and
+    the headline/total reflects the cross-vendor sum.
+
+    Anthropic rising days + OpenAI rising days + a small cap the combined
+    projection blows past → advisory, with one breakdown line per vendor
+    (label == vendor name), each carrying a basis detail
+    ("estimated"/"authoritative")."""
+    from vargate_telemetry.insights.cards import cost_forecasting
+
+    tenant = _tid("forecast_xvendor")
+    _provision_tenant(tenant)
+    _seed_rising_days(tenant, 9)  # Anthropic, estimated
+    _seed_openai_rising_days(tenant, 9)  # OpenAI usage, estimated
+    _insert_monthly_tenant_budget(tenant, threshold_usd="1.00")
+
+    card = cost_forecasting.build_card(tenant, "7d")
+
+    assert card.severity == "advisory"
+    assert card.findings_count >= 1
+
+    labels = [item.label for item in card.items]
+    # Both vendors appear as their own breakdown lines.
+    assert "Anthropic" in labels
+    assert "OpenAI" in labels
+    # The summary lines are still present.
+    assert "Current spend" in labels
+    assert "Projected end of period" in labels
+
+    # Each vendor line names a basis and a projected figure.
+    by_label = {item.label: item for item in card.items}
+    for vendor in ("Anthropic", "OpenAI"):
+        it = by_label[vendor]
+        assert it.detail is not None
+        assert "estimated" in it.detail or "authoritative" in it.detail
+        assert it.value is not None and "projected" in it.value
+
+
+def test_cross_vendor_headline_total_exceeds_single_vendor(
+    clean_budgets: None,
+) -> None:
+    """The headline projection is the cross-vendor TOTAL: the combined
+    projected_end is strictly greater than the Anthropic-only projection
+    when OpenAI also has spend.
+
+    Pins that the total really aggregates across vendors (the per-vendor
+    sum), not just the Anthropic baseline."""
+    from vargate_telemetry.insights import spend_data
+    from vargate_telemetry.insights.cards import cost_forecasting
+
+    tenant = _tid("forecast_total")
+    _provision_tenant(tenant)
+    _seed_rising_days(tenant, 9)
+    _seed_openai_rising_days(tenant, 9)
+
+    forecasts = cost_forecasting.vendor_forecasts(tenant)
+    by_vendor = {vf.vendor: vf for vf in forecasts}
+    assert set(by_vendor) == {"Anthropic", "OpenAI"}
+
+    anthropic_only = spend_data.project_period_end(tenant).projected_end
+    total = sum((vf.projected_end for vf in forecasts), Decimal("0"))
+
+    # Anthropic's per-vendor figure equals the standalone Anthropic
+    # projection (reused verbatim) ...
+    assert by_vendor["Anthropic"].projected_end == anthropic_only
+    # ... and OpenAI adds on top, so the cross-vendor total is larger.
+    assert by_vendor["OpenAI"].projected_end > Decimal("0")
+    assert total > anthropic_only
+
+
+def test_openai_authoritative_basis_labeled(clean_budgets: None) -> None:
+    """When the OpenAI ``/costs`` stream has billed amounts, the OpenAI
+    per-vendor forecast is labelled ``authoritative`` (not ``estimated``)."""
+    from vargate_telemetry.insights import spend_data
+    from vargate_telemetry.insights.cards import cost_forecasting
+
+    tenant = _tid("forecast_auth")
+    _provision_tenant(tenant)
+    _seed_rising_days(tenant, 9)
+    # OpenAI usage (would be estimated) PLUS billed /costs over several
+    # recent days → authoritative wins.
+    _seed_openai_rising_days(tenant, 9)
+    for k in range(9):
+        _seed_openai_cost(
+            tenant,
+            occurred_at=datetime.now(tz=timezone.utc) - timedelta(days=k),
+            amount_value="5.00",
+        )
+
+    forecasts = cost_forecasting.vendor_forecasts(tenant)
+    by_vendor = {vf.vendor: vf for vf in forecasts}
+    assert by_vendor["OpenAI"].basis == spend_data.BASIS_AUTHORITATIVE
+    assert by_vendor["Anthropic"].basis == spend_data.BASIS_ESTIMATED
+
+
+def test_single_vendor_has_no_breakdown_lines(clean_budgets: None) -> None:
+    """An Anthropic-only tenant keeps the TM7 body verbatim — no
+    per-vendor breakdown lines (a one-row breakdown that just restates
+    the total adds nothing)."""
+    from vargate_telemetry.insights.cards import cost_forecasting
+
+    tenant = _tid("forecast_single")
+    _provision_tenant(tenant)
+    _seed_rising_days(tenant, 9)
+    _insert_monthly_tenant_budget(tenant, threshold_usd="1.00")
+
+    card = cost_forecasting.build_card(tenant, "7d")
+
+    labels = [item.label for item in card.items]
+    # The TM7 items, and NO vendor-named breakdown line.
+    assert "Current spend" in labels
+    assert "Anthropic" not in labels
+    assert "OpenAI" not in labels
+
+
+def test_idle_path_unchanged_with_openai_only_short_history(
+    clean_budgets: None,
+) -> None:
+    """Fewer than 7 combined days (here OpenAI-only, 3 days) → idle, the
+    same not-enough-history gate as the Anthropic path."""
+    from vargate_telemetry.insights.cards import cost_forecasting
+
+    tenant = _tid("forecast_oai_idle")
+    _provision_tenant(tenant)
+    _seed_openai_rising_days(tenant, 3)  # 3 distinct days only
+
+    card = cost_forecasting.build_card(tenant, "7d")
+    assert card.severity == "idle"
+    assert card.findings_count == 0
+    assert card.empty_state is not None
+    assert "7 days" in card.empty_state
+
+
+def test_openai_only_projection_when_no_anthropic(
+    clean_budgets: None,
+) -> None:
+    """A tenant with ONLY OpenAI spend (≥7 days) still projects — the
+    cross-vendor card doesn't go idle just because Anthropic is empty.
+
+    This is the honest cross-vendor behavior: an OpenAI-only customer
+    sees their forecast."""
+    from vargate_telemetry.insights.cards import cost_forecasting
+
+    tenant = _tid("forecast_oai_only")
+    _provision_tenant(tenant)
+    _seed_openai_rising_days(tenant, 9)
+
+    forecasts = cost_forecasting.vendor_forecasts(tenant)
+    assert {vf.vendor for vf in forecasts} == {"OpenAI"}
+
+    card = cost_forecasting.build_card(tenant, "7d")
+    # No budget → idle-but-with-projection sentence + CTA.
+    assert card.findings_count == 0
+    assert card.empty_state is not None
+    assert "on current pace" in card.empty_state.lower()
+    assert card.cta is not None

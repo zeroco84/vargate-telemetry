@@ -236,7 +236,8 @@ def test_forecast_happy_path(clean: None, client: TestClient) -> None:
     assert r.status_code == 200, r.text
     body = r.json()
 
-    # Shape.
+    # Shape. ``vendors`` (TM8 Phase D) is the per-vendor breakdown — an
+    # additive field; the rest is the original TM7 shape.
     assert set(body) == {
         "period_start",
         "period_end",
@@ -246,6 +247,7 @@ def test_forecast_happy_path(clean: None, client: TestClient) -> None:
         "days_of_data",
         "daily_series",
         "budgets",
+        "vendors",
     }
     # Period bounds are ISO dates; the period starts on the 1st.
     assert _ISO_DATE.match(body["period_start"])
@@ -270,6 +272,26 @@ def test_forecast_happy_path(clean: None, client: TestClient) -> None:
 
     # The seeded budget is echoed back for the cap overlay.
     assert body["budgets"] == [{"name": "Monthly cap", "threshold_usd": 500.0}]
+
+    # Per-vendor breakdown (TM8 Phase D). This fixture is Anthropic-only,
+    # so a single "Anthropic" entry, basis "estimated", whose figures
+    # equal the cross-vendor totals (no other vendor to add).
+    vendors = body["vendors"]
+    assert isinstance(vendors, list) and len(vendors) == 1
+    av = vendors[0]
+    assert set(av) == {
+        "vendor",
+        "basis",
+        "current_spend",
+        "projected_end",
+        "daily_series",
+    }
+    assert av["vendor"] == "Anthropic"
+    assert av["basis"] == "estimated"
+    assert av["projected_end"] == body["projected_end"]
+    assert av["current_spend"] == body["current_spend"]
+    # Its per-vendor series matches the combined series (only vendor).
+    assert av["daily_series"] == series
 
 
 # ───────────────────────────────────────────────────────────────────────────

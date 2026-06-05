@@ -144,6 +144,71 @@ def _now() -> datetime:
     return datetime.now(tz=timezone.utc)
 
 
+# OpenAI usage seed (shape mirrors pull_openai_usage / test_vendor_spend).
+# gpt-4o: input $2.50/MTok; gpt-4o-mini: input $0.15/MTok.
+_GPT4O = "gpt-4o"
+_GPT4O_MINI = "gpt-4o-mini"
+
+
+def _seed_openai_usage(
+    tenant_id: str,
+    *,
+    occurred_at: datetime,
+    model: str,
+    input_uncached: int = 1_000_000,
+    input_cached: int = 0,
+    output: int = 0,
+) -> None:
+    """Insert one ``record_type='usage'`` / ``source_api='openai_admin_usage'``
+    row shaped like ``pull_openai_usage`` writes it."""
+    from vargate_telemetry.db import engine
+
+    md = {
+        "start_time": occurred_at.isoformat(),
+        "end_time": occurred_at.isoformat(),
+        "modality": "completions",
+        "result": {
+            "model": model,
+            "input_tokens": input_uncached + input_cached,  # TOTAL
+            "input_uncached_tokens": input_uncached,
+            "input_cached_tokens": input_cached,
+            "output_tokens": output,
+        },
+        "model": model,
+    }
+    eid = f"openai_admin_usage:{uuid.uuid4()}"
+    with engine.begin() as conn:
+        conn.execute(
+            sql_text(
+                """
+                INSERT INTO telemetry_records (
+                    tenant_id, record_type, source_api, external_id,
+                    occurred_at, content_hash, metadata,
+                    chain_seq, chain_prev_hash, chain_self_hash
+                ) VALUES (
+                    :t, 'usage', 'openai_admin_usage', :eid,
+                    :occurred_at, decode(:zero32, 'hex'),
+                    :metadata,
+                    (SELECT COALESCE(MAX(chain_seq), 0) + 1
+                       FROM telemetry_records
+                      WHERE tenant_id = :t_lookup),
+                    decode(:zero32, 'hex'),
+                    decode(:one32, 'hex')
+                )
+                """
+            ),
+            {
+                "t": tenant_id,
+                "t_lookup": tenant_id,
+                "eid": eid,
+                "occurred_at": occurred_at,
+                "metadata": json.dumps(md),
+                "zero32": "00" * 32,
+                "one32": "11" * 32,
+            },
+        )
+
+
 # ───────────────────────────────────────────────────────────────────────────
 # (a) >=30pp share swing → advisory with a finding
 # ───────────────────────────────────────────────────────────────────────────
@@ -220,3 +285,201 @@ def test_identical_mix_both_windows_is_idle(clean_records: None) -> None:
     assert card.severity == "idle"
     assert card.findings_count == 0
     assert card.items == []
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# (c) Vendor-mix shift (TM8 Phase D)
+# ───────────────────────────────────────────────────────────────────────────
+
+
+def _vendor_items(card) -> list:
+    """The vendor-shift findings on a card (label ends with '(vendor)')."""
+    return [it for it in card.items if it.label.endswith("(vendor)")]
+
+
+def test_vendor_shift_fires_on_20pp_share_swing(clean_records: None) -> None:
+    """Prior week all-Anthropic, current week all-OpenAI → a >=20pp vendor
+    share swing → advisory with at least one VENDOR-labelled finding whose
+    detail mentions 'total spend' and whose value is a pp-delta."""
+    from vargate_telemetry.insights.cards.model_mix import build_card
+
+    tenant = _unique_tenant("vendorshift_20pp")
+    now = _now()
+
+    # PRIOR [now-14d, now-7d): Anthropic only.
+    _seed_usage_record(
+        tenant, occurred_at=now - timedelta(days=10), model=_SONNET
+    )
+    # CURRENT [now-7d, now): OpenAI only.
+    _seed_openai_usage(
+        tenant, occurred_at=now - timedelta(days=1), model=_GPT4O
+    )
+
+    card = build_card(tenant, "7d")
+
+    assert card.severity == "advisory"
+    vendor_items = _vendor_items(card)
+    assert len(vendor_items) >= 1, [it.label for it in card.items]
+    vi = vendor_items[0]
+    assert vi.detail is not None and "total spend" in vi.detail
+    assert vi.value is not None and "pp" in vi.value
+
+
+def test_vendor_shift_fires_on_3x_absolute_with_stable_share(
+    clean_records: None,
+) -> None:
+    """A vendor whose ABSOLUTE spend triples week-over-week fires the
+    vendor-shift even when its SHARE doesn't move.
+
+    The whole tenant scales up exactly 3x between weeks, holding the
+    Anthropic/OpenAI proportions identical — so every vendor's SHARE is
+    unchanged (0pp, well below the 20pp rule) and the trigger is the
+    >=3x ABSOLUTE rule. (A uniform 3x also trips the per-model 3x rule,
+    which is fine — we're asserting the vendor-shift path fired, and a
+    vendor-labelled finding is unambiguous.)"""
+    from vargate_telemetry.insights.cards.model_mix import build_card
+
+    tenant = _unique_tenant("vendorshift_3x")
+    now = _now()
+    prior = now - timedelta(days=10)
+    cur = now - timedelta(days=1)
+
+    # PRIOR: Anthropic $6 (2M Sonnet), OpenAI $2.50 (1M gpt-4o). A≈71%.
+    _seed_usage_record(
+        tenant, occurred_at=prior, model=_SONNET, input_tokens=2_000_000,
+        output_tokens=0,
+    )
+    _seed_openai_usage(
+        tenant, occurred_at=prior, model=_GPT4O, input_uncached=1_000_000
+    )
+    # CURRENT: exactly 3x each vendor — Anthropic $18 (6M Sonnet), OpenAI
+    # $7.50 (3M gpt-4o). Shares unchanged (still ≈71/29); each vendor 3x.
+    _seed_usage_record(
+        tenant, occurred_at=cur, model=_SONNET, input_tokens=6_000_000,
+        output_tokens=0,
+    )
+    _seed_openai_usage(
+        tenant, occurred_at=cur, model=_GPT4O, input_uncached=3_000_000
+    )
+
+    card = build_card(tenant, "7d")
+
+    assert card.severity == "advisory"
+    vendor_items = _vendor_items(card)
+    assert len(vendor_items) >= 1, [it.label for it in card.items]
+    # The share didn't move materially → the pp-delta on the vendor line
+    # is below the 20pp bar; the finding fired on the 3x absolute rule.
+    for vi in vendor_items:
+        # value like "+0pp" / "-0pp" / "+1pp" — well under 20.
+        pp = int(vi.value.replace("pp", "").replace("+", ""))
+        assert abs(pp) < 20, vi.value
+
+
+def test_vendor_shift_not_fired_below_thresholds(clean_records: None) -> None:
+    """A small vendor-mix drift (< 20pp share, < 3x absolute on each
+    vendor) and a stable per-model mix → NO vendor-shift finding (idle)."""
+    from vargate_telemetry.insights.cards.model_mix import build_card
+
+    tenant = _unique_tenant("vendorshift_none")
+    now = _now()
+    prior = now - timedelta(days=10)
+    cur = now - timedelta(days=1)
+
+    # PRIOR: Anthropic $6 (2M Sonnet), OpenAI $2.50 (1M gpt-4o) -> A≈71%.
+    _seed_usage_record(
+        tenant, occurred_at=prior, model=_SONNET, input_tokens=2_000_000,
+        output_tokens=0,
+    )
+    _seed_openai_usage(
+        tenant, occurred_at=prior, model=_GPT4O, input_uncached=1_000_000
+    )
+    # CURRENT: Anthropic $6.60 (2.2M Sonnet), OpenAI $2.75 (1.1M gpt-4o)
+    # -> A≈71% (≈0pp move), each vendor < 3x. Per-model mix also stable.
+    _seed_usage_record(
+        tenant, occurred_at=cur, model=_SONNET, input_tokens=2_200_000,
+        output_tokens=0,
+    )
+    _seed_openai_usage(
+        tenant, occurred_at=cur, model=_GPT4O, input_uncached=1_100_000
+    )
+
+    card = build_card(tenant, "7d")
+
+    assert _vendor_items(card) == []
+    # Per-model mix is stable too → the whole card is idle.
+    assert card.severity == "idle"
+    assert card.findings_count == 0
+
+
+def test_within_vendor_shift_openai_mini_to_4o(clean_records: None) -> None:
+    """The within-vendor model-shift signal works for OpenAI too: a
+    gpt-4o-mini -> gpt-4o migration (a per-turn cost multiplier) is
+    flagged as a within-vendor model finding keyed 'OpenAI / <model>'.
+
+    Single vendor (OpenAI) in both windows, so NO vendor-mix finding — the
+    finding must be a model line, proving the within-vendor path spans
+    OpenAI's models."""
+    from vargate_telemetry.insights.cards.model_mix import build_card
+
+    tenant = _unique_tenant("within_openai")
+    now = _now()
+
+    # PRIOR: gpt-4o-mini only. CURRENT: gpt-4o only (a 100pp model swing
+    # within OpenAI).
+    _seed_openai_usage(
+        tenant, occurred_at=now - timedelta(days=10), model=_GPT4O_MINI,
+        input_uncached=10_000_000,
+    )
+    _seed_openai_usage(
+        tenant, occurred_at=now - timedelta(days=1), model=_GPT4O,
+        input_uncached=1_000_000,
+    )
+
+    card = build_card(tenant, "7d")
+
+    assert card.severity == "advisory"
+    # Single vendor → no vendor-mix finding.
+    assert _vendor_items(card) == []
+    # A within-vendor model finding, keyed "OpenAI / <model>".
+    model_items = [
+        it for it in card.items if it.label.startswith("OpenAI / ")
+    ]
+    assert len(model_items) >= 1, [it.label for it in card.items]
+    assert any("->" in (it.detail or "") for it in model_items)
+
+
+def test_within_vendor_anthropic_shift_preserved_cross_vendor(
+    clean_records: None,
+) -> None:
+    """The TM7 Sonnet->Opus within-vendor signal is preserved even when a
+    second vendor (OpenAI) carries steady spend in both windows.
+
+    OpenAI is identical across both weeks (no vendor pivot, no OpenAI model
+    shift); Anthropic swings Sonnet->Opus. The Opus model line must still
+    fire, keyed 'Anthropic / <opus>'."""
+    from vargate_telemetry.insights.cards.model_mix import build_card
+
+    tenant = _unique_tenant("within_anthropic_xv")
+    now = _now()
+    prior = now - timedelta(days=10)
+    cur = now - timedelta(days=1)
+
+    # Anthropic: Sonnet (prior) -> Opus (current).
+    _seed_usage_record(tenant, occurred_at=prior, model=_SONNET)
+    _seed_usage_record(tenant, occurred_at=cur, model=_OPUS)
+    # OpenAI: same gpt-4o spend in BOTH windows (steady; no shift).
+    _seed_openai_usage(
+        tenant, occurred_at=prior, model=_GPT4O, input_uncached=1_000_000
+    )
+    _seed_openai_usage(
+        tenant, occurred_at=cur, model=_GPT4O, input_uncached=1_000_000
+    )
+
+    card = build_card(tenant, "7d")
+
+    assert card.severity == "advisory"
+    opus_items = [
+        it for it in card.items
+        if it.label.startswith("Anthropic / ") and "opus" in it.label.lower()
+    ]
+    assert len(opus_items) >= 1, [it.label for it in card.items]
