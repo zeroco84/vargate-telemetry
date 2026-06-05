@@ -1252,3 +1252,622 @@ def test_cache_recommendations_no_tenant_400(client: TestClient) -> None:
     )
     assert r.status_code == 400, r.text
     assert r.json()["detail"]["code"] == "no_tenant_bound"
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# TM8 Phase D — cross-vendor (/usage serves OpenAI rows alongside Anthropic)
+#
+# OpenAI usage records have a DIFFERENT metadata shape than Anthropic: a
+# single ``metadata->'result'`` object (not a ``metadata->'results'``
+# array), with the billable split living in ``input_uncached_tokens`` /
+# ``input_cached_tokens`` and the "workspace" dimension being the
+# OpenAI ``project_id``. The seeder below mirrors exactly what
+# ``pull_openai_usage._normalize_result`` writes.
+#
+# Two invariants under test:
+#   1. REGRESSION — an ``admin`` (Anthropic) tenant's response is
+#      unchanged except that every row now reports source_api='admin'.
+#   2. The §2.1 double-count trap — OpenAI cost is derived from the
+#      uncached + cached split, NEVER the raw input_tokens total.
+# ───────────────────────────────────────────────────────────────────────────
+
+
+def _openai_result(
+    *,
+    model: str | None = None,
+    project_id: str | None = None,
+    api_key_id: str | None = None,
+    user_id: str | None = None,
+    input_uncached_tokens: int = 0,
+    input_cached_tokens: int = 0,
+    output_tokens: int = 0,
+) -> dict:
+    """One ``UsageCompletionsResult`` dump, as the OpenAI usage pull stores it.
+
+    ``input_tokens`` is the TOTAL (uncached + cached) — present on the
+    wire and stored verbatim, but the endpoint must NOT bill it directly
+    (recon §2.1). The endpoint reads ``input_uncached_tokens`` /
+    ``input_cached_tokens`` for the billable split.
+    """
+    return {
+        "object": "organization.usage.completions.result",
+        "project_id": project_id,
+        "user_id": user_id,
+        "api_key_id": api_key_id,
+        "model": model,
+        "batch": None,
+        "service_tier": None,
+        "num_model_requests": 1,
+        "input_tokens": input_uncached_tokens + input_cached_tokens,
+        "input_uncached_tokens": input_uncached_tokens,
+        "input_cached_tokens": input_cached_tokens,
+        "output_tokens": output_tokens,
+        "input_text_tokens": input_uncached_tokens,
+        "output_text_tokens": output_tokens,
+        "input_cached_text_tokens": input_cached_tokens,
+        "input_audio_tokens": 0,
+        "input_cached_audio_tokens": 0,
+        "output_audio_tokens": 0,
+        "input_image_tokens": 0,
+        "input_cached_image_tokens": 0,
+        "output_image_tokens": 0,
+    }
+
+
+def _seed_openai_usage_record(
+    tenant_id: str,
+    *,
+    bucket_date: date,
+    result: dict | None,
+    seq_suffix: str = "",
+) -> None:
+    """Insert one ``source_api='openai_admin_usage'`` record.
+
+    Metadata mirrors ``pull_openai_usage._normalize_result`` / its
+    empty-bucket sentinel (``result=None``). ``occurred_at`` is midnight
+    UTC of ``bucket_date`` (the bucket start). ``external_id`` follows the
+    recon-pinned format; ``seq_suffix`` lets a test seed multiple rows on
+    the same date+model without colliding on the UNIQUE.
+    """
+    from vargate_telemetry.db import engine
+
+    occurred = datetime.combine(
+        bucket_date, datetime.min.time(), tzinfo=timezone.utc
+    )
+    end = datetime.combine(
+        date.fromordinal(bucket_date.toordinal() + 1),
+        datetime.min.time(),
+        tzinfo=timezone.utc,
+    )
+    window = {
+        "start_time": occurred.isoformat(),
+        "end_time": end.isoformat(),
+        "modality": "completions",
+    }
+    if result is None:
+        md = {**window, "result": None}
+        model_key = project_key = api_key_key = user_key = "-"
+    else:
+        md = {
+            **window,
+            "result": result,
+            "subject_user_id": result.get("user_id"),
+            "model": result.get("model"),
+            "project_id": result.get("project_id"),
+            "api_key_id": result.get("api_key_id"),
+            "estimated_cost_usd": None,
+        }
+        model_key = result.get("model") or "-"
+        project_key = result.get("project_id") or "-"
+        api_key_key = result.get("api_key_id") or "-"
+        user_key = result.get("user_id") or "-"
+
+    start_epoch = int(occurred.timestamp())
+    end_epoch = int(end.timestamp())
+    external_id = (
+        f"openai:openai_admin_usage:{start_epoch}:{end_epoch}:"
+        f"{model_key}:{project_key}:{api_key_key}:{user_key}{seq_suffix}"
+    )
+    with engine.begin() as conn:
+        conn.execute(
+            sql_text(
+                """
+                INSERT INTO telemetry_records (
+                    tenant_id, record_type, source_api, external_id,
+                    occurred_at, content_hash, metadata,
+                    chain_seq, chain_prev_hash, chain_self_hash
+                ) VALUES (
+                    :tenant_id, 'usage', 'openai_admin_usage', :external_id,
+                    :occurred_at, decode(:content_hash_hex, 'hex'),
+                    :metadata,
+                    (SELECT COALESCE(MAX(chain_seq), 0) + 1
+                       FROM telemetry_records
+                      WHERE tenant_id = :tenant_id_lookup),
+                    decode(:prev_hex, 'hex'),
+                    decode(:self_hex, 'hex')
+                )
+                """
+            ),
+            {
+                "tenant_id": tenant_id,
+                "tenant_id_lookup": tenant_id,
+                "external_id": external_id,
+                "occurred_at": occurred,
+                "content_hash_hex": "00" * 32,
+                "metadata": json.dumps(md),
+                "prev_hex": "00" * 32,
+                "self_hex": "22" * 32,
+            },
+        )
+
+
+def _seed_openai_project(tenant_id: str, project_id: str, name: str) -> None:
+    from vargate_telemetry.db import engine
+
+    with engine.begin() as conn:
+        conn.execute(
+            sql_text(
+                "INSERT INTO tenants (tenant_id, region, active, billing_status) "
+                "VALUES (:t, 'us', TRUE, 'trial') "
+                "ON CONFLICT (tenant_id) DO NOTHING"
+            ),
+            {"t": tenant_id},
+        )
+        conn.execute(
+            sql_text(
+                """
+                INSERT INTO openai_projects (tenant_id, project_id, name)
+                VALUES (:t, :p, :n)
+                ON CONFLICT (tenant_id, project_id)
+                DO UPDATE SET name = EXCLUDED.name
+                """
+            ),
+            {"t": tenant_id, "p": project_id, "n": name},
+        )
+
+
+def _seed_openai_api_key(
+    tenant_id: str, api_key_id: str, name: str
+) -> None:
+    from vargate_telemetry.db import engine
+
+    with engine.begin() as conn:
+        conn.execute(
+            sql_text(
+                "INSERT INTO tenants (tenant_id, region, active, billing_status) "
+                "VALUES (:t, 'us', TRUE, 'trial') "
+                "ON CONFLICT (tenant_id) DO NOTHING"
+            ),
+            {"t": tenant_id},
+        )
+        conn.execute(
+            sql_text(
+                """
+                INSERT INTO openai_api_keys (tenant_id, api_key_id, name)
+                VALUES (:t, :k, :n)
+                ON CONFLICT (tenant_id, api_key_id)
+                DO UPDATE SET name = EXCLUDED.name
+                """
+            ),
+            {"t": tenant_id, "k": api_key_id, "n": name},
+        )
+
+
+@pytest.fixture
+def clean_openai_side_tables() -> Iterator[None]:
+    from vargate_telemetry.db import engine
+
+    def _truncate() -> None:
+        with engine.begin() as conn:
+            conn.execute(
+                sql_text("TRUNCATE TABLE openai_projects, openai_api_keys")
+            )
+
+    _truncate()
+    yield
+    _truncate()
+
+
+# ── Regression: Anthropic rows are unchanged + now carry source_api ──
+
+
+def test_list_usage_admin_rows_report_source_api(
+    clean_records: None, client: TestClient
+) -> None:
+    """An Anthropic (``admin``) row now carries ``source_api='admin'``;
+    everything else about the row is unchanged (regression guard for the
+    additive field)."""
+    tenant = "tnt_us_test_admin_source_api"
+    _seed_usage_record(
+        tenant,
+        bucket_date=date(2026, 5, 11),
+        results=[
+            _result_group(
+                model="claude-sonnet-4-5-20250929",
+                input_tokens=180_593,
+                output_tokens=26_235,
+                cache_read=689_700,
+            )
+        ],
+    )
+    r = client.get(
+        "/usage?since=2026-05-11&until=2026-05-11",
+        headers=_bearer_for_tenant(tenant),
+    )
+    assert r.status_code == 200, r.text
+    row = r.json()["rows"][0]
+    assert row["source_api"] == "admin"
+    # Cost is byte-identical to the pre-TM8 number (see
+    # test_list_usage_populates_cost_for_known_model).
+    assert row["estimated_cost_usd"] == "1.142214"
+
+
+# ── OpenAI rows appear with cost, project + key names ──
+
+
+def test_list_usage_openai_row_double_count_safe_cost(
+    clean_records: None,
+    clean_openai_side_tables: None,
+    client: TestClient,
+) -> None:
+    """An ``openai_admin_usage`` row surfaces with source_api, the
+    project/key names resolved from the side tables, and a cost derived
+    from the UNCACHED + CACHED split — NOT the raw input_tokens total."""
+    tenant = "tnt_us_test_openai_cost"
+    _seed_openai_project(tenant, "proj_eng", "Engineering")
+    _seed_openai_api_key(tenant, "key_ci", "CI pipeline")
+    _seed_openai_usage_record(
+        tenant,
+        bucket_date=date(2026, 5, 11),
+        result=_openai_result(
+            model="gpt-4o-2024-08-06",
+            project_id="proj_eng",
+            api_key_id="key_ci",
+            user_id="user-abc",
+            input_uncached_tokens=1_000_000,  # full rate 2.50 → 2.50
+            input_cached_tokens=400_000,      # cached rate 1.25 → 0.50
+            output_tokens=200_000,            # output 10.00 → 2.00
+        ),
+    )
+
+    r = client.get(
+        "/usage?since=2026-05-11&until=2026-05-11",
+        headers=_bearer_for_tenant(tenant),
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert len(body["rows"]) == 1
+    row = body["rows"][0]
+
+    assert row["source_api"] == "openai_admin_usage"
+    # OpenAI project_id rides the workspace_id field; name resolved.
+    assert row["workspace_id"] == "proj_eng"
+    assert row["workspace_name"] == "Engineering"
+    assert row["api_key_id"] == "key_ci"
+    assert row["api_key_name"] == "CI pipeline"
+    assert row["model"] == "gpt-4o-2024-08-06"
+
+    # Counters carry the BILLABLE split, not the raw wire fields.
+    assert row["input_tokens"] == 1_000_000      # uncached
+    assert row["cache_read_tokens"] == 400_000   # cached
+    assert row["cache_creation_tokens"] == 0     # OpenAI has none
+    assert row["output_tokens"] == 200_000
+
+    # 2.50 + 0.50 + 2.00 = 5.00. The double-count bug (billing the raw
+    # 1.4M input total) would give 6.00 — this pins the §2.1 fix.
+    assert row["estimated_cost_usd"] == "5.000000"
+    assert body["totals"]["total_cost_usd"] == "5.00"
+    assert body["totals"]["rows_without_cost"] == 0
+    assert body["totals"]["input_tokens"] == 1_000_000
+    assert body["totals"]["cache_read_tokens"] == 400_000
+
+
+def test_list_usage_openai_unresolved_project_and_key_null_names(
+    clean_records: None,
+    clean_openai_side_tables: None,
+    client: TestClient,
+) -> None:
+    """No matching side-table rows → names null; the row still appears
+    (the UI falls back to the raw ids)."""
+    tenant = "tnt_us_test_openai_unresolved"
+    _seed_openai_usage_record(
+        tenant,
+        bucket_date=date(2026, 5, 11),
+        result=_openai_result(
+            model="gpt-4o-mini",
+            project_id="proj_unknown",
+            api_key_id="key_unknown",
+            input_uncached_tokens=1_000,
+        ),
+    )
+    r = client.get(
+        "/usage?since=2026-05-11&until=2026-05-11",
+        headers=_bearer_for_tenant(tenant),
+    )
+    body = r.json()
+    row = body["rows"][0]
+    assert row["workspace_id"] == "proj_unknown"
+    assert row["workspace_name"] is None
+    assert row["api_key_id"] == "key_unknown"
+    assert row["api_key_name"] is None
+
+
+def test_list_usage_openai_unknown_model_leaves_cost_null(
+    clean_records: None,
+    clean_openai_side_tables: None,
+    client: TestClient,
+) -> None:
+    """An OpenAI model unknown to the rate card → cost null, row survives,
+    rows_without_cost bumps (never fake a number)."""
+    tenant = "tnt_us_test_openai_unknown_model"
+    _seed_openai_usage_record(
+        tenant,
+        bucket_date=date(2026, 5, 11),
+        result=_openai_result(
+            model="gpt-9-imaginary",
+            input_uncached_tokens=1_000_000,
+        ),
+    )
+    r = client.get(
+        "/usage?since=2026-05-11&until=2026-05-11",
+        headers=_bearer_for_tenant(tenant),
+    )
+    body = r.json()
+    assert len(body["rows"]) == 1
+    assert body["rows"][0]["estimated_cost_usd"] is None
+    assert body["totals"]["total_cost_usd"] is None
+    assert body["totals"]["rows_without_cost"] == 1
+
+
+def test_list_usage_openai_empty_bucket_sentinel_excluded(
+    clean_records: None,
+    clean_openai_side_tables: None,
+    client: TestClient,
+) -> None:
+    """An empty-bucket sentinel (``result=None``) is NOT a usage row — it
+    only exists to advance the cursor — so the endpoint omits it."""
+    tenant = "tnt_us_test_openai_sentinel"
+    _seed_openai_usage_record(
+        tenant, bucket_date=date(2026, 5, 11), result=None
+    )
+    # A real row on a different day so the response isn't trivially empty.
+    _seed_openai_usage_record(
+        tenant,
+        bucket_date=date(2026, 5, 10),
+        result=_openai_result(
+            model="gpt-4o", input_uncached_tokens=1_000
+        ),
+    )
+    r = client.get(
+        "/usage?since=2026-05-10&until=2026-05-11",
+        headers=_bearer_for_tenant(tenant),
+    )
+    body = r.json()
+    # Only the 05-10 row; the 05-11 sentinel is excluded.
+    assert [row["date"] for row in body["rows"]] == ["2026-05-10"]
+    assert body["totals"]["row_count"] == 1
+
+
+# ── OpenAI filters (workspace_id == project_id, model) ──
+
+
+def test_list_usage_openai_project_filter(
+    clean_records: None,
+    clean_openai_side_tables: None,
+    client: TestClient,
+) -> None:
+    """``workspace_id`` filters OpenAI rows on their project_id dimension."""
+    tenant = "tnt_us_test_openai_proj_filter"
+    _seed_openai_usage_record(
+        tenant,
+        bucket_date=date(2026, 5, 11),
+        result=_openai_result(
+            model="gpt-4o", project_id="proj_a", input_uncached_tokens=100
+        ),
+    )
+    _seed_openai_usage_record(
+        tenant,
+        bucket_date=date(2026, 5, 11),
+        result=_openai_result(
+            model="gpt-4o", project_id="proj_b", input_uncached_tokens=200
+        ),
+    )
+    r = client.get(
+        "/usage?since=2026-05-11&until=2026-05-11&workspace_id=proj_a",
+        headers=_bearer_for_tenant(tenant),
+    )
+    body = r.json()
+    assert len(body["rows"]) == 1
+    assert body["rows"][0]["workspace_id"] == "proj_a"
+    assert body["totals"]["input_tokens"] == 100
+
+
+def test_list_usage_openai_model_filter(
+    clean_records: None,
+    clean_openai_side_tables: None,
+    client: TestClient,
+) -> None:
+    """``model`` filters OpenAI rows too."""
+    tenant = "tnt_us_test_openai_model_filter"
+    _seed_openai_usage_record(
+        tenant,
+        bucket_date=date(2026, 5, 11),
+        result=_openai_result(
+            model="gpt-4o", input_uncached_tokens=100
+        ),
+    )
+    _seed_openai_usage_record(
+        tenant,
+        bucket_date=date(2026, 5, 11),
+        result=_openai_result(
+            model="gpt-4o-mini", input_uncached_tokens=200
+        ),
+    )
+    r = client.get(
+        "/usage?since=2026-05-11&until=2026-05-11&model=gpt-4o-mini",
+        headers=_bearer_for_tenant(tenant),
+    )
+    body = r.json()
+    assert len(body["rows"]) == 1
+    assert body["rows"][0]["model"] == "gpt-4o-mini"
+    assert body["totals"]["input_tokens"] == 200
+
+
+# ── Mixed vendors in one tenant: totals sum across both ──
+
+
+def test_list_usage_mixed_vendors_totals_and_rows(
+    clean_records: None,
+    clean_openai_side_tables: None,
+    client: TestClient,
+) -> None:
+    """A tenant with BOTH an Anthropic and an OpenAI usage row: both
+    appear (each tagged with its source_api), token totals sum across
+    vendors, and the cost total is the sum of the two vendor-priced
+    figures."""
+    from decimal import Decimal
+
+    tenant = "tnt_us_test_mixed_vendors"
+    # Anthropic Sonnet row: input 1M @ $3.00 = $3.00 (no cache/output).
+    _seed_usage_record(
+        tenant,
+        bucket_date=date(2026, 5, 11),
+        results=[
+            _result_group(
+                model="claude-sonnet-4-5-20250929",
+                input_tokens=1_000_000,
+            )
+        ],
+    )
+    # OpenAI gpt-4o row: uncached 1M @ $2.50 = $2.50.
+    _seed_openai_usage_record(
+        tenant,
+        bucket_date=date(2026, 5, 11),
+        result=_openai_result(
+            model="gpt-4o", input_uncached_tokens=1_000_000
+        ),
+    )
+
+    r = client.get(
+        "/usage?since=2026-05-11&until=2026-05-11",
+        headers=_bearer_for_tenant(tenant),
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+
+    by_source = {row["source_api"] for row in body["rows"]}
+    assert by_source == {"admin", "openai_admin_usage"}
+    assert len(body["rows"]) == 2
+
+    # Token totals sum across both vendors.
+    assert body["totals"]["input_tokens"] == 2_000_000
+    assert body["totals"]["row_count"] == 2
+
+    # Cost total = $3.00 (Anthropic) + $2.50 (OpenAI) = $5.50, and equals
+    # the sum of the per-row costs.
+    assert body["totals"]["total_cost_usd"] == "5.50"
+    assert body["totals"]["rows_without_cost"] == 0
+    per_row_sum = sum(
+        Decimal(row["estimated_cost_usd"])
+        for row in body["rows"]
+        if row["estimated_cost_usd"]
+    )
+    assert per_row_sum.quantize(Decimal("0.01")) == Decimal("5.50")
+
+
+def test_list_usage_mixed_vendor_cursor_pagination(
+    clean_records: None,
+    clean_openai_side_tables: None,
+    client: TestClient,
+) -> None:
+    """Cursor pagination walks the MERGED set correctly: 4 rows across
+    two vendors on distinct days, page size 1, yields 4 pages in
+    descending date order with no row dropped or repeated. Totals stay
+    constant (full filtered set) on every page."""
+    tenant = "tnt_us_test_mixed_cursor"
+    # 05-08 Anthropic, 05-09 OpenAI, 05-10 Anthropic, 05-11 OpenAI.
+    _seed_usage_record(
+        tenant,
+        bucket_date=date(2026, 5, 8),
+        results=[_result_group(model="claude-sonnet-4-5", input_tokens=10)],
+    )
+    _seed_openai_usage_record(
+        tenant,
+        bucket_date=date(2026, 5, 9),
+        result=_openai_result(model="gpt-4o", input_uncached_tokens=20),
+    )
+    _seed_usage_record(
+        tenant,
+        bucket_date=date(2026, 5, 10),
+        results=[_result_group(model="claude-sonnet-4-5", input_tokens=30)],
+    )
+    _seed_openai_usage_record(
+        tenant,
+        bucket_date=date(2026, 5, 11),
+        result=_openai_result(model="gpt-4o", input_uncached_tokens=40),
+    )
+
+    seen: list[tuple[str, str]] = []
+    cursor: str | None = None
+    pages = 0
+    while True:
+        pages += 1
+        url = "/usage?since=2026-05-08&until=2026-05-11&limit=1"
+        if cursor:
+            url += f"&cursor={cursor}"
+        r = client.get(url, headers=_bearer_for_tenant(tenant))
+        assert r.status_code == 200, r.text
+        body = r.json()
+        for row in body["rows"]:
+            seen.append((row["date"], row["source_api"]))
+        # Full-set totals — same on every page.
+        assert body["totals"]["row_count"] == 4
+        assert body["totals"]["input_tokens"] == 100  # 10+20+30+40
+        if not body["next_cursor"]:
+            break
+        cursor = body["next_cursor"]
+        if pages > 10:
+            pytest.fail("cursor walk did not terminate")
+
+    assert pages == 4
+    # Descending date order; each row exactly once; vendor tag correct.
+    assert seen == [
+        ("2026-05-11", "openai_admin_usage"),
+        ("2026-05-10", "admin"),
+        ("2026-05-09", "openai_admin_usage"),
+        ("2026-05-08", "admin"),
+    ]
+
+
+def test_list_usage_openai_only_tenant_does_not_see_admin_supersession(
+    clean_records: None,
+    clean_openai_side_tables: None,
+    client: TestClient,
+) -> None:
+    """The Anthropic supersession filter must not touch OpenAI rows: an
+    OpenAI row with a null-ish dimension is never hidden by an unrelated
+    Anthropic per-model row, because the two branches are independent.
+    Here an OpenAI row coexists with an Anthropic per-model row on the
+    same date — both survive."""
+    tenant = "tnt_us_test_openai_no_supersede"
+    _seed_usage_record(
+        tenant,
+        bucket_date=date(2026, 5, 11),
+        results=[
+            _result_group(
+                model="claude-sonnet-4-5-20250929", input_tokens=100
+            )
+        ],
+    )
+    _seed_openai_usage_record(
+        tenant,
+        bucket_date=date(2026, 5, 11),
+        result=_openai_result(model="gpt-4o", input_uncached_tokens=200),
+    )
+    r = client.get(
+        "/usage?since=2026-05-11&until=2026-05-11",
+        headers=_bearer_for_tenant(tenant),
+    )
+    body = r.json()
+    assert body["totals"]["row_count"] == 2
+    assert body["totals"]["input_tokens"] == 300
