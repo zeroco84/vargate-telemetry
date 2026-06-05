@@ -70,6 +70,16 @@ def main() -> int:
             f"+{vol['events_added']} events, +{vol['usage_added']} usage, "
             f"+{vol['content_added']} content"
         )
+        # seed_volume also layers OpenAI activity (cross-vendor demo) onto
+        # the same roster — report those stream counts too.
+        print(
+            f"  openai  : +{vol['openai_projects_added']} projects, "
+            f"+{vol['openai_api_keys_added']} keys, "
+            f"+{vol['openai_users_added']} users, "
+            f"+{vol['openai_usage_added']} usage, "
+            f"+{vol['openai_costs_added']} costs, "
+            f"+{vol['openai_audit_added']} audit"
+        )
 
     v = verify_telemetry_chain(tenant_id)
     print(f"  chain   : valid={v.valid} records={v.record_count}")

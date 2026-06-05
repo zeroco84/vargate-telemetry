@@ -39,6 +39,16 @@ from vargate_telemetry.storage.content import store_content
 
 _SRC_CONTENT = "compliance_content"
 
+# OpenAI source_api values — kept in lockstep with the pull tasks'
+# SOURCE_API_OPENAI_* constants (tasks/pull_openai_usage.py /
+# pull_openai_costs.py / pull_openai_audit.py). Defined locally rather
+# than imported so demo_seed stays free of the Celery task import graph
+# (same posture as _SRC_CONTENT). The OpenAI seed lives further down
+# (seed_openai_volume).
+SOURCE_API_OPENAI_USAGE = "openai_admin_usage"
+SOURCE_API_OPENAI_COSTS = "openai_admin_costs"
+SOURCE_API_OPENAI_AUDIT = "openai_audit_logs"
+
 
 def _md_hash(metadata: dict[str, Any]) -> bytes:
     """content_hash for a blob-less event: SHA-256 of its canonical
@@ -599,11 +609,651 @@ def seed_volume(tenant_id: str, *, days: int = 30) -> dict[str, int]:
                 usage_added += 1
 
     content_added = _seed_volume_content(tenant_id, today, rng)
+
+    # Cross-vendor: layer OpenAI activity (projects/keys/users side tables
+    # + per-(day, user) usage + authoritative per-project costs + a few
+    # audit logs) onto the SAME roster so the API Usage vendor filter,
+    # the cross-vendor Insights cards, and the Users list+detail render
+    # OpenAI alongside Anthropic. Relative-dated → the nightly cron keeps
+    # it inside the 7d/30d windows. Idempotent (demo: external_ids).
+    openai_counts = seed_openai_volume(tenant_id, days=days)
+
     return {
         "users_added": users_added,
         "events_added": events_added,
         "usage_added": usage_added,
         "content_added": content_added,
+        # OpenAI stream counts (added rows) so the --volume summary can
+        # report both vendors. Keys mirror seed_openai_volume's return.
+        "openai_projects_added": openai_counts["projects_added"],
+        "openai_api_keys_added": openai_counts["api_keys_added"],
+        "openai_users_added": openai_counts["users_added"],
+        "openai_usage_added": openai_counts["usage_added"],
+        "openai_costs_added": openai_counts["costs_added"],
+        "openai_audit_added": openai_counts["audit_added"],
+    }
+
+
+# ── OpenAI cross-vendor volume (TM8 Phase F) ───────────────────────────────
+#
+# Seeds the same shapes the OpenAI pull tasks write (tasks/pull_openai_*.py)
+# via the SAME real pipeline (append_telemetry_record for telemetry_records
+# + raw ON CONFLICT upserts for the openai_projects / openai_api_keys /
+# openai_users side tables). The seeded openai_users emails reuse the
+# _VOL_ROSTER emails so OpenAI activity stitches into the SAME users rows
+# as Claude (the alias reconciler email-matches metadata.user_email →
+# users.email; it runs lazily on GET /api/users).
+#
+# Source-of-truth shapes are pinned to:
+#   - pull_openai_usage._normalize_result  (usage metadata + external_id)
+#   - pull_openai_costs._normalize_cost_result  (costs metadata + external_id)
+#   - pull_openai_audit._normalize_audit  (audit metadata + external_id)
+#   - openai/types.py  (UsageCompletionsResult / CostResult / AuditLogEntry
+#     model_dump shapes — what lands under metadata['result'] / 'entry')
+#   - pricing/vendor_cost._estimate_openai_usage / insights/spend_data /
+#     api/usage._openai_branch  (which read result.input_uncached_tokens /
+#     input_cached_tokens / output_tokens / model / project_id / api_key_id)
+#
+# Two OpenAI projects + three API keys. One model mix per day (gpt-4o +
+# gpt-4o-mini) so model_mix's recent-7d-vs-prior-7d cross-vendor share is
+# stable; volume comparable to the Anthropic demo usage.
+
+_OPENAI_PROJECTS = [
+    ("proj_demo_platform", "Platform"),
+    ("proj_demo_apps", "Applications"),
+]
+# (api_key_id, project_id, display name)
+_OPENAI_API_KEYS = [
+    ("key_demo_backend", "proj_demo_platform", "backend-service"),
+    ("key_demo_batch", "proj_demo_platform", "nightly-batch"),
+    ("key_demo_webapp", "proj_demo_apps", "webapp-frontend"),
+]
+# The two demo models + their per-row token shape (uncached, cached,
+# output, requests). gpt-4o is the heavier model; gpt-4o-mini the cheap
+# high-volume one — same split posture as a real org.
+_OPENAI_MODELS = [
+    # model, input_uncached, input_cached, output, num_requests
+    ("gpt-4o-2024-08-06", 9000, 3000, 2600, 14),
+    ("gpt-4o-mini-2024-07-18", 26000, 8000, 7400, 41),
+]
+
+# An OpenAI user id whose email is deliberately NOT in the roster — its
+# usage lands in the Unmapped panel (the cross-vendor analogue of an
+# Anthropic api-key actor with no email). Seeded into openai_users with a
+# null email so it resolves to no user_email and never auto-matches.
+_OPENAI_UNMAPPED_USER_ID = "user-demo-svcacct"
+
+
+def _openai_user_id(handle: str) -> str:
+    """Deterministic OpenAI user id for a roster handle (opaque, like the
+    vendor's ``user-XXXX``)."""
+    return f"user-demo-{handle}"
+
+
+def _seed_openai_side_tables(tenant_id: str) -> dict[str, int]:
+    """Upsert the openai_projects / openai_api_keys / openai_users side
+    tables (migration 0025), mirroring pull_openai_projects' UPSERTs.
+
+    openai_users gets one row per roster user (email = the roster email,
+    so attribution stitches) PLUS exactly one unmapped identity (null
+    email). Idempotent — ON CONFLICT DO UPDATE, returns the count of rows
+    touched (inserts only, for the summary)."""
+    from datetime import datetime, timezone
+
+    created = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    projects_added = api_keys_added = users_added = 0
+
+    with session_scope(tenant_id) as s:
+        for project_id, name in _OPENAI_PROJECTS:
+            res = s.execute(
+                sql_text(
+                    """
+                    INSERT INTO openai_projects
+                        (tenant_id, project_id, name, status,
+                         created_at_openai)
+                    VALUES (:t, :p, :n, 'active', :c)
+                    ON CONFLICT (tenant_id, project_id)
+                    DO UPDATE SET
+                        name = EXCLUDED.name,
+                        status = EXCLUDED.status,
+                        synced_at = now()
+                    RETURNING (xmax = 0) AS was_insert
+                    """
+                ),
+                {"t": tenant_id, "p": project_id, "n": name, "c": created},
+            ).first()
+            if res is not None and res.was_insert:
+                projects_added += 1
+
+        for api_key_id, project_id, name in _OPENAI_API_KEYS:
+            res = s.execute(
+                sql_text(
+                    """
+                    INSERT INTO openai_api_keys
+                        (tenant_id, api_key_id, project_id, name,
+                         created_at_openai, last_used_at)
+                    VALUES (:t, :k, :p, :n, :c, :c)
+                    ON CONFLICT (tenant_id, api_key_id)
+                    DO UPDATE SET
+                        project_id = EXCLUDED.project_id,
+                        name = EXCLUDED.name,
+                        synced_at = now()
+                    RETURNING (xmax = 0) AS was_insert
+                    """
+                ),
+                {
+                    "t": tenant_id,
+                    "k": api_key_id,
+                    "p": project_id,
+                    "n": name,
+                    "c": created,
+                },
+            ).first()
+            if res is not None and res.was_insert:
+                api_keys_added += 1
+
+        # One openai_users row per roster user (email match → stitch).
+        for name, handle in _VOL_ROSTER:
+            email = f"{handle}@{_VOL_DOMAIN}"
+            res = s.execute(
+                sql_text(
+                    """
+                    INSERT INTO openai_users
+                        (tenant_id, openai_user_id, email, name, role)
+                    VALUES (:t, :u, :e, :n, 'member')
+                    ON CONFLICT (tenant_id, openai_user_id)
+                    DO UPDATE SET
+                        email = EXCLUDED.email,
+                        name = EXCLUDED.name,
+                        role = EXCLUDED.role,
+                        synced_at = now()
+                    RETURNING (xmax = 0) AS was_insert
+                    """
+                ),
+                {
+                    "t": tenant_id,
+                    "u": _openai_user_id(handle),
+                    "e": email,
+                    "n": name,
+                },
+            ).first()
+            if res is not None and res.was_insert:
+                users_added += 1
+
+        # The unmapped identity: an OpenAI user with NO email (a service
+        # account). Its usage rows resolve to no user_email and land in
+        # the Users "unmapped activity" panel.
+        res = s.execute(
+            sql_text(
+                """
+                INSERT INTO openai_users
+                    (tenant_id, openai_user_id, email, name, role)
+                VALUES (:t, :u, NULL, 'Batch Service Account',
+                        'service_account')
+                ON CONFLICT (tenant_id, openai_user_id)
+                DO UPDATE SET name = EXCLUDED.name, synced_at = now()
+                RETURNING (xmax = 0) AS was_insert
+                """
+            ),
+            {"t": tenant_id, "u": _OPENAI_UNMAPPED_USER_ID},
+        ).first()
+        if res is not None and res.was_insert:
+            users_added += 1
+
+    return {
+        "projects_added": projects_added,
+        "api_keys_added": api_keys_added,
+        "users_added": users_added,
+    }
+
+
+def _openai_usage_result_dict(
+    *,
+    model: str,
+    user_id: str,
+    api_key_id: str,
+    project_id: str,
+    input_uncached: int,
+    input_cached: int,
+    output: int,
+    num_requests: int,
+) -> dict[str, Any]:
+    """Build one grouped usage result row matching
+    ``UsageCompletionsResult.model_dump(mode="json")`` (openai/types.py).
+
+    ``input_tokens`` is the TOTAL (uncached + cached) — the double-count
+    trap the cost path must NOT bill directly; the text sub-splits mirror
+    the recon §2 shape so the stored metadata is realistic. This dict
+    lands verbatim under ``metadata['result']``; api/usage + spend_data +
+    vendor_cost all read ``input_uncached_tokens`` / ``input_cached_tokens``
+    / ``output_tokens`` / ``model`` / ``project_id`` / ``api_key_id`` from
+    it."""
+    return {
+        "object": "organization.usage.completions.result",
+        "project_id": project_id,
+        "user_id": user_id,
+        "api_key_id": api_key_id,
+        "model": model,
+        "batch": None,
+        "service_tier": None,
+        "num_model_requests": num_requests,
+        "input_tokens": input_uncached + input_cached,  # TOTAL — do not bill
+        "input_uncached_tokens": input_uncached,
+        "input_cached_tokens": input_cached,
+        "output_tokens": output,
+        "input_text_tokens": input_uncached,
+        "output_text_tokens": output,
+        "input_cached_text_tokens": input_cached,
+        "input_audio_tokens": 0,
+        "input_cached_audio_tokens": 0,
+        "output_audio_tokens": 0,
+        "input_image_tokens": 0,
+        "input_cached_image_tokens": 0,
+        "output_image_tokens": 0,
+    }
+
+
+def _seed_openai_usage(
+    tenant_id: str, today, days: int, email_map: dict[str, str], rng
+) -> int:
+    """Per-(day, user) OpenAI usage records over the trailing ``days``.
+
+    Mirrors ``pull_openai_usage._normalize_result``: one record per
+    grouped (model, user, key, project) row, ``record_type='usage'``,
+    ``source_api='openai_admin_usage'``, the recon-pinned external_id
+    ``openai:openai_admin_usage:{start_epoch}:{end_epoch}:{model}:{project}:{key}:{user}``,
+    ``content_hash`` = SHA-256 of the canonical sub_meta, and the per-row
+    wrapper metadata (window + modality + result + top-level
+    subject_user_id / model / project_id / api_key_id / estimated_cost_usd
+    / user_email). user_email is resolved from ``email_map`` (the seeded
+    openai_users) so attribution stitches; the unmapped user yields no
+    user_email and lands unmapped.
+
+    Token counts get a small deterministic per-(user, day) jitter so the
+    Users per-user spend isn't uniform. Dedup is by external_id (the epoch
+    window is stable per UTC day), so same-day re-runs skip and later runs
+    add the new day."""
+    from datetime import datetime, timedelta, timezone
+
+    from vargate_telemetry.pricing import openai_rates
+
+    added = 0
+    # Each roster user is assigned a stable key+project so their usage
+    # attributes to a consistent project (the "workspace" dimension).
+    for u_idx, (name, handle) in enumerate(_VOL_ROSTER):
+        user_id = _openai_user_id(handle)
+        api_key_id, project_id, _kname = _OPENAI_API_KEYS[
+            u_idx % len(_OPENAI_API_KEYS)
+        ]
+        email = email_map.get(user_id)
+        for d in range(days):
+            # ~55% of days active per user (deterministic via seeded rng).
+            if rng.random() > 0.55:
+                continue
+            day = today - timedelta(days=d)
+            start = datetime(
+                day.year, day.month, day.day, tzinfo=timezone.utc
+            )
+            end = start + timedelta(days=1)
+            start_epoch = int(start.timestamp())
+            end_epoch = int(end.timestamp())
+            window = {
+                "start_time": start.isoformat(),
+                "end_time": end.isoformat(),
+                "modality": "completions",
+            }
+            for model, base_unc, base_cache, base_out, base_req in (
+                _OPENAI_MODELS
+            ):
+                # Deterministic jitter (0.6x–1.4x) so per-user totals vary.
+                jitter = 0.6 + rng.random() * 0.8
+                input_uncached = int(base_unc * jitter)
+                input_cached = int(base_cache * jitter)
+                output = int(base_out * jitter)
+                num_requests = max(1, int(base_req * jitter))
+
+                result_dict = _openai_usage_result_dict(
+                    model=model,
+                    user_id=user_id,
+                    api_key_id=api_key_id,
+                    project_id=project_id,
+                    input_uncached=input_uncached,
+                    input_cached=input_cached,
+                    output=output,
+                    num_requests=num_requests,
+                )
+
+                # §2.1 double-count-safe estimate — uncached as input,
+                # cached as cache_read, no cache-creation charge.
+                est = openai_rates.compute_cost_usd(
+                    model,
+                    input_tokens=input_uncached,
+                    output_tokens=output,
+                    cache_read_tokens=input_cached,
+                    cache_creation_tokens=0,
+                    occurred_at=start,
+                )
+
+                sub_meta: dict[str, Any] = {
+                    **window,
+                    "result": result_dict,
+                    "subject_user_id": user_id,
+                    "model": model,
+                    "project_id": project_id,
+                    "api_key_id": api_key_id,
+                    "estimated_cost_usd": (
+                        str(est) if est is not None else None
+                    ),
+                }
+                if email is not None:
+                    sub_meta["user_email"] = email
+
+                ext = (
+                    f"demo:openai:{SOURCE_API_OPENAI_USAGE}:"
+                    f"{start_epoch}:{end_epoch}:"
+                    f"{model}:{project_id}:{api_key_id}:{user_id}"
+                )
+                canonical = json.dumps(
+                    sub_meta, sort_keys=True, separators=(",", ":")
+                ).encode("utf-8")
+                try:
+                    append_telemetry_record(
+                        tenant_id,
+                        record_type="usage",
+                        source_api=SOURCE_API_OPENAI_USAGE,
+                        external_id=ext,
+                        occurred_at=start,
+                        content_hash=hashlib.sha256(canonical).digest(),
+                        record_metadata=sub_meta,
+                        subject_user_id=user_id,
+                    )
+                    added += 1
+                except IntegrityError:
+                    pass
+
+    # A slice of usage for the UNMAPPED service-account identity (no
+    # email) on a few recent days so the Unmapped panel has real volume.
+    for d in range(min(days, 5)):
+        day = today - timedelta(days=d)
+        start = datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
+        end = start + timedelta(days=1)
+        start_epoch = int(start.timestamp())
+        end_epoch = int(end.timestamp())
+        model = "gpt-4o-mini-2024-07-18"
+        api_key_id, project_id, _ = _OPENAI_API_KEYS[1]  # nightly-batch key
+        result_dict = _openai_usage_result_dict(
+            model=model,
+            user_id=_OPENAI_UNMAPPED_USER_ID,
+            api_key_id=api_key_id,
+            project_id=project_id,
+            input_uncached=52000,
+            input_cached=18000,
+            output=14000,
+            num_requests=80,
+        )
+        est = openai_rates.compute_cost_usd(
+            model,
+            input_tokens=52000,
+            output_tokens=14000,
+            cache_read_tokens=18000,
+            cache_creation_tokens=0,
+            occurred_at=start,
+        )
+        sub_meta = {
+            "start_time": start.isoformat(),
+            "end_time": end.isoformat(),
+            "modality": "completions",
+            "result": result_dict,
+            "subject_user_id": _OPENAI_UNMAPPED_USER_ID,
+            "model": model,
+            "project_id": project_id,
+            "api_key_id": api_key_id,
+            "estimated_cost_usd": str(est) if est is not None else None,
+        }
+        ext = (
+            f"demo:openai:{SOURCE_API_OPENAI_USAGE}:"
+            f"{start_epoch}:{end_epoch}:"
+            f"{model}:{project_id}:{api_key_id}:{_OPENAI_UNMAPPED_USER_ID}"
+        )
+        canonical = json.dumps(
+            sub_meta, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        try:
+            append_telemetry_record(
+                tenant_id,
+                record_type="usage",
+                source_api=SOURCE_API_OPENAI_USAGE,
+                external_id=ext,
+                occurred_at=start,
+                content_hash=hashlib.sha256(canonical).digest(),
+                record_metadata=sub_meta,
+                subject_user_id=_OPENAI_UNMAPPED_USER_ID,
+            )
+            added += 1
+        except IntegrityError:
+            pass
+
+    return added
+
+
+def _seed_openai_costs(tenant_id: str, today, days: int) -> int:
+    """Authoritative per-project daily OpenAI spend over ``days``.
+
+    Mirrors ``pull_openai_costs._normalize_cost_result``: one record per
+    (line_item, project) row, ``record_type='cost'``,
+    ``source_api='openai_admin_costs'``, external_id
+    ``openai:openai_admin_costs:{start}:{end}:{line_item}:{project}``,
+    top-level ``amount_value`` (Decimal string — the field spend_data /
+    cost_forecasting sum on), ``line_item`` / ``project_id`` /
+    ``project_name`` / ``currency``, and the full ``result`` dict
+    (CostResult.model_dump shape). gpt-4o + gpt-4o-mini input/output line
+    items per project per day."""
+    from datetime import datetime, timedelta, timezone
+
+    added = 0
+    # Per-project, per-model daily billed amount (USD). gpt-4o costs more;
+    # split into input/output line items the way /costs reports them.
+    # (project_id, project_name, [(model, input_usd, output_usd)])
+    cost_plan = [
+        (
+            "proj_demo_platform",
+            "Platform",
+            [
+                ("gpt-4o-2024-08-06", "0.62", "0.48"),
+                ("gpt-4o-mini-2024-07-18", "0.18", "0.16"),
+            ],
+        ),
+        (
+            "proj_demo_apps",
+            "Applications",
+            [
+                ("gpt-4o-2024-08-06", "0.34", "0.27"),
+                ("gpt-4o-mini-2024-07-18", "0.11", "0.09"),
+            ],
+        ),
+    ]
+    for d in range(days):
+        day = today - timedelta(days=d)
+        start = datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
+        end = start + timedelta(days=1)
+        start_epoch = int(start.timestamp())
+        end_epoch = int(end.timestamp())
+        window = {
+            "start_time": start.isoformat(),
+            "end_time": end.isoformat(),
+        }
+        for project_id, project_name, line_items in cost_plan:
+            for model, in_usd, out_usd in line_items:
+                for kind, amount in (("input", in_usd), ("output", out_usd)):
+                    line_item = f"{model}, {kind}"
+                    result_dict = {
+                        "object": "organization.costs.result",
+                        "amount": {"value": float(amount), "currency": "usd"},
+                        "line_item": line_item,
+                        "quantity": None,
+                        "project_id": project_id,
+                        "project_name": project_name,
+                        "organization_id": None,
+                        "organization_name": None,
+                    }
+                    sub_meta = {
+                        **window,
+                        "result": result_dict,
+                        "line_item": line_item,
+                        "project_id": project_id,
+                        "project_name": project_name,
+                        "amount_value": amount,
+                        "currency": "usd",
+                    }
+                    ext = (
+                        f"demo:openai:{SOURCE_API_OPENAI_COSTS}:"
+                        f"{start_epoch}:{end_epoch}:{line_item}:{project_id}"
+                    )
+                    canonical = json.dumps(
+                        sub_meta, sort_keys=True, separators=(",", ":")
+                    ).encode("utf-8")
+                    try:
+                        append_telemetry_record(
+                            tenant_id,
+                            record_type="cost",
+                            source_api=SOURCE_API_OPENAI_COSTS,
+                            external_id=ext,
+                            occurred_at=start,
+                            content_hash=hashlib.sha256(canonical).digest(),
+                            record_metadata=sub_meta,
+                        )
+                        added += 1
+                    except IntegrityError:
+                        pass
+    return added
+
+
+def _seed_openai_audit(tenant_id: str, today) -> int:
+    """A handful of OpenAI audit-log records.
+
+    Mirrors ``pull_openai_audit._normalize_audit``: ``record_type=
+    'audit_log'``, ``source_api='openai_audit_logs'``, external_id
+    ``openai:openai_audit_logs:{event_id}`` (the stable event id is the
+    dedup key — no window), the full entry under ``metadata['entry']``
+    (AuditLogEntry.model_dump shape) + top-level event_type /
+    subject_user_id (+ user_email when the actor has one). Events are
+    relative-dated to the last few days."""
+    from datetime import datetime, timedelta, timezone
+
+    # (event_id_suffix, event_type, days_ago, actor_handle_or_None)
+    events = [
+        ("apikeycreated", "api_key.created", 1, "carol"),
+        ("loginsucceeded", "login.succeeded", 1, "dave"),
+        ("projectupdated", "project.updated", 2, "erin"),
+        ("invitesent", "invite.sent", 2, "frank"),
+        ("logoutsucceeded", "logout.succeeded", 3, "grace"),
+    ]
+    added = 0
+    for suffix, event_type, days_ago, handle in events:
+        day = today - timedelta(days=days_ago)
+        occurred = datetime(
+            day.year, day.month, day.day, 12, tzinfo=timezone.utc
+        )
+        event_id = f"audit_log-demo-{suffix}"
+        user_id = _openai_user_id(handle) if handle else None
+        email = f"{handle}@{_VOL_DOMAIN}" if handle else None
+        entry_dict: dict[str, Any] = {
+            "object": "organization.audit_log",
+            "id": event_id,
+            "type": event_type,
+            "effective_at": int(occurred.timestamp()),
+            "actor": {
+                "type": "session",
+                "session": (
+                    {"user": {"id": user_id, "email": email}}
+                    if user_id
+                    else None
+                ),
+                "api_key": None,
+            },
+            "project": {
+                "id": "proj_demo_platform",
+                "name": "Platform",
+            },
+        }
+        sub_meta: dict[str, Any] = {
+            "entry": entry_dict,
+            "event_type": event_type,
+            "subject_user_id": user_id,
+        }
+        if email is not None:
+            sub_meta["user_email"] = email
+        ext = f"demo:openai:{SOURCE_API_OPENAI_AUDIT}:{event_id}"
+        canonical = json.dumps(
+            sub_meta, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        try:
+            append_telemetry_record(
+                tenant_id,
+                record_type="audit_log",
+                source_api=SOURCE_API_OPENAI_AUDIT,
+                external_id=ext,
+                occurred_at=occurred,
+                content_hash=hashlib.sha256(canonical).digest(),
+                record_metadata=sub_meta,
+                subject_user_id=user_id,
+            )
+            added += 1
+        except IntegrityError:
+            pass
+    return added
+
+
+def seed_openai_volume(tenant_id: str, *, days: int = 30) -> dict[str, int]:
+    """Seed OpenAI cross-vendor demo activity onto the roster.
+
+    Layers the OpenAI side tables + per-(day, user) usage + per-project
+    costs + a few audit logs onto the SAME ``_VOL_ROSTER`` users
+    ``seed_volume`` creates, so the cross-vendor dashboard renders OpenAI
+    next to Anthropic. Idempotent (``demo:`` external_ids), relative-dated
+    to today (nightly cron keeps it inside the 7d/30d windows).
+
+    Calls ``ensure_tenant`` + creates the roster users itself, so it is
+    independently runnable (``scripts/seed_demo_openai.py``) without first
+    running the Anthropic ``seed_volume``. When invoked FROM
+    ``seed_volume`` the roster users already exist (``_ensure_user`` is
+    idempotent), so no duplication.
+
+    Returns per-stream added-row counts."""
+    import random
+    from datetime import date
+
+    if not tenant_id:
+        raise ValueError("tenant_id required")
+    ensure_tenant(tenant_id)
+
+    # Ensure the roster users exist (idempotent) so OpenAI attribution has
+    # users.email rows to stitch into even when run standalone.
+    for name, handle in _VOL_ROSTER:
+        _ensure_user(tenant_id, f"{handle}@{_VOL_DOMAIN}", name, handle)
+
+    side = _seed_openai_side_tables(tenant_id)
+    # Resolve the seeded openai_users → email map (what the pull task's
+    # _load_email_map builds) so usage records carry metadata.user_email.
+    email_map = {
+        _openai_user_id(handle): f"{handle}@{_VOL_DOMAIN}"
+        for _name, handle in _VOL_ROSTER
+    }
+
+    rng = random.Random(8675309)  # distinct stream from seed_volume's rng
+    today = date.today()
+
+    usage_added = _seed_openai_usage(tenant_id, today, days, email_map, rng)
+    costs_added = _seed_openai_costs(tenant_id, today, days)
+    audit_added = _seed_openai_audit(tenant_id, today)
+
+    return {
+        "projects_added": side["projects_added"],
+        "api_keys_added": side["api_keys_added"],
+        "users_added": side["users_added"],
+        "usage_added": usage_added,
+        "costs_added": costs_added,
+        "audit_added": audit_added,
     }
 
 
