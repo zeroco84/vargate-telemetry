@@ -36,9 +36,26 @@ _log = logging.getLogger(__name__)
 
 
 # Source APIs that carry an actor dimension (same set the /sessions
-# endpoint aggregates). Admin usage is bucket-grain (no actor) so
-# it's excluded — per-user attribution doesn't exist for it.
-SESSION_SOURCE_APIS = ("code_analytics", "compliance_activities", "mcp")
+# endpoint aggregates). Anthropic admin usage is bucket-grain (no
+# actor) so it's excluded — per-user attribution doesn't exist for it.
+#
+# TM8: OpenAI usage (``openai_admin_usage``) DOES carry a per-user
+# dimension (the grouped result row's ``user_id``, which the pull task
+# resolves to an email in ``metadata.user_email`` via the
+# ``openai_users`` side table and also exposes raw as
+# ``metadata.subject_user_id``). Both keys are in the ACTOR_KEY_SQL
+# COALESCE below, so an OpenAI user with a resolvable email auto-matches
+# an Ogma ``users`` row exactly like a Claude Code actor; one without a
+# known email lands unmapped on the raw ``user_id`` (same as an
+# Anthropic api-key actor). OpenAI costs / audit are NOT in this set —
+# costs have no per-user grain, and audit attribution is best-effort and
+# not part of the cross-vendor user rollup.
+SESSION_SOURCE_APIS = (
+    "code_analytics",
+    "compliance_activities",
+    "mcp",
+    "openai_admin_usage",
+)
 
 
 # Actor-identifier extraction. KEEP IN SYNC with
