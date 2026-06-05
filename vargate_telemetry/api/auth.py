@@ -79,6 +79,68 @@ class MeResponse(BaseModel):
     role: Optional[str] = None
 
 
+# ───────────────────────────────────────────────────────────────────────────
+# TM8 Phase B — nested per-vendor capability shape.
+#
+# `/me/capabilities` grows from a flat 5-bool object into a per-vendor
+# map `{anthropic:{…}, openai:{…}}`. To avoid blanking the SPA's tiles
+# mid-deploy, the endpoint ALSO dual-emits the legacy flat Anthropic
+# keys at the top level for one release; the flat keys are dropped once
+# the frontend ships the nested consumer.
+#
+# `extra="allow"` is NOT used here — the response is a closed contract
+# and the dual-emit flat keys are declared explicitly on the envelope
+# so the OpenAPI schema documents both shapes during the rollout.
+# ───────────────────────────────────────────────────────────────────────────
+
+
+class AnthropicCapabilities(BaseModel):
+    admin_api: bool
+    activity_feed: bool
+    content_capture: bool
+    code_analytics: bool
+    mcp_connector: bool
+
+
+class OpenAICapabilities(BaseModel):
+    # `admin` = the org Admin key works (usage rows have landed OR a key
+    # is sealed). `costs` / `audit_logs` reflect recent rows of the
+    # respective source_api. NOTE accessible ≠ populated: an org can hold
+    # a working key whose audit_logs endpoint returns empty (non-
+    # Enterprise) — `audit_logs` stays False until a row actually lands.
+    admin: bool
+    costs: bool
+    audit_logs: bool
+    # `project_users` = the openai_users side table has rows for the
+    # tenant (projects/keys/users sync ran).
+    project_users: bool
+    # `per_user_breakdown` = a recent openai_admin_usage row carries a
+    # non-null subject_user_id, i.e. group_by=user_id populated on this
+    # org's tier (PAYG+ per the recon). Drives the honest empty-state.
+    per_user_breakdown: bool
+
+
+class CapabilitiesResponse(BaseModel):
+    """Nested per-vendor capability snapshot + dual-emitted legacy flat keys.
+
+    The `anthropic` / `openai` sub-objects are the forward shape. The
+    five top-level bools (`admin_api`, `activity_feed`, `content_capture`,
+    `code_analytics`, `mcp_connector`) are the legacy flat Anthropic keys,
+    retained for one release so the current SPA keeps working through the
+    deploy. They MIRROR `anthropic.*` exactly and are dropped once the
+    nested consumer ships.
+    """
+
+    anthropic: AnthropicCapabilities
+    openai: OpenAICapabilities
+    # Legacy flat Anthropic keys (deprecated; mirror `anthropic.*`).
+    admin_api: bool
+    activity_feed: bool
+    content_capture: bool
+    code_analytics: bool
+    mcp_connector: bool
+
+
 def _redirect_uri(provider: str) -> str:
     """Build the callback URL the provider was told to redirect to.
 
@@ -270,9 +332,10 @@ def get_me(user: AuthenticatedUser = Depends(current_user)) -> MeResponse:
 
 @router.get(
     "/me/capabilities",
+    response_model=CapabilitiesResponse,
     operation_id="getMeCapabilities",
     tags=["me"],
-    summary="Active-data-based 5-bool capability snapshot for the tenant",
+    summary="Nested per-vendor capability snapshot (dual-emits legacy flat keys)",
     responses={
         status.HTTP_401_UNAUTHORIZED: {
             "description": "Missing or invalid session.",
@@ -281,44 +344,94 @@ def get_me(user: AuthenticatedUser = Depends(current_user)) -> MeResponse:
 )
 def get_me_capabilities(
     user: AuthenticatedUser = Depends(current_user),
-) -> dict:
-    """Return the 5-bool capability snapshot for the tenant.
+) -> CapabilitiesResponse:
+    """Return the per-vendor capability snapshot for the tenant.
 
-    Four bools (``admin_api``, ``activity_feed``, ``code_analytics``,
-    ``mcp_connector``) answer "does the tenant have at least one
-    ``telemetry_records`` row with the matching ``source_api`` in the
-    last 90 days?" — same uniform semantics as the ``mcp_connector``
-    detector in onboarding.py.
+    **Shape (TM8 Phase B):** nested per-vendor map —
+    ``{anthropic:{…}, openai:{…}}`` — PLUS the legacy flat Anthropic
+    keys dual-emitted at the top level for one release so the current
+    SPA keeps working through the deploy. The flat keys mirror
+    ``anthropic.*`` exactly and are dropped once the nested consumer
+    ships.
 
-    ``content_capture`` (TM5 T5.1) is the exception: it answers "is a
-    Compliance Access Key sealed for this tenant?" (a row in
-    ``encrypted_secrets``), because the capability is unlocked by
-    *holding the key*, not by content having been pulled yet.
+    **Anthropic** — four bools (``admin_api``, ``activity_feed``,
+    ``code_analytics``, ``mcp_connector``) answer "does the tenant have
+    at least one ``telemetry_records`` row with the matching
+    ``source_api`` in the last 90 days?" — same uniform semantics as the
+    ``mcp_connector`` detector in onboarding.py. ``content_capture``
+    (TM5 T5.1) is the exception: it answers "is a Compliance Access Key
+    sealed for this tenant?" (a row in ``encrypted_secrets``), because
+    the capability is unlocked by *holding the key*, not by content
+    having been pulled yet.
+
+    **OpenAI** (TM8) —
+      - ``admin``: a recent ``openai_admin_usage`` row OR an
+        ``openai_admin_key`` sealed in ``encrypted_secrets`` (so the
+        tile lights the moment the key is sealed, before the first pull).
+      - ``costs``: a recent ``openai_admin_costs`` row.
+      - ``audit_logs``: a recent ``openai_audit_logs`` row. NOTE
+        accessible ≠ populated — the endpoint 200s but is empty on
+        non-Enterprise orgs, so this stays False until a row lands.
+      - ``project_users``: the ``openai_users`` side table has rows for
+        the tenant (the projects/keys/users sync ran).
+      - ``per_user_breakdown``: a recent ``openai_admin_usage`` row
+        carries a non-null ``subject_user_id`` (``group_by=user_id``
+        populated on this org's tier) — drives the honest empty-state.
 
     Pre-tenant users (no tenant_id) get all False.
     """
     if not user.tenant_id:
-        return {
-            "admin_api": False,
-            "activity_feed": False,
-            "content_capture": False,
-            "code_analytics": False,
-            "mcp_connector": False,
-        }
+        anthropic_caps = AnthropicCapabilities(
+            admin_api=False,
+            activity_feed=False,
+            content_capture=False,
+            code_analytics=False,
+            mcp_connector=False,
+        )
+        openai_caps = OpenAICapabilities(
+            admin=False,
+            costs=False,
+            audit_logs=False,
+            project_users=False,
+            per_user_breakdown=False,
+        )
+        return CapabilitiesResponse(
+            anthropic=anthropic_caps,
+            openai=openai_caps,
+            admin_api=False,
+            activity_feed=False,
+            content_capture=False,
+            code_analytics=False,
+            mcp_connector=False,
+        )
 
     from vargate_telemetry.anthropic.factory import (
         ANTHROPIC_COMPLIANCE_KEY_SECRET,
     )
+    from vargate_telemetry.openai.factory import OPENAI_ADMIN_KEY_SECRET
+    from vargate_telemetry.tasks.pull_openai_audit import (
+        SOURCE_API_OPENAI_AUDIT,
+    )
+    from vargate_telemetry.tasks.pull_openai_costs import (
+        SOURCE_API_OPENAI_COSTS,
+    )
+    from vargate_telemetry.tasks.pull_openai_usage import (
+        SOURCE_API_OPENAI_USAGE,
+    )
     from vargate_telemetry.db import session_scope
 
     with session_scope(user.tenant_id) as s:
-        # One round-trip — five EXISTS subqueries. The first four are
-        # cheap single-row probes against
-        # ix_telemetry_records_tenant_occurred. content_capture (TM5
-        # T5.1) is different in kind: it reflects whether a Compliance
-        # Access Key is *sealed* (the capability), not whether content
-        # has been *pulled* yet (the result, T5.2/T5.3) — so it probes
-        # encrypted_secrets, not telemetry_records.
+        # One round-trip. Anthropic: four cheap recent-row probes
+        # against ix_telemetry_records_tenant_occurred + the
+        # content_capture key probe (sealed-key, not pulled-data). OpenAI
+        # (TM8): three recent-row probes (usage/costs/audit), one
+        # sealed-key probe (openai_admin_key — so `admin` lights on key-
+        # seal before the first pull), one non-null-subject probe for
+        # per_user_breakdown, and a side-table EXISTS for project_users.
+        #
+        # The OpenAI source_api strings come from the pull-task module
+        # constants (single source of truth), bound as params rather than
+        # inlined so a rename can't silently diverge.
         row = s.execute(
             sql_text(
                 """
@@ -351,25 +464,84 @@ def get_me_capabilities(
                     SELECT 1 FROM encrypted_secrets
                     WHERE tenant_id = :t
                       AND secret_name = :compliance_secret
-                  ) AS content_capture
+                  ) AS content_capture,
+                  EXISTS (
+                    SELECT 1 FROM telemetry_records
+                    WHERE tenant_id = :t
+                      AND source_api = :openai_usage
+                      AND ingested_at > now() - INTERVAL '90 days'
+                  ) AS openai_usage_rows,
+                  EXISTS (
+                    SELECT 1 FROM encrypted_secrets
+                    WHERE tenant_id = :t
+                      AND secret_name = :openai_secret
+                  ) AS openai_key_sealed,
+                  EXISTS (
+                    SELECT 1 FROM telemetry_records
+                    WHERE tenant_id = :t
+                      AND source_api = :openai_costs
+                      AND ingested_at > now() - INTERVAL '90 days'
+                  ) AS openai_costs,
+                  EXISTS (
+                    SELECT 1 FROM telemetry_records
+                    WHERE tenant_id = :t
+                      AND source_api = :openai_audit
+                      AND ingested_at > now() - INTERVAL '90 days'
+                  ) AS openai_audit_logs,
+                  EXISTS (
+                    SELECT 1 FROM openai_users
+                    WHERE tenant_id = :t
+                  ) AS openai_project_users,
+                  EXISTS (
+                    SELECT 1 FROM telemetry_records
+                    WHERE tenant_id = :t
+                      AND source_api = :openai_usage
+                      AND subject_user_id IS NOT NULL
+                      AND ingested_at > now() - INTERVAL '90 days'
+                  ) AS openai_per_user_breakdown
                 """
             ),
             {
                 "t": user.tenant_id,
                 "compliance_secret": ANTHROPIC_COMPLIANCE_KEY_SECRET,
+                "openai_secret": OPENAI_ADMIN_KEY_SECRET,
+                "openai_usage": SOURCE_API_OPENAI_USAGE,
+                "openai_costs": SOURCE_API_OPENAI_COSTS,
+                "openai_audit": SOURCE_API_OPENAI_AUDIT,
             },
         ).one()
 
-    return {
-        "admin_api": bool(row.admin_api),
-        "activity_feed": bool(row.activity_feed),
+    anthropic_caps = AnthropicCapabilities(
+        admin_api=bool(row.admin_api),
+        activity_feed=bool(row.activity_feed),
         # TM5 T5.1: True once a Compliance Access Key is sealed for this
         # tenant (via POST /onboarding/compliance-key) — the capability,
         # independent of whether any content has been pulled yet.
-        "content_capture": bool(row.content_capture),
-        "code_analytics": bool(row.code_analytics),
-        "mcp_connector": bool(row.mcp_connector),
-    }
+        content_capture=bool(row.content_capture),
+        code_analytics=bool(row.code_analytics),
+        mcp_connector=bool(row.mcp_connector),
+    )
+    openai_caps = OpenAICapabilities(
+        # `admin` lights on EITHER a recent usage row OR a sealed key, so
+        # the onboarding tile flips the moment the key is sealed (before
+        # the first 15-minute pull lands a row).
+        admin=bool(row.openai_usage_rows) or bool(row.openai_key_sealed),
+        costs=bool(row.openai_costs),
+        audit_logs=bool(row.openai_audit_logs),
+        project_users=bool(row.openai_project_users),
+        per_user_breakdown=bool(row.openai_per_user_breakdown),
+    )
+    return CapabilitiesResponse(
+        anthropic=anthropic_caps,
+        openai=openai_caps,
+        # Dual-emit the legacy flat Anthropic keys (mirror anthropic.*)
+        # for one release so the current SPA keeps working mid-deploy.
+        admin_api=anthropic_caps.admin_api,
+        activity_feed=anthropic_caps.activity_feed,
+        content_capture=anthropic_caps.content_capture,
+        code_analytics=anthropic_caps.code_analytics,
+        mcp_connector=anthropic_caps.mcp_connector,
+    )
 
 
 # ───────────────────────────────────────────────────────────────────────────

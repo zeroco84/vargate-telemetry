@@ -169,6 +169,48 @@ celery_app.conf.beat_schedule = {
         "schedule": 900.0,  # every 15 minutes
         "options": {"queue": "default"},
     },
+    # TM8 Phase B: OpenAI Admin API ingest — Ogma's first non-Anthropic
+    # vendor. Four streams fan out per-tenant on the established
+    # dispatch-all-with-soft-skip pattern (region=None → all active
+    # tenants; the per-tenant task soft-skips on 403 by returning a
+    # status dict, never raising — capability state isn't persisted, so
+    # we don't filter at dispatch). Usage + costs run at the 15-minute
+    # cadence alongside the Anthropic ingest streams so spend shows up
+    # within one tick. Audit + projects run hourly: audit_logs is empty
+    # on non-Enterprise orgs (accessible ≠ populated) and projects/keys/
+    # users metadata changes slowly, so a 60-minute cadence is plenty.
+    "dispatch-openai-usage-pulls": {
+        "task": (
+            "vargate_telemetry.tasks.pull_openai_usage."
+            "dispatch_openai_usage_pulls"
+        ),
+        "schedule": 900.0,  # every 15 minutes
+        "options": {"queue": "default"},
+    },
+    "dispatch-openai-costs-pulls": {
+        "task": (
+            "vargate_telemetry.tasks.pull_openai_costs."
+            "dispatch_openai_costs_pulls"
+        ),
+        "schedule": 900.0,  # every 15 minutes
+        "options": {"queue": "default"},
+    },
+    "dispatch-openai-audit-pulls": {
+        "task": (
+            "vargate_telemetry.tasks.pull_openai_audit."
+            "dispatch_openai_audit_pulls"
+        ),
+        "schedule": 3600.0,  # every hour
+        "options": {"queue": "default"},
+    },
+    "dispatch-openai-projects-pulls": {
+        "task": (
+            "vargate_telemetry.tasks.pull_openai_projects."
+            "dispatch_openai_projects_pulls"
+        ),
+        "schedule": 3600.0,  # every hour
+        "options": {"queue": "default"},
+    },
 }
 
 # Alias so `celery -A vargate_telemetry.celery_app worker` (which looks up

@@ -219,16 +219,16 @@ components:
             Has Claude Code Analytics access. T5.4 will land the real
             probe; today this is always `false`.
 
-    MeCapabilities:
+    AnthropicCapabilities:
       type: object
       required:
         [admin_api, activity_feed, content_capture, code_analytics, mcp_connector]
       description: |
-        The tenant's current capability snapshot (`GET /me/capabilities`).
-        Same 5-bool shape as `KeyCapabilities`, but reflects what data the
-        tenant HAS now (telemetry-row / sealed-key presence) rather than
-        what a freshly-probed admin key COULD unlock. `content_capture`
-        (TM5 T5.1) is true once a Compliance Access Key is sealed.
+        Anthropic-vendor capability snapshot. Reflects what data the
+        tenant HAS now (telemetry-row presence per `source_api` in the
+        last 90 days) rather than what a freshly-probed admin key COULD
+        unlock. `content_capture` (TM5 T5.1) is true once a Compliance
+        Access Key is sealed.
       properties:
         admin_api:
           type: boolean
@@ -240,6 +240,77 @@ components:
           type: boolean
         mcp_connector:
           type: boolean
+
+    OpenAICapabilities:
+      type: object
+      required: [admin, costs, audit_logs, project_users, per_user_breakdown]
+      description: |
+        OpenAI-vendor capability snapshot (TM8). `admin` is true once an
+        `openai_admin_usage` row has landed in the last 90 days OR an
+        `openai_admin_key` is sealed (so the tile lights on key-seal,
+        before the first pull). `costs` / `audit_logs` reflect recent
+        rows of the respective `source_api` — NOTE accessible ≠
+        populated: `audit_logs` 200s but is empty on non-Enterprise orgs,
+        so it stays false until a row lands. `project_users` is true once
+        the `openai_users` side table has rows for the tenant.
+        `per_user_breakdown` is true when a recent usage row carries a
+        non-null `subject_user_id` (`group_by=user_id` populated on this
+        org's tier) — it drives the honest per-user empty-state copy.
+      properties:
+        admin:
+          type: boolean
+        costs:
+          type: boolean
+        audit_logs:
+          type: boolean
+        project_users:
+          type: boolean
+        per_user_breakdown:
+          type: boolean
+
+    MeCapabilities:
+      type: object
+      required:
+        [anthropic, openai, admin_api, activity_feed, content_capture,
+         code_analytics, mcp_connector]
+      description: |
+        The tenant's current capability snapshot (`GET /me/capabilities`).
+
+        **Shape (TM8):** nested per-vendor map — `anthropic` + `openai`
+        sub-objects — PLUS the legacy flat Anthropic keys dual-emitted at
+        the top level for one release so the current SPA keeps working
+        through the deploy. The flat keys (`admin_api`, `activity_feed`,
+        `content_capture`, `code_analytics`, `mcp_connector`) MIRROR
+        `anthropic.*` exactly and are DEPRECATED — they are dropped once
+        the nested consumer ships.
+
+        Reflects what data the tenant HAS now (telemetry rows /
+        sealed-key presence), not what an admin key could probe.
+      properties:
+        anthropic:
+          $ref: '#/components/schemas/AnthropicCapabilities'
+        openai:
+          $ref: '#/components/schemas/OpenAICapabilities'
+        admin_api:
+          type: boolean
+          deprecated: true
+          description: Legacy flat key; mirrors `anthropic.admin_api`.
+        activity_feed:
+          type: boolean
+          deprecated: true
+          description: Legacy flat key; mirrors `anthropic.activity_feed`.
+        content_capture:
+          type: boolean
+          deprecated: true
+          description: Legacy flat key; mirrors `anthropic.content_capture`.
+        code_analytics:
+          type: boolean
+          deprecated: true
+          description: Legacy flat key; mirrors `anthropic.code_analytics`.
+        mcp_connector:
+          type: boolean
+          deprecated: true
+          description: Legacy flat key; mirrors `anthropic.mcp_connector`.
 
     McpStatus:
       type: object
@@ -2068,17 +2139,21 @@ paths:
   /me/capabilities:
     get:
       tags: [me]
-      summary: The tenant's current capability snapshot (5 bools)
+      summary: The tenant's per-vendor capability snapshot
       description: |
         Drives the onboarding / settings capability cards + empty-state
         copy. Reflects what data the tenant HAS now (telemetry rows per
-        source_api in the last 90 days; sealed Compliance Access Key for
-        `content_capture`), not what an admin key could probe. Pre-tenant
-        users get all-false.
+        source_api in the last 90 days; sealed Compliance / OpenAI Admin
+        key), not what an admin key could probe. Pre-tenant users get
+        all-false.
+
+        **TM8:** nested per-vendor shape (`anthropic` + `openai`) plus
+        dual-emitted legacy flat Anthropic keys for one release — see the
+        `MeCapabilities` schema.
       operationId: getMeCapabilities
       responses:
         '200':
-          description: The 5-bool capability snapshot.
+          description: The per-vendor capability snapshot.
           content:
             application/json:
               schema:

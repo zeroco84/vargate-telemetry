@@ -15,5 +15,9 @@ from vargate_telemetry.tasks import (  # noqa: F401
     pull_admin,
     pull_code_analytics,
     pull_compliance,
+    pull_openai_audit,
+    pull_openai_costs,
+    pull_openai_projects,
+    pull_openai_usage,
     reconcile_aliases,
 )
