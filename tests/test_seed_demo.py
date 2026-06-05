@@ -133,6 +133,14 @@ def test_seed_volume_users_activity_and_chain(seed_tenant: str) -> None:
         "events_added": 0,
         "usage_added": 0,
         "content_added": 0,
+        # seed_volume also layers OpenAI activity (TM8 Phase F); an
+        # idempotent re-run adds nothing on those streams either.
+        "openai_projects_added": 0,
+        "openai_api_keys_added": 0,
+        "openai_users_added": 0,
+        "openai_usage_added": 0,
+        "openai_costs_added": 0,
+        "openai_audit_added": 0,
     }
 
     # Chain stays valid after the bulk seed + the demo deletions.
