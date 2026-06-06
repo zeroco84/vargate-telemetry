@@ -18,6 +18,7 @@ hsm-tokens/
 *.docx
 *.xlsx
 *.pptx
+docs/sprints/
 
 # --- Python ------------------------------------------------------------------
 __pycache__/
