@@ -1017,6 +1017,15 @@ components:
           type: string
           format: date
           description: UTC date of the bucket.
+        source_api:
+          type: string
+          default: admin
+          description: |
+            TM8: vendor/source stream this usage row came from
+            (`admin` = Anthropic Admin API, `openai_admin_usage` =
+            OpenAI). Defaults to `admin` (the incumbent Anthropic-only
+            path) for backward compatibility; the frontend maps it to a
+            vendor via the design-system `sourceVendor()` accessor.
         workspace_id:
           type: string
           nullable: true
@@ -1667,6 +1676,15 @@ components:
           type: string
           format: date-time
           nullable: true
+        spend_7d_by_vendor:
+          type: object
+          additionalProperties:
+            type: string
+          description: |
+            TM8 Phase E: per-vendor 7-day spend split, keyed by vendor
+            label (Anthropic, OpenAI) → string-Decimal spend. Omitted
+            for users with no cross-vendor activity; the UI vendor-stacks
+            per-user spend from it.
 
     UnmappedAlias:
       type: object
@@ -1716,13 +1734,18 @@ components:
 
     SpendTrendPoint:
       type: object
-      required: [day, source_api, spend_usd]
+      required: [day, source_api, vendor, spend_usd]
       properties:
         day:
           type: string
           format: date
         source_api:
           type: string
+        vendor:
+          type: string
+          description: |
+            TM8 Phase E: vendor label (Anthropic, OpenAI) this spend
+            point belongs to; the detail spend-trend chart stacks on it.
         spend_usd:
           type: string
           description: String Decimal — per-day MCP spend.
