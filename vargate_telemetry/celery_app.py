@@ -211,6 +211,32 @@ celery_app.conf.beat_schedule = {
         "schedule": 3600.0,  # every hour
         "options": {"queue": "default"},
     },
+    # TM9: Google Vertex AI ingest — Ogma's third vendor. Two streams
+    # (cost via BigQuery billing export, usage via Cloud Monitoring
+    # token_count) fan out per-tenant on the established
+    # dispatch-all-with-soft-skip pattern (region=None → all active
+    # tenants; the per-tenant task soft-skips on no-GCP-creds / 403 by
+    # returning a status dict, never raising — capability state isn't
+    # persisted, so we don't filter at dispatch). 15-minute cadence
+    # alongside the Anthropic/OpenAI usage+cost streams so Vertex spend
+    # shows up within one tick. Audit is DEFERRED (no Vertex audit stream
+    # in the MVP).
+    "dispatch-vertex-usage-pulls": {
+        "task": (
+            "vargate_telemetry.tasks.pull_vertex_usage."
+            "dispatch_vertex_usage_pulls"
+        ),
+        "schedule": 900.0,  # every 15 minutes
+        "options": {"queue": "default"},
+    },
+    "dispatch-vertex-costs-pulls": {
+        "task": (
+            "vargate_telemetry.tasks.pull_vertex_costs."
+            "dispatch_vertex_costs_pulls"
+        ),
+        "schedule": 900.0,  # every 15 minutes
+        "options": {"queue": "default"},
+    },
 }
 
 # Alias so `celery -A vargate_telemetry.celery_app worker` (which looks up

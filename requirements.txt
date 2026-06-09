@@ -97,6 +97,26 @@ python-jose[cryptography]>=3.3,<4
 # transcript + chain-proof appendix + Bates numbering).
 reportlab>=4,<5
 
+# TM9: Google Vertex AI ingest — Ogma's third vendor. The vertex/ package
+# imports these at module top (mirroring the OpenAI client's top-level
+# `import httpx`):
+#   - google-auth: mints OAuth2 tokens from the sealed service-account
+#     JSON key (google.oauth2.service_account +
+#     google.auth.transport.requests). Also pulls google.auth.exceptions /
+#     google.api_core.exceptions used by the client soft-skip paths.
+#   - google-cloud-bigquery: queries the customer's billing-export table
+#     for authoritative Vertex spend (cost stream).
+#   - google-cloud-monitoring: reads the publisher token_count metric for
+#     per-model/project token usage (usage stream).
+# TODO(TM9 Phase A): pin all three to a tested minor range on first build
+# (the version bands below are placeholders — the scaffold is
+# py_compile-clean without them installed, but the first `docker compose
+# build` must resolve + lock real versions, same `>=x,<y` discipline as
+# the rest of this file).
+google-auth>=2,<3
+google-cloud-bigquery>=3,<4
+google-cloud-monitoring>=2,<3
+
 # Test deps. Kept in this single requirements file for now so the image
 # can run pytest without a second install layer; revisit when the prod
 # image is split out (later in the sprint plan).

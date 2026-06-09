@@ -19,5 +19,7 @@ from vargate_telemetry.tasks import (  # noqa: F401
     pull_openai_costs,
     pull_openai_projects,
     pull_openai_usage,
+    pull_vertex_costs,
+    pull_vertex_usage,
     reconcile_aliases,
 )

@@ -36,6 +36,7 @@ from vargate_telemetry.api import openai_onboarding as openai_onboarding_routes
 from vargate_telemetry.api import sessions as sessions_routes
 from vargate_telemetry.api import usage as usage_routes
 from vargate_telemetry.api import users as users_routes
+from vargate_telemetry.api import vertex_onboarding as vertex_onboarding_routes
 from vargate_telemetry.api import well_known as well_known_routes
 
 # Side-effect import: registers the T4.7 onboarding instruments against
@@ -89,6 +90,15 @@ def _build_app() -> FastAPI:
     # seal an OpenAI Admin key (second-vendor onboarding; admin-gated
     # submit enqueues the usage/costs/projects backfill).
     app.include_router(openai_onboarding_routes.router)
+    # TM9: POST /onboarding/google/{validate,submit} — parse + seal a
+    # Google service-account key + BigQuery billing-export config
+    # (third-vendor onboarding; admin-gated submit enqueues the Vertex
+    # costs/usage backfill). NOTE: including this router triggers
+    # `import vargate_telemetry.vertex.*`, which top-level-imports the
+    # google libs — google-auth / google-cloud-bigquery /
+    # google-cloud-monitoring must be installed (see requirements.txt)
+    # before this app boots, or the import fails.
+    app.include_router(vertex_onboarding_routes.router)
     # TM5 T5.3: GET /content/chats[/{id}] — read-only compliance content
     # view (list captured chats + decrypt-on-read message view).
     app.include_router(content_routes.router)

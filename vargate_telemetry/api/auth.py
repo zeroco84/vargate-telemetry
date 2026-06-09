@@ -120,19 +120,49 @@ class OpenAICapabilities(BaseModel):
     per_user_breakdown: bool
 
 
+class GoogleCapabilities(BaseModel):
+    # TM9: Google Vertex AI — Ogma's third vendor. Two MVP streams
+    # (cost via BigQuery billing export, usage via Cloud Monitoring
+    # token_count); audit is DEFERRED.
+    #
+    # `cost` = a recent `vertex_billing_costs` row has landed.
+    # `usage` = a recent `vertex_token_usage` row has landed.
+    cost: bool
+    usage: bool
+    # `project_attribution` is STRUCTURAL — Google always attributes
+    # usage/spend to a project, so this is ALWAYS True for the Google
+    # block (independent of row presence).
+    project_attribution: bool
+    # `team_labels` = a recent `vertex_billing_costs` row carries a
+    # non-empty request-label set (the team dim). Lights only once a
+    # labelled billing row has actually landed.
+    team_labels: bool
+    # `per_user_breakdown` is STRUCTURAL and ALWAYS False — Google has
+    # NO per-user-email attribution (no Vertex users side-table, the
+    # email reconciler never reads these streams). The dashboard uses
+    # this to render the honest "project/team only" empty-state.
+    per_user_breakdown: bool
+    # `audit` is ALWAYS False — the Vertex audit stream is DEFERRED in
+    # the TM9 MVP (no `vertex_*_audit` source_api exists yet).
+    audit: bool
+
+
 class CapabilitiesResponse(BaseModel):
     """Nested per-vendor capability snapshot + dual-emitted legacy flat keys.
 
-    The `anthropic` / `openai` sub-objects are the forward shape. The
-    five top-level bools (`admin_api`, `activity_feed`, `content_capture`,
-    `code_analytics`, `mcp_connector`) are the legacy flat Anthropic keys,
-    retained for one release so the current SPA keeps working through the
-    deploy. They MIRROR `anthropic.*` exactly and are dropped once the
-    nested consumer ships.
+    The `anthropic` / `openai` / `google` sub-objects are the forward
+    shape. The five top-level bools (`admin_api`, `activity_feed`,
+    `content_capture`, `code_analytics`, `mcp_connector`) are the legacy
+    flat Anthropic keys, retained for one release so the current SPA keeps
+    working through the deploy. They MIRROR `anthropic.*` exactly and are
+    dropped once the nested consumer ships.
     """
 
     anthropic: AnthropicCapabilities
     openai: OpenAICapabilities
+    # TM9: Google Vertex AI block (third vendor). Additive — does not
+    # affect the Anthropic / OpenAI shapes.
+    google: GoogleCapabilities
     # Legacy flat Anthropic keys (deprecated; mirror `anthropic.*`).
     admin_api: bool
     activity_feed: bool
@@ -347,10 +377,10 @@ def get_me_capabilities(
 ) -> CapabilitiesResponse:
     """Return the per-vendor capability snapshot for the tenant.
 
-    **Shape (TM8 Phase B):** nested per-vendor map —
-    ``{anthropic:{…}, openai:{…}}`` — PLUS the legacy flat Anthropic
-    keys dual-emitted at the top level for one release so the current
-    SPA keeps working through the deploy. The flat keys mirror
+    **Shape (TM8 Phase B, extended TM9):** nested per-vendor map —
+    ``{anthropic:{…}, openai:{…}, google:{…}}`` — PLUS the legacy flat
+    Anthropic keys dual-emitted at the top level for one release so the
+    current SPA keeps working through the deploy. The flat keys mirror
     ``anthropic.*`` exactly and are dropped once the nested consumer
     ships.
 
@@ -378,7 +408,25 @@ def get_me_capabilities(
         carries a non-null ``subject_user_id`` (``group_by=user_id``
         populated on this org's tier) — drives the honest empty-state.
 
-    Pre-tenant users (no tenant_id) get all False.
+    **Google / Vertex** (TM9) — project/team attribution only, audit
+    deferred:
+      - ``cost``: a recent ``vertex_billing_costs`` row (BigQuery billing
+        export).
+      - ``usage``: a recent ``vertex_token_usage`` row (Cloud Monitoring
+        token_count).
+      - ``project_attribution``: STRUCTURAL — always True (Google always
+        attributes to a project).
+      - ``team_labels``: a recent ``vertex_billing_costs`` row carries a
+        non-empty request-label set (the team dim) — lights only once a
+        labelled billing row lands.
+      - ``per_user_breakdown``: STRUCTURAL — always False (Google has NO
+        per-user-email attribution; no users side-table, the reconciler
+        never reads these streams).
+      - ``audit``: always False — the Vertex audit stream is DEFERRED in
+        the TM9 MVP.
+
+    Pre-tenant users (no tenant_id) get all False (except the structural
+    ``google.project_attribution``, which is always True).
     """
     if not user.tenant_id:
         anthropic_caps = AnthropicCapabilities(
@@ -395,9 +443,22 @@ def get_me_capabilities(
             project_users=False,
             per_user_breakdown=False,
         )
+        # Google: all-False EXCEPT the structural project_attribution
+        # (always True). per_user_breakdown / audit are structurally /
+        # deferred-False; cost / usage / team_labels are False with no
+        # tenant to probe.
+        google_caps = GoogleCapabilities(
+            cost=False,
+            usage=False,
+            project_attribution=True,
+            team_labels=False,
+            per_user_breakdown=False,
+            audit=False,
+        )
         return CapabilitiesResponse(
             anthropic=anthropic_caps,
             openai=openai_caps,
+            google=google_caps,
             admin_api=False,
             activity_feed=False,
             content_capture=False,
@@ -418,6 +479,12 @@ def get_me_capabilities(
     from vargate_telemetry.tasks.pull_openai_usage import (
         SOURCE_API_OPENAI_USAGE,
     )
+    from vargate_telemetry.tasks.pull_vertex_costs import (
+        SOURCE_API_VERTEX_COSTS,
+    )
+    from vargate_telemetry.tasks.pull_vertex_usage import (
+        SOURCE_API_VERTEX_USAGE,
+    )
     from vargate_telemetry.db import session_scope
 
     with session_scope(user.tenant_id) as s:
@@ -428,10 +495,15 @@ def get_me_capabilities(
         # sealed-key probe (openai_admin_key — so `admin` lights on key-
         # seal before the first pull), one non-null-subject probe for
         # per_user_breakdown, and a side-table EXISTS for project_users.
+        # Google (TM9): two recent-row probes (vertex_billing_costs →
+        # cost, vertex_token_usage → usage) plus a labelled-cost-row probe
+        # (a vertex_billing_costs row whose metadata->'labels' is a
+        # non-empty object → team_labels). project_attribution /
+        # per_user_breakdown / audit are STRUCTURAL constants, not probed.
         #
-        # The OpenAI source_api strings come from the pull-task module
-        # constants (single source of truth), bound as params rather than
-        # inlined so a rename can't silently diverge.
+        # The OpenAI + Vertex source_api strings come from the pull-task
+        # module constants (single source of truth), bound as params
+        # rather than inlined so a rename can't silently diverge.
         row = s.execute(
             sql_text(
                 """
@@ -498,7 +570,28 @@ def get_me_capabilities(
                       AND source_api = :openai_usage
                       AND subject_user_id IS NOT NULL
                       AND ingested_at > now() - INTERVAL '90 days'
-                  ) AS openai_per_user_breakdown
+                  ) AS openai_per_user_breakdown,
+                  EXISTS (
+                    SELECT 1 FROM telemetry_records
+                    WHERE tenant_id = :t
+                      AND source_api = :vertex_costs
+                      AND ingested_at > now() - INTERVAL '90 days'
+                  ) AS vertex_costs,
+                  EXISTS (
+                    SELECT 1 FROM telemetry_records
+                    WHERE tenant_id = :t
+                      AND source_api = :vertex_usage
+                      AND ingested_at > now() - INTERVAL '90 days'
+                  ) AS vertex_usage,
+                  EXISTS (
+                    SELECT 1 FROM telemetry_records
+                    WHERE tenant_id = :t
+                      AND source_api = :vertex_costs
+                      AND ingested_at > now() - INTERVAL '90 days'
+                      AND metadata->'labels' IS NOT NULL
+                      AND metadata->'labels' <> 'null'::jsonb
+                      AND metadata->'labels' <> '{}'::jsonb
+                  ) AS vertex_team_labels
                 """
             ),
             {
@@ -508,6 +601,8 @@ def get_me_capabilities(
                 "openai_usage": SOURCE_API_OPENAI_USAGE,
                 "openai_costs": SOURCE_API_OPENAI_COSTS,
                 "openai_audit": SOURCE_API_OPENAI_AUDIT,
+                "vertex_costs": SOURCE_API_VERTEX_COSTS,
+                "vertex_usage": SOURCE_API_VERTEX_USAGE,
             },
         ).one()
 
@@ -531,9 +626,24 @@ def get_me_capabilities(
         project_users=bool(row.openai_project_users),
         per_user_breakdown=bool(row.openai_per_user_breakdown),
     )
+    google_caps = GoogleCapabilities(
+        # `cost` / `usage` are row-presence (a recent vertex_billing_costs
+        # / vertex_token_usage row landed). `team_labels` lights once a
+        # labelled billing row has landed.
+        cost=bool(row.vertex_costs),
+        usage=bool(row.vertex_usage),
+        # STRUCTURAL — Google always attributes to a project.
+        project_attribution=True,
+        team_labels=bool(row.vertex_team_labels),
+        # STRUCTURAL — Google has NO per-user-email attribution.
+        per_user_breakdown=False,
+        # DEFERRED — no Vertex audit stream in the TM9 MVP.
+        audit=False,
+    )
     return CapabilitiesResponse(
         anthropic=anthropic_caps,
         openai=openai_caps,
+        google=google_caps,
         # Dual-emit the legacy flat Anthropic keys (mirror anthropic.*)
         # for one release so the current SPA keeps working mid-deploy.
         admin_api=anthropic_caps.admin_api,

@@ -22,7 +22,7 @@ Two functions:
   ``None`` for an unpriceable / unknown-source record (never fakes a
   number — same discipline as ``compute_cost_usd``).
 - :func:`vendor_of` — ``source_api`` → display vendor name
-  (``"Anthropic"`` | ``"OpenAI"``).
+  (``"Anthropic"`` | ``"OpenAI"`` | ``"Google"``).
 
 Why ``metadata`` (not a SQL row)
 ================================
@@ -39,7 +39,8 @@ Authoritative vs estimated
 ===========================
 
 This primitive only produces **usage-token estimates** (Anthropic
-always; OpenAI from the ``openai_admin_usage`` stream). OpenAI also has
+always; OpenAI from the ``openai_admin_usage`` stream; Google/Vertex
+from the ``vertex_token_usage`` stream). OpenAI also has
 **authoritative billed spend** in the ``openai_admin_costs`` stream
 (``amount.value``); that is NOT priced here — it is read directly by
 :mod:`vargate_telemetry.insights.spend_data` (``openai_actual_spend``).
@@ -47,6 +48,14 @@ always; OpenAI from the ``openai_admin_usage`` stream). OpenAI also has
 ``openai_admin_costs`` record on purpose: a cost record carries no
 token fields to estimate from, and double-counting it against the
 usage estimate is the trap the per-vendor spend split exists to avoid.
+
+Google/Vertex mirrors OpenAI exactly: usage (``vertex_token_usage``,
+from Cloud Monitoring ``token_count``) is token-estimated here via
+:mod:`vargate_telemetry.pricing.vertex_rates`, while costs
+(``vertex_billing_costs``) are **authoritative** (the BigQuery billing
+export, net of credits) and read separately by the spend rollups —
+``estimate_record_cost_usd`` returns ``None`` for a
+``vertex_billing_costs`` record for the same no-double-count reason.
 """
 
 from __future__ import annotations
@@ -55,7 +64,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Optional
 
-from vargate_telemetry.pricing import anthropic_rates, openai_rates
+from vargate_telemetry.pricing import anthropic_rates, openai_rates, vertex_rates
 
 # ───────────────────────────────────────────────────────────────────────────
 # source_api → vendor mapping
@@ -71,28 +80,42 @@ from vargate_telemetry.pricing import anthropic_rates, openai_rates
 
 VENDOR_ANTHROPIC = "Anthropic"
 VENDOR_OPENAI = "OpenAI"
+VENDOR_GOOGLE = "Google"
 
 # Usage streams this primitive can price (token-derived estimate).
 SOURCE_API_ANTHROPIC_USAGE = "admin"
 SOURCE_API_OPENAI_USAGE = "openai_admin_usage"
+# Vertex (TM9) usage stream — Cloud Monitoring token_count. Both Vertex
+# source_api strings are <= 32 chars (the pull_state limit): 18 / 20.
+SOURCE_API_VERTEX_USAGE = "vertex_token_usage"
+# Vertex (TM9) cost stream — BigQuery billing export. Authoritative
+# (net-of-credits) billed spend; NOT estimated here (returns None from
+# estimate_record_cost_usd, read separately by the spend rollups).
+SOURCE_API_VERTEX_COSTS = "vertex_billing_costs"
 
-# Every OpenAI source_api prefix → OpenAI. Anthropic is the default for
-# everything else (matches the pre-TM8 world where all streams were
-# Anthropic).
+# Every OpenAI source_api prefix → OpenAI; every Vertex prefix → Google.
+# Anthropic is the default for everything else (matches the pre-TM8 world
+# where all streams were Anthropic). The prefixes are disjoint
+# (``openai_`` vs ``vertex_``), so the test order is for readability only.
 _OPENAI_SOURCE_PREFIX = "openai_"
+_VERTEX_SOURCE_PREFIX = "vertex_"
 
 
 def vendor_of(source_api: str) -> str:
     """Display vendor name for a ``source_api`` value.
 
-    ``"openai_admin_usage"`` / ``"openai_admin_costs"`` /
-    ``"openai_audit_logs"`` → ``"OpenAI"``; everything else (the
-    Anthropic streams ``admin`` / ``mcp`` / ``code_analytics`` /
-    ``activity_feed`` / ``compliance_*``, and any future Anthropic
-    stream) → ``"Anthropic"``. The OpenAI test is a prefix match so a
-    new ``openai_*`` stream is classified correctly without touching
-    this map.
+    ``"vertex_token_usage"`` / ``"vertex_billing_costs"`` (any
+    ``vertex_*`` stream) → ``"Google"``; ``"openai_admin_usage"`` /
+    ``"openai_admin_costs"`` / ``"openai_audit_logs"`` (any ``openai_*``
+    stream) → ``"OpenAI"``; everything else (the Anthropic streams
+    ``admin`` / ``mcp`` / ``code_analytics`` / ``activity_feed`` /
+    ``compliance_*``, and any future Anthropic stream) → ``"Anthropic"``.
+    The OpenAI and Vertex tests are prefix matches so a new ``openai_*`` /
+    ``vertex_*`` stream is classified correctly without touching this map;
+    the two prefixes are disjoint, so the order is for readability only.
     """
+    if source_api and source_api.startswith(_VERTEX_SOURCE_PREFIX):
+        return VENDOR_GOOGLE
     if source_api and source_api.startswith(_OPENAI_SOURCE_PREFIX):
         return VENDOR_OPENAI
     return VENDOR_ANTHROPIC
@@ -236,6 +259,78 @@ def _estimate_openai_usage(
 
 
 # ───────────────────────────────────────────────────────────────────────────
+# Google / Vertex — per-monitoring-point token estimate (project/team only)
+# ───────────────────────────────────────────────────────────────────────────
+
+
+def _estimate_vertex_usage(
+    metadata: dict[str, Any], occurred_at: datetime
+) -> Optional[Decimal]:
+    """Price one Vertex usage record's token total.
+
+    Vertex usage is sourced from Cloud Monitoring ``token_count`` (the
+    metric splits by a ``type`` label = input|output), per model /
+    project. ``pull_vertex_usage._normalize_usage`` writes ONE record per
+    monitoring point carrying that single side's count, with the relevant
+    fields hoisted to the metadata top level: ``model`` (the Gemini model
+    string), ``token_type`` (the raw ``input`` / ``output`` label), and
+    ``token_count`` (that side's tokens). The full point dump is also
+    nested under ``result``, but the top-level fields are the contract
+    this reads.
+
+    Because a point carries EITHER an input OR an output count (never
+    both), the count is routed to the matching side and 0 is passed for
+    the other — the same per-point posture ``_estimate_point_cost`` uses
+    inside ``pull_vertex_usage``. There is no cache-read split and no
+    cache-write charge in this metric, so ``cache_read_tokens`` and
+    ``cache_creation_tokens`` are both 0; for the context-length-tiered
+    model (Gemini 2.5 Pro) the input-token count selects the tier (see
+    ``vertex_rates._resolve_rates``).
+
+    Returns ``None`` when the model is null/unknown to the rate card
+    (``vertex_rates.compute_cost_usd`` never fakes a number) or the
+    point's ``token_type`` is neither ``input`` nor ``output``.
+
+    Google has NO per-user-email attribution — this estimate is per
+    token-and-model regardless of who ran the request (the project / team
+    dims live in the record metadata, not in pricing).
+
+    # TODO(TM9 Phase A): re-confirm these metadata keys (``model`` /
+    # ``token_type`` / ``token_count``) against the frozen
+    # pull_vertex_usage record shape once a live GCP project exists — in
+    # particular whether a cached-input ``token_type`` appears (which
+    # would route to ``cache_read_tokens`` here and add a branch below).
+    """
+    model = metadata.get("model")
+    token_type_raw = metadata.get("token_type")
+    token_type = (
+        str(token_type_raw).lower() if token_type_raw else ""
+    )
+    token_count = _as_int(metadata.get("token_count"))
+
+    if token_type == "input":
+        return vertex_rates.compute_cost_usd(
+            model,
+            input_tokens=token_count,
+            output_tokens=0,
+            cache_read_tokens=0,
+            cache_creation_tokens=0,
+            occurred_at=occurred_at,
+        )
+    if token_type == "output":
+        return vertex_rates.compute_cost_usd(
+            model,
+            input_tokens=0,
+            output_tokens=token_count,
+            cache_read_tokens=0,
+            cache_creation_tokens=0,
+            occurred_at=occurred_at,
+        )
+    # Unknown / missing token_type — surface the gap, don't fake a number.
+    return None
+
+
+# ───────────────────────────────────────────────────────────────────────────
 # Public dispatch
 # ───────────────────────────────────────────────────────────────────────────
 
@@ -268,9 +363,9 @@ def estimate_record_cost_usd(
     A :class:`Decimal` (six-decimal precision from the underlying
     ``compute_cost_usd``) or ``None`` when the record is unpriceable:
       - ``source_api`` is not a usage stream (``openai_admin_costs`` /
-        ``openai_audit_logs`` / any non-usage Anthropic stream) — a
-        cost record's authoritative spend is read elsewhere, not
-        estimated here;
+        ``openai_audit_logs`` / ``vertex_billing_costs`` / any non-usage
+        Anthropic stream) — a cost record's authoritative spend is read
+        elsewhere, not estimated here;
       - the metadata carries no priceable breakdown (empty-bucket
         sentinel);
       - the model is null or unknown to the rate card.
@@ -289,16 +384,24 @@ def estimate_record_cost_usd(
         return _estimate_anthropic_usage(metadata, occurred_at)
     if source_api == SOURCE_API_OPENAI_USAGE:
         return _estimate_openai_usage(metadata, occurred_at)
+    if source_api == SOURCE_API_VERTEX_USAGE:
+        return _estimate_vertex_usage(metadata, occurred_at)
 
-    # openai_admin_costs / openai_audit_logs / non-usage Anthropic
-    # streams: not token-estimable here.
+    # openai_admin_costs / openai_audit_logs / vertex_billing_costs /
+    # non-usage Anthropic streams: not token-estimable here.
+    # vertex_billing_costs is authoritative (BigQuery billing export, net
+    # of credits) and read separately by the spend rollups — pricing it
+    # here would double-count against the vertex_token_usage estimate.
     return None
 
 
 __all__ = [
     "SOURCE_API_ANTHROPIC_USAGE",
     "SOURCE_API_OPENAI_USAGE",
+    "SOURCE_API_VERTEX_COSTS",
+    "SOURCE_API_VERTEX_USAGE",
     "VENDOR_ANTHROPIC",
+    "VENDOR_GOOGLE",
     "VENDOR_OPENAI",
     "estimate_record_cost_usd",
     "vendor_of",
